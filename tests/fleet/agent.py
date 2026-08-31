@@ -65,8 +65,10 @@ the operator names one.
 """
 import argparse
 import json
+import locale
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -699,21 +701,34 @@ def installed_bin_under(home):
 def bundle_env(sandbox_dir, ota_dir=None):
     """The environment for running a published release the way a customer does.
 
-    Everything the fleet run itself uses is stripped rather than inherited: a
-    BLINK_SCENARIO or BLINK_TAP left over from the daemon passes would follow
-    the installer into whatever it starts, and BLINK_OTA_DIR set in the
-    operator's shell would silently decide which feed the update scenario
-    read -- a green run against the wrong release.
+    Every BLINK_* variable that changes what the program does is stripped
+    rather than inherited, because each of them is a way for the operator's
+    own shell to decide the verdict:
 
-    BLINK_SKIP_SERVICE goes in the CHILD, and only the child. It is what keeps
-    `blink install` from registering a login agent on this desk and `blink
-    update` from restarting one; the agent's own process must never have it
-    (see the module docstring).
+      - BLINK_RELEASE_PUBKEY_FILE is the dangerous one. It makes the update
+        verify against a key of the caller's choosing (pc/update.py:73-85),
+        and tests/ci/check_update.sh exports it by design -- so it is a
+        variable somebody working in this repository plausibly has set. With
+        it inherited, update_path would happily verify a throwaway locally
+        signed manifest and report that it had proved the real update path.
+        The entire claim of that scenario is that a fabricated feed CANNOT
+        drive it, and this variable is the one thing that makes that false.
+      - BLINK_OTA_DIR set outside would silently choose which feed was read:
+        a green run against the wrong release.
+      - BLINK_NO_AUTO_UPDATE and a leftover BLINK_SCENARIO or BLINK_TAP from
+        the daemon passes would follow the installer into whatever it starts.
+
+    Stripped by list rather than by prefix on purpose: BLINK_SKIP_SERVICE is
+    set two lines below, and a sweep would be one refactor away from removing
+    the variable that keeps `blink install` off this desk's login services.
+    That one goes in the CHILD and only the child; the agent's own process
+    must never have it (see the module docstring).
     """
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["BLINK_SKIP_SERVICE"] = "1"
-    for leftover in ("BLINK_SCENARIO", "BLINK_TAP", "BLINK_OTA_DIR"):
+    for leftover in ("BLINK_SCENARIO", "BLINK_TAP", "BLINK_OTA_DIR",
+                     "BLINK_RELEASE_PUBKEY_FILE", "BLINK_NO_AUTO_UPDATE"):
         env.pop(leftover, None)
     _redirect_home(env, sandbox_dir)
     if ota_dir is not None:
@@ -738,20 +753,62 @@ def reported_version(text):
     return None
 
 
-def _run_program(cmd, env, runner, name, what):
-    """Run one of the release's own commands. Returns (result, problems)."""
+class _Ran(NamedTuple):
+    """What a command did, with its output decoded to text exactly once."""
+    returncode: int
+    stdout: str
+    stderr: str
+
+
+def _decode_console(raw):
+    """Text out of a program's output, whatever it wrote it in.
+
+    UTF-8 first, then the machine's own preferred encoding, then UTF-8 with
+    replacements so that something always comes back. Nothing here may raise:
+    this is the diagnostic in a failure message, and a decoder that threw
+    would replace the problem the run found with one about reading it.
+    """
+    if isinstance(raw, str):
+        return raw
+    if not raw:
+        return ""
+    for codec in ("utf-8", locale.getpreferredencoding(False)):
+        try:
+            return raw.decode(codec)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _run_program(cmd, env, runner, name, what, ours=True):
+    """Run one command. Returns (_Ran or None, problems).
+
+    `ours=False` is for a program that is not one of ours -- which here means
+    tar and unzip. Our own children are told PYTHONIOENCODING=utf-8, so
+    naming that encoding to subprocess reads them back correctly. tar.exe is
+    not a Python program and has never heard of that variable: on Windows it
+    writes in the machine's own code page, and the message it writes contains
+    the path it failed on -- which on the desk that matters contains a
+    non-ASCII profile name. Forced through UTF-8, the one diagnostic a failed
+    unpack has comes back as a row of replacement characters. So its bytes
+    are captured and decoded here instead, where there is somewhere to fall
+    back to.
+    """
+    kwargs = {"env": env, "capture_output": True, "timeout": BUNDLE_TIMEOUT_S}
+    if ours:
+        kwargs.update(encoding="utf-8", errors="replace")
     try:
-        done = runner([str(c) for c in cmd], env=env, capture_output=True,
-                      encoding="utf-8", errors="replace",
-                      timeout=BUNDLE_TIMEOUT_S)
+        done = runner([str(c) for c in cmd], **kwargs)
     except Exception as e:
         return None, [f"Scenario {name}: {what} could not be run at all: {e}."
                       f" The command was {' '.join(str(c) for c in cmd)}."]
-    if done.returncode != 0:
-        return done, [f"Scenario {name}: {what} exited {done.returncode}."
-                      f" It printed: {_tail(done.stdout)}"
-                      f"{_tail(done.stderr, ' Errors: ')}"]
-    return done, []
+    ran = _Ran(done.returncode, _decode_console(done.stdout),
+               _decode_console(done.stderr))
+    if ran.returncode != 0:
+        return ran, [f"Scenario {name}: {what} exited {ran.returncode}."
+                     f" It printed: {_tail(ran.stdout)}"
+                     f"{_tail(ran.stderr, ' Errors: ')}"]
+    return ran, []
 
 
 def _tail(text, prefix=""):
@@ -772,7 +829,8 @@ def _version_of(binary, env, runner, name, what):
     return version, []
 
 
-def unpack_bundle(archive, dest, runner=subprocess.run, name=FRESH_INSTALL):
+def unpack_bundle(archive, dest, runner=subprocess.run, name=FRESH_INSTALL,
+                  home=None):
     """Unpack a release archive and hand back the directory holding the program.
 
     The archive carries one top-level `blink/` directory so that a person who
@@ -781,6 +839,12 @@ def unpack_bundle(archive, dest, runner=subprocess.run, name=FRESH_INSTALL):
     directory itself is checked too, rather than assuming a layout, and an
     archive that yielded no program at all is reported as that instead of as a
     version check against a file that is not there.
+
+    The unpacker gets a redirected home like every other child. tar writes
+    where -C tells it to and would not read one, so this buys no safety by
+    itself -- it keeps an invariant whole. "Both variables, always" is worth
+    having only if there is no child anywhere in this file that is the
+    exception, because the exception is what the next person copies.
     """
     archive, dest = Path(archive), Path(dest)
     if not archive.exists():
@@ -794,8 +858,9 @@ def unpack_bundle(archive, dest, runner=subprocess.run, name=FRESH_INSTALL):
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         return None, [f"Scenario {name}: cannot create {dest}: {e}."]
-    _, problems = _run_program(cmd, dict(os.environ), runner, name,
-                               f"unpacking {archive.name} with {cmd[0]}")
+    _, problems = _run_program(cmd, bundle_env(home or dest), runner, name,
+                               f"unpacking {archive.name} with {cmd[0]}",
+                               ours=False)
     if problems:
         return None, problems
     for candidate in (dest / "blink", dest):
@@ -899,12 +964,15 @@ def run_update_check(prev_dir, ota_dir, expect_version, runner=subprocess.run,
                      sandbox=None, name=UPDATE_PATH):
     """Install the previous release, update it off the feed, prove the result.
 
-    The previous release is installed first rather than updated in place from
-    the unpacked directory, because the half of this that can go wrong is the
-    rotation over an existing install -- <bin> to <bin>.old and <bin>.new to
-    <bin> (pc/update.py:322-360), directories that a running program is inside
-    of. An update that only ever wrote into an empty ~/.blink/bin would prove
-    the download and skip the rename.
+    The previous release is installed first, and it is the INSTALLED copy
+    that runs the update -- not the unpacked bundle. Both halves of that
+    matter, and for the same reason: what can go wrong here is the rotation,
+    <bin> to <bin>.old and <bin>.new to <bin> (pc/update.py:322-360), of a
+    directory the running program is inside of. Updating from the unpacked
+    bundle would rename a directory nothing is running from, and updating
+    into an empty ~/.blink/bin would prove the download and skip the rename.
+    Either shortcut leaves the Windows desk -- the one where a locked file is
+    a real possibility -- untested by the scenario named after it.
 
     Two ways this could pass while proving nothing, both closed here:
 
@@ -951,7 +1019,14 @@ def run_update_check(prev_dir, ota_dir, expect_version, runner=subprocess.run,
     if problems:
         return {"ok": False, "problems": problems}
 
-    _, problems = _run_program([exe, "update"], bundle_env(sandbox, ota_dir),
+    # The INSTALLED copy runs the update, not the unpacked bundle. That is
+    # what a customer does, and it is the only arrangement that exercises the
+    # risk: update.apply renames the directory the running executable is
+    # inside of (pc/update.py:322-360). Run from the bundle, the rename is of
+    # a directory nothing is running from -- which cannot fail the way
+    # Windows fails, and so proves nothing about the desk most likely to.
+    _, problems = _run_program([installed, "update"],
+                               bundle_env(sandbox, ota_dir),
                                runner, name, "`blink update`")
     if problems:
         return {"ok": False, "problems": problems}
@@ -969,11 +1044,31 @@ def run_update_check(prev_dir, ota_dir, expect_version, runner=subprocess.run,
     return {"ok": not problems, "problems": problems}
 
 
+def _clear(work):
+    """Empty a scenario's working directory before it is used again.
+
+    The work root is a fixed path beside --out and nothing else ever removes
+    it, so without this the sandbox home outlives the run that made it and
+    the next run's version check reads a program THIS run's installer never
+    wrote. An installer that exits 0 having copied nothing is not a
+    hypothetical -- that is what `blink install` does when handed an unfrozen
+    build (pc/cli.py:1123) -- and the leftovers would prove it correct,
+    hiding exactly the packaging fault these scenarios exist to catch.
+
+    It also restores the name: after the first run, every fresh_install would
+    otherwise be an install over an existing one.
+    """
+    work = Path(work)
+    shutil.rmtree(work, ignore_errors=True)
+    (work / "home").mkdir(parents=True, exist_ok=True)
+    return work
+
+
 def run_fresh_install(archive, workroot, deps, expect_version):
     """The fresh_install scenario, from the archive a release published."""
-    work = Path(workroot) / FRESH_INSTALL
+    work = _clear(Path(workroot) / FRESH_INSTALL)
     bundle, problems = unpack_bundle(archive, work / "unpacked", deps.runner,
-                                     FRESH_INSTALL)
+                                     FRESH_INSTALL, home=work / "home")
     if problems:
         return {"ok": False, "problems": problems}
     return run_install_check(bundle, expect_version, runner=deps.runner,
@@ -982,12 +1077,12 @@ def run_fresh_install(archive, workroot, deps, expect_version):
 
 def run_update_path(archive, ota_dir, workroot, deps, expect_version):
     """The update_path scenario: the previous release, brought up to date."""
-    work = Path(workroot) / UPDATE_PATH
+    work = _clear(Path(workroot) / UPDATE_PATH)
     problems = check_feed_dir(ota_dir)
     if problems:
         return {"ok": False, "problems": problems}
     bundle, problems = unpack_bundle(archive, work / "unpacked", deps.runner,
-                                     UPDATE_PATH)
+                                     UPDATE_PATH, home=work / "home")
     if problems:
         return {"ok": False, "problems": problems}
     return run_update_check(bundle, ota_dir, expect_version,
@@ -1164,11 +1259,12 @@ def parse_args(argv=None):
     # scenario with nothing to compare against would run a real installer and
     # then have no verdict to give, and the version is the entire claim.
     if (args.bundle or args.prev_bundle) and not args.expect_version:
-        ap.error("--bundle and --prev-bundle need --expect-version: the"
-                 " scenario's whole claim is that the program ends up"
+        ap.error("Both --bundle and --prev-bundle need --expect-version:"
+                 " the scenario's whole claim is that the program ends up"
                  " reporting a particular version.")
     if args.prev_bundle and not args.ota_dir:
-        ap.error("--prev-bundle needs --ota-dir, a directory holding the"
+        ap.error("The --prev-bundle scenario needs --ota-dir too, a"
+                 " directory holding the"
                  " candidate release's manifest.json, manifest.json.sig and"
                  " platform archive. The update verifies that signature"
                  " against the key frozen into the binary, so the files have"

@@ -35,22 +35,33 @@ def _bin_name():
     return "blink.exe" if sys.platform == "win32" else "blink"
 
 
-def _programs(bundle_version="1.2.4", installed=None, install_leaves=...,
-              install_code=0, update_to=None, update_code=0, update_out="",
+def _programs(bundle_version="1.2.4", install_leaves=..., install_code=0,
+              copies=True, update_to=None, update_code=0, update_out="",
               unpacks=True):
     """A stand-in for every program these scenarios run.
 
     Answers `--version`, `install` and `update` for two distinct programs --
-    the unpacked bundle and the copy under the sandbox home -- and models the
-    one thing that makes the scenarios meaningful: the installed copy's
-    version changes only when a command actually replaced it.
+    the unpacked bundle and the copy under the sandbox home -- and it keeps
+    the second of those ON DISK rather than in a variable, deliberately. The
+    installed copy is a file that exists only because something put it there,
+    and a fake that remembered it in a dict could not tell an install that
+    worked apart from a directory left over by the run before. That
+    difference is the whole of fresh_install.
 
-    It also stands in for `tar`, creating the directory a real unpack would
+    `copies=False` is the installer that exits 0 having copied nothing --
+    what `blink install` does when handed an unfrozen build (pc/cli.py:1123),
+    which is exactly the packaging fault this scenario is there to catch.
+
+    It also stands in for `tar`, writing the program a real unpack would
     leave, so the agent's own "did a program come out of this archive?" check
     has something to look at.
     """
-    state = {"installed": installed}
     calls = []
+
+    def _put(kw, version):
+        where = agent.installed_bin_under(agent.Path(kw["env"]["HOME"]))
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(version, encoding="utf-8")
 
     def run(cmd, **kw):
         argv = [str(c) for c in cmd]
@@ -63,31 +74,32 @@ def _programs(bundle_version="1.2.4", installed=None, install_leaves=...,
                         dest = agent.Path(argv[argv.index(flag) + 1]) / "blink"
                         dest.mkdir(parents=True, exist_ok=True)
                         (dest / _bin_name()).write_text("x", encoding="utf-8")
-            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-        under_home = ".blink" in prog
+            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         if verb == "--version":
-            version = state["installed"] if under_home else bundle_version
-            if version is None:
-                return types.SimpleNamespace(returncode=1, stdout="",
-                                             stderr="no such program")
+            if ".blink" in prog:
+                where = agent.Path(prog)
+                if not where.exists():
+                    raise FileNotFoundError(prog)
+                version = where.read_text(encoding="utf-8")
+            else:
+                version = bundle_version
             return types.SimpleNamespace(returncode=0,
                                          stdout=f"blink {version}\n", stderr="")
         if verb == "install":
-            if install_code == 0:
-                state["installed"] = (bundle_version if install_leaves is ...
-                                      else install_leaves)
+            if install_code == 0 and copies:
+                _put(kw, bundle_version if install_leaves is ...
+                     else install_leaves)
             return types.SimpleNamespace(returncode=install_code,
                                          stdout="Installed.\n", stderr="")
         if verb == "update":
             if update_code == 0 and update_to is not None:
-                state["installed"] = update_to
+                _put(kw, update_to)
             return types.SimpleNamespace(returncode=update_code,
                                          stdout=update_out or "updated\n",
                                          stderr="")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     run.calls = calls
-    run.state = state
     return run
 
 
@@ -222,6 +234,50 @@ def test_install_check_sandboxes_both_home_variables(tmp_path):
         assert env["HOME"] != os.path.expanduser("~")
 
 
+# --- what the child must not inherit ----------------------------------
+
+LEAKY = ("BLINK_RELEASE_PUBKEY_FILE", "BLINK_OTA_DIR", "BLINK_NO_AUTO_UPDATE",
+         "BLINK_SCENARIO", "BLINK_TAP")
+
+
+def test_bundle_env_strips_a_signing_key_override(tmp_path, monkeypatch):
+    """The one variable that could turn a fabricated feed into a green run.
+
+    BLINK_RELEASE_PUBKEY_FILE makes the update verify against a key of the
+    operator's choosing (pc/update.py:73-85), and tests/ci/check_update.sh
+    sets it by design -- so it is a variable somebody working in this
+    repository plausibly has exported. Inherited, update_path would verify a
+    throwaway locally signed release and report that it had proved the real
+    signed update path.
+    """
+    for name in LEAKY:
+        monkeypatch.setenv(name, "leaked")
+    env = agent.bundle_env(tmp_path)
+    for name in LEAKY:
+        assert name not in env, f"{name} reached the child"
+
+
+def test_nothing_leaky_reaches_any_child_of_either_scenario(
+        tmp_path, monkeypatch):
+    for name in LEAKY:
+        monkeypatch.setenv(name, "leaked")
+    runner = _programs(bundle_version="1.2.4", update_to="1.3.0")
+    agent.run_install_check(tmp_path / "b", expect_version="1.2.4",
+                            runner=runner, sandbox=tmp_path / "h1")
+    agent.run_update_check(tmp_path / "prev", tmp_path / "feed",
+                           expect_version="1.3.0", runner=runner,
+                           sandbox=tmp_path / "h2")
+    assert runner.calls
+    for call in runner.calls:
+        env = call["kw"]["env"]
+        for name in LEAKY:
+            if name == "BLINK_OTA_DIR" and call["cmd"][-1] == "update":
+                assert env[name] == str(tmp_path / "feed")
+                continue
+            assert env.get(name) != "leaked", \
+                f"{name} reached `{call['cmd'][-1]}`"
+
+
 # --- the update path --------------------------------------------------
 
 def test_update_check_takes_the_candidate_off_the_feed(tmp_path):
@@ -280,6 +336,25 @@ def test_update_check_starts_from_an_install_of_the_previous_release(tmp_path):
     assert verbs.index("install") < verbs.index("update")
 
 
+def test_the_update_is_run_from_the_installed_copy(tmp_path):
+    """A customer updates the program that is running from ~/.blink/bin.
+
+    That is the whole risk in an update: update.apply rotates the directory
+    the running executable is inside of (pc/update.py:322-360). Run from the
+    unpacked bundle instead, the rename is of a directory nothing is running
+    from -- which is the one arrangement that cannot fail the way Windows
+    fails.
+    """
+    runner = _programs(bundle_version="1.2.4", update_to="1.3.0")
+    agent.run_update_check(tmp_path / "prev", tmp_path / "feed",
+                           expect_version="1.3.0", runner=runner,
+                           sandbox=tmp_path / "home")
+    update = [c for c in runner.calls if c["cmd"][-1] == "update"]
+    assert len(update) == 1
+    assert ".blink" in update[0]["cmd"][0], \
+        "the update must be run by the installed program, not by the bundle"
+
+
 def test_update_check_sandboxes_both_home_variables(tmp_path):
     runner = _programs(bundle_version="1.2.4", update_to="1.3.0")
     home = tmp_path / "home"
@@ -291,6 +366,51 @@ def test_update_check_sandboxes_both_home_variables(tmp_path):
         assert env["BLINK_SKIP_SERVICE"] == "1"
         if call["cmd"][-1] != "update":
             assert "BLINK_OTA_DIR" not in env
+
+
+# --- reading what a program printed -----------------------------------
+
+def test_the_unpacker_is_decoded_here_rather_than_by_subprocess(tmp_path):
+    """tar.exe is not one of our children and ignores PYTHONIOENCODING.
+
+    On the Windows desk it writes in the machine's own code page, and the
+    message it writes contains the path -- which on that desk contains the
+    non-ASCII profile name. Forced through UTF-8 it comes back as replacement
+    characters, degrading the one diagnostic a failed unpack has.
+    """
+    seen = {}
+
+    def runner(cmd, **kw):
+        seen.update(kw)
+        return types.SimpleNamespace(returncode=1, stdout=b"",
+                                     stderr=b"tar: no such file")
+
+    where, problems = agent.unpack_bundle(_archive(tmp_path), tmp_path / "u",
+                                          runner)
+    assert where is None and "no such file" in problems[0]
+    assert "encoding" not in seen and "errors" not in seen
+
+
+def test_a_message_in_the_machines_own_encoding_still_reads(monkeypatch):
+    monkeypatch.setattr(agent.locale, "getpreferredencoding",
+                        lambda *a: "cp1255")
+    assert agent._decode_console("גלית".encode("cp1255")) == "גלית"
+
+
+def test_decoding_never_raises_on_bytes_nothing_can_read():
+    assert isinstance(agent._decode_console(b"\xff\xfe\xff"), str)
+    assert agent._decode_console(b"plain") == "plain"
+    assert agent._decode_console("already text") == "already text"
+    assert agent._decode_console(None) == ""
+
+
+def test_our_own_children_are_still_decoded_as_utf8(tmp_path):
+    """They are told PYTHONIOENCODING=utf-8, so they are read back by name."""
+    runner = _programs(bundle_version="1.3.0")
+    agent.run_install_check(tmp_path / "b", expect_version="1.3.0",
+                            runner=runner, sandbox=tmp_path / "home")
+    ours = [c for c in runner.calls if c["cmd"][0] not in ("tar", "unzip")]
+    assert ours and all(c["kw"]["encoding"] == "utf-8" for c in ours)
 
 
 # --- the feed the update reads ----------------------------------------
@@ -358,6 +478,75 @@ def test_the_update_scenario_needs_a_feed_and_a_previous_bundle(tmp_path):
         "--expect-version", "1.3.0"])
     out = agent.customer_path(args, tmp_path / "work", _deps(runner))
     assert out["update_path"]["ok"] is True, out["update_path"]["problems"]
+
+
+def _customer_args(tmp_path, *extra):
+    return agent.parse_args([
+        "--scenarios", str(_scenarios(tmp_path)),
+        "--out", str(tmp_path / "r.json"),
+        "--expect-version", "1.3.0", *extra])
+
+
+def test_fresh_install_does_not_pass_on_the_last_runs_residue(tmp_path):
+    """The work root is a fixed path and nothing else clears it.
+
+    So `<out>/fleet-work/fresh_install/home/.blink/bin/blink` outlives the run
+    that made it, and the next run's version check would read a program the
+    installer never wrote. An installer that exits 0 having copied nothing --
+    what an unfrozen archive produces -- would then be proved correct by the
+    leftovers of the run before, which is precisely the packaging fault this
+    scenario exists to catch.
+    """
+    work = tmp_path / "work"
+    stale = agent.installed_bin_under(work / agent.FRESH_INSTALL / "home")
+    stale.parent.mkdir(parents=True)
+    stale.write_text("1.3.0", encoding="utf-8")
+
+    runner = _programs(bundle_version="1.3.0", copies=False)
+    args = _customer_args(tmp_path, "--bundle", str(_archive(tmp_path)))
+    out = agent.customer_path(args, work, _deps(runner))
+    assert out[agent.FRESH_INSTALL]["ok"] is False
+    assert not stale.exists(), "the work directory was not cleared"
+
+
+def test_the_update_scenario_also_starts_from_a_cleared_directory(tmp_path):
+    work = tmp_path / "work"
+    stale = agent.installed_bin_under(work / agent.UPDATE_PATH / "home")
+    stale.parent.mkdir(parents=True)
+    stale.write_text("1.3.0", encoding="utf-8")
+
+    runner = _programs(bundle_version="1.2.4", copies=False)
+    args = _customer_args(tmp_path,
+                          "--prev-bundle", str(_archive(tmp_path)),
+                          "--ota-dir", str(_feed(tmp_path)))
+    out = agent.customer_path(args, work, _deps(runner))
+    assert out[agent.UPDATE_PATH]["ok"] is False
+    assert not stale.exists(), "the work directory was not cleared"
+
+
+def test_a_second_run_over_the_first_still_passes(tmp_path):
+    """Clearing must not make the scenario fail on its own leftovers."""
+    work = tmp_path / "work"
+    args = _customer_args(tmp_path, "--bundle", str(_archive(tmp_path)))
+    for _ in range(2):
+        out = agent.customer_path(args, work,
+                                  _deps(_programs(bundle_version="1.3.0")))
+        assert out[agent.FRESH_INSTALL]["ok"] is True, \
+            out[agent.FRESH_INSTALL]["problems"]
+
+
+def test_even_the_unpacker_runs_with_a_redirected_home(tmp_path):
+    """The invariant is both variables, always -- with no exception for tar."""
+    runner = _programs(bundle_version="1.3.0")
+    args = _customer_args(tmp_path, "--bundle", str(_archive(tmp_path)))
+    agent.customer_path(args, tmp_path / "work", _deps(runner))
+    unpackers = [c for c in runner.calls if c["cmd"][0] in ("tar", "unzip")]
+    assert unpackers, "no unpack was attempted"
+    for call in runner.calls:
+        env = call["kw"]["env"]
+        assert env["HOME"] != os.path.expanduser("~")
+        assert env["USERPROFILE"] != os.path.expanduser("~")
+        assert env["HOME"] == env["USERPROFILE"]
 
 
 def test_a_bundle_without_an_expected_version_is_refused(tmp_path):
