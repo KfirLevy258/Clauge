@@ -32,14 +32,16 @@ class _RealCommandAttempted(BaseException):
 
 
 class _Runs:
-    """Stands in for subprocess.run: records argv, replays exit codes."""
+    """Stands in for subprocess.run: records argv and kwargs, replays codes."""
 
     def __init__(self, codes=None):
         self.calls = []
+        self.kwargs = []
         self._codes = list(codes or [])
 
     def __call__(self, argv, **kw):
         self.calls.append(list(argv))
+        self.kwargs.append(kw)
         code = self._codes.pop(0) if self._codes else 0
         return subprocess.CompletedProcess(argv, code, stdout="", stderr="")
 
@@ -60,6 +62,38 @@ class _Runs:
         return False
 
 
+class _Killer:
+    """Stands in for cli._kill_recorded_daemon.
+
+    Records the runner it was handed, and reports how many daemons it found
+    -- which is what tells a Windows stop with no Scheduled Task whether it
+    freed the port or found nothing to free.
+    """
+
+    def __init__(self):
+        self.runners = []
+        self.count = 0
+
+    def __call__(self, runner=None):
+        self.runners.append(runner)
+        return self.count
+
+
+class _RecordingBackend:
+    """A backend that does nothing but remember which runner it was handed."""
+
+    def __init__(self):
+        self.handed = None
+
+    def stop(self, runner=None):
+        self.handed = runner
+        return "stopped"
+
+    def start(self, runner=None):
+        self.handed = runner
+        return "started"
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """HOME is redirected by tests/conftest.py; this adds the stubs."""
@@ -72,14 +106,21 @@ def home(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture
+def killer(monkeypatch):
+    k = _Killer()
+    monkeypatch.setattr(cli, "_kill_recorded_daemon", k)
+    return k
+
+
 def _platform(monkeypatch, name):
     monkeypatch.setattr(cli.sys, "platform", name)
 
 
-def _write(path):
+def _write(path, text="x"):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        f.write("x")
+        f.write(text)
 
 
 def _pretend_installed(monkeypatch):
@@ -131,17 +172,8 @@ def test_launchd_without_a_plist_is_not_an_error(home, monkeypatch):
 
 # --------------------------------------------------------------- schtasks --
 
-@pytest.fixture
-def killed(monkeypatch):
-    """Records _kill_recorded_daemon, and the runner it was handed."""
-    seen = []
-    monkeypatch.setattr(cli, "_kill_recorded_daemon",
-                        lambda runner=None: seen.append(runner))
-    return seen
-
-
 def test_schtasks_stop_ends_the_task_and_kills_the_detached_daemon(
-        home, monkeypatch, killed):
+        home, monkeypatch, killer):
     # /end only reaches the instance the task launched. A daemon that replaced
     # itself started its successor detached, and that one keeps COM15 open --
     # a stop that leaves it running reads as a hardware fault.
@@ -149,31 +181,50 @@ def test_schtasks_stop_ends_the_task_and_kills_the_detached_daemon(
     r = _Runs()
     assert cli._SchtasksBackend().stop(r) == "stopped"
     assert r.ran("schtasks", "/end", "/tn", cli.TASK_NAME)
-    assert killed == [r]
+    assert killer.runners == [r]
 
 
 def test_schtasks_stop_kills_the_daemon_even_with_no_task_registered(
-        home, monkeypatch, killed):
+        home, monkeypatch, killer):
     _platform(monkeypatch, "win32")
+    killer.count = 1                           # a detached daemon was running
     r = _Runs(codes=[1])                       # /query: no such task
-    assert cli._SchtasksBackend().stop(r) == "not installed"
+    # The port really was freed, so the answer does not deny it was held.
+    assert cli._SchtasksBackend().stop(r) == "not installed; killed a detached daemon"
     assert not r.ran("/end")
-    assert killed == [r]                       # ...but the port is still freed
+    assert killer.runners == [r]
 
 
-def test_schtasks_start_runs_the_task(home, monkeypatch, killed):
+def test_schtasks_stop_with_nothing_at_all_running(home, monkeypatch, killer):
+    _platform(monkeypatch, "win32")
+    r = _Runs(codes=[1])
+    assert cli._SchtasksBackend().stop(r) == "not installed"
+
+
+def test_schtasks_start_runs_the_task(home, monkeypatch, killer):
     _platform(monkeypatch, "win32")
     r = _Runs()
     assert cli._SchtasksBackend().start(r) == "started"
     assert r.ran("schtasks", "/run", "/tn", cli.TASK_NAME)
-    assert killed == []                        # start() never kills anything
+    assert killer.runners == []                # start() never kills anything
 
 
-def test_schtasks_start_without_the_task_is_not_an_error(home, monkeypatch, killed):
+def test_schtasks_start_without_the_task_is_not_an_error(home, monkeypatch, killer):
     _platform(monkeypatch, "win32")
     r = _Runs(codes=[1])
     assert cli._SchtasksBackend().start(r) == "not installed"
     assert not r.ran("/run")
+
+
+def test_the_recorded_daemon_is_killed_by_pid_through_the_runner(home, monkeypatch):
+    """The kill itself: by pid, with the runner it was handed, counted."""
+    _platform(monkeypatch, "win32")
+    monkeypatch.setattr(cli.update.ota, "NO_WINDOW", {"creationflags": 0x08000000})
+    _write(cli.pid_path(), "424242")
+    r = _Runs()
+    assert cli._kill_recorded_daemon(runner=r) == 1
+    assert r.ran("taskkill", "/f", "/t", "/pid", "424242")
+    assert r.kwargs[0].get("creationflags") == 0x08000000
 
 
 # ---------------------------------------------------------------- systemd --
@@ -222,7 +273,7 @@ def test_an_unknown_platform_says_what_it_cannot_do(home, monkeypatch):
 
 # ----------------------------------------------------------------- safety --
 
-def test_stopping_and_starting_never_installs_or_removes(home, monkeypatch, killed):
+def test_stopping_and_starting_never_installs_or_removes(home, monkeypatch, killer):
     """The one thing this pair must never do.
 
     stop/start bracket a test run on a machine someone works on: a stray
@@ -246,14 +297,106 @@ def test_stopping_and_starting_never_installs_or_removes(home, monkeypatch, kill
             assert os.path.exists(artifact()), f"{platform} deleted its own unit"
 
 
+def test_every_command_hides_the_console_window(home, monkeypatch, killer):
+    """The v1.2.1 fix: nothing Blink starts may flash a console window.
+
+    update.ota.NO_WINDOW is an empty dict off Windows, so asserting on its
+    real value would be vacuous on the machine most likely to run this suite
+    -- and a call site that dropped the spread would stay green. A sentinel
+    value is what actually pins it.
+    """
+    monkeypatch.setattr(cli.update.ota, "NO_WINDOW", {"creationflags": 0x08000000})
+    for platform, artifact in (("win32", None),
+                               ("darwin", cli.plist_path),
+                               ("linux", cli.unit_path)):
+        _platform(monkeypatch, platform)
+        monkeypatch.setattr(cli.shutil, "which", lambda _n: "/usr/bin/systemctl")
+        if artifact:
+            _write(artifact())
+        r = _Runs()
+        cli.backend().stop(r)
+        cli.backend().start(r)
+        assert r.kwargs, f"{platform} ran nothing to check"
+        for kw in r.kwargs:
+            assert kw.get("creationflags") == 0x08000000, (platform, kw)
+
+
 # ------------------------------------------------------- the thin wrappers --
 
 def test_no_unit_test_can_stop_the_real_service(home):
     """BLINK_SKIP_SERVICE, set for every test by tests/conftest.py."""
     r = _Runs()
-    assert "skipped" in service_ctl.stop_service(runner=r)
-    assert "skipped" in service_ctl.start_service(runner=r)
+    for out in (service_ctl.stop_service(runner=r),
+                service_ctl.start_service(runner=r)):
+        assert out.skipped is True and out.ok is False
+        assert "BLINK_SKIP_SERVICE" in str(out)
     assert r.calls == []
+
+
+def test_a_skipped_stop_cannot_be_read_as_a_done_one(home, monkeypatch):
+    """Both answers are a line of prose, so the difference has to be a field.
+
+    tests/ci/check_install.sh documents exporting BLINK_SKIP_SERVICE=1, so a
+    fleet agent started from such a shell is a real path: it would stop
+    nothing, be refused the port, and blame the board -- and since the start
+    no-ops too, it leaves a perfectly healthy desk and nothing to diagnose.
+    """
+    skipped = service_ctl.stop_service(runner=_Runs())
+    monkeypatch.delenv("BLINK_SKIP_SERVICE")
+    _pretend_installed(monkeypatch)
+    done = service_ctl.stop_service(runner=_Runs())
+    assert skipped.skipped and not done.skipped
+    assert str(skipped) != str(done)
+
+
+def test_the_outcome_still_reads_as_the_line_it_replaced(home, monkeypatch):
+    monkeypatch.delenv("BLINK_SKIP_SERVICE")
+    _pretend_installed(monkeypatch)
+    out = service_ctl.stop_service(runner=_Runs())
+    assert str(out) == out.detail and isinstance(out.detail, str)
+
+
+def test_ok_tracks_what_the_backend_actually_did(home, monkeypatch, killer):
+    """Pins service_ctl._WORKED to the phrases the backends really return."""
+    monkeypatch.delenv("BLINK_SKIP_SERVICE")
+    _platform(monkeypatch, "darwin")
+    assert service_ctl.stop_service(runner=_Runs()).ok          # not installed
+    _write(cli.plist_path())
+    assert service_ctl.stop_service(runner=_Runs()).ok          # stopped
+    assert service_ctl.start_service(runner=_Runs()).ok         # started
+    assert not service_ctl.stop_service(runner=_Runs(codes=[1])).ok
+    _platform(monkeypatch, "freebsd14")
+    assert not service_ctl.stop_service(runner=_Runs()).ok      # no supervisor
+    _platform(monkeypatch, "win32")
+    killer.count = 1
+    out = service_ctl.stop_service(runner=_Runs(codes=[1]))     # no task, but
+    assert out.ok and "killed a detached daemon" in str(out)    # the port is free
+
+
+def test_a_runner_less_call_uses_the_runner_the_suite_stubbed(home, monkeypatch):
+    """WHEN the default runner is resolved, which is a safety property.
+
+    It has to be looked up on the subprocess module at call time. Captured
+    once -- as a `runner=subprocess.run` default argument, or any module
+    constant standing in for one -- it is the real function, and neither this
+    file's tripwire nor the stub the rest of the suite installs can take it
+    back. That leaves one delenv("BLINK_SKIP_SERVICE") between a test and the
+    logged-in user's agent, which is the incident tests/conftest.py describes.
+
+    Note what this does NOT depend on: spelling it cli.subprocess.run rather
+    than importing subprocess here is only a statement of intent, since both
+    read the same attribute off the one module object at call time. The
+    binding time is the part that bites, so that is the part pinned here.
+    """
+    monkeypatch.delenv("BLINK_SKIP_SERVICE")
+    stub = _Runs()
+    monkeypatch.setattr(cli.subprocess, "run", stub)
+    b = _RecordingBackend()
+    monkeypatch.setattr(cli, "backend", lambda: b)
+    service_ctl.stop_service()
+    assert b.handed is stub
+    service_ctl.start_service()
+    assert b.handed is stub
 
 
 def test_stop_and_start_drive_this_machine_platform(home, monkeypatch):
@@ -276,7 +419,7 @@ def test_a_failing_command_is_reported_not_raised(home, monkeypatch):
     monkeypatch.delenv("BLINK_SKIP_SERVICE")
     _pretend_installed(monkeypatch)
     out = service_ctl.stop_service(runner=_Runs(codes=[1, 1, 1]))
-    assert isinstance(out, str) and "not" in out.lower()
+    assert out.ok is False and "not" in str(out).lower()
 
 
 def test_a_missing_tool_is_reported_not_raised(home, monkeypatch):
@@ -288,5 +431,6 @@ def test_a_missing_tool_is_reported_not_raised(home, monkeypatch):
     def _absent(argv, **kw):
         raise FileNotFoundError(2, "No such file or directory", argv[0])
 
-    assert isinstance(service_ctl.stop_service(runner=_absent), str)
-    assert isinstance(service_ctl.start_service(runner=_absent), str)
+    for out in (service_ctl.stop_service(runner=_absent),
+                service_ctl.start_service(runner=_absent)):
+        assert out.ok is False and isinstance(out.detail, str)

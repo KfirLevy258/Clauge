@@ -687,7 +687,9 @@ class _SchtasksBackend(_Backend):
         port, and a second process asking for the same COM port is refused
         with "Access is denied" -- which looks exactly like a board fault. So
         the kill happens even when there is no task registered at all: the
-        port is the thing being freed here, not the task.
+        port is the thing being freed here, not the task, and an unregistered
+        task with a live detached daemon says so rather than reporting the
+        bare "not installed" that would deny the port was ever held.
         """
         run = runner or subprocess.run
         registered = self._registered(run)
@@ -695,9 +697,10 @@ class _SchtasksBackend(_Backend):
         if registered:
             r = run(["schtasks", "/end", "/tn", TASK_NAME],
                     capture_output=True, **update.ota.NO_WINDOW)
-        _kill_recorded_daemon(runner=run)
+        killed = _kill_recorded_daemon(runner=run)
         if not registered:
-            return "not installed"
+            return ("not installed; killed a detached daemon" if killed
+                    else "not installed")
         if r.returncode == 0:
             return "stopped"
         return f'could not stop it: schtasks /end /tn "{TASK_NAME}"'
@@ -883,8 +886,12 @@ def _remove_service() -> str:
 _rm = update._rm
 
 
-def _kill_recorded_daemon(runner=None):
+def _kill_recorded_daemon(runner=None) -> int:
     """Stop the bridge by the pid it wrote for itself, not by its name.
+
+    Returns how many pids it signalled, which stop() reports: on a machine
+    with no Scheduled Task registered, a daemon killed here is the difference
+    between a freed serial port and one still held.
 
     Ending the Scheduled Task ends the process the task launched. PyInstaller's
     onefile bootloader re-executes the same .exe as a child, and that child
@@ -897,7 +904,8 @@ def _kill_recorded_daemon(runner=None):
     what the previous attempt did. /t takes the bootloader's child with it.
     """
     if sys.platform != "win32":
-        return
+        return 0
+    killed = 0
     # Every place a daemon may have left its pid: ~/.blink since 1.1.0, and
     # beside the program before that -- which, after 1.1.0's install has
     # rotated the directory, means bin.old. The first 1.0.4 -> 1.1.0
@@ -921,6 +929,8 @@ def _kill_recorded_daemon(runner=None):
             ["taskkill", "/f", "/t", "/pid", str(pid),
              "/fi", "IMAGENAME eq " + os.path.basename(installed_bin())],
             capture_output=True, **update.ota.NO_WINDOW)
+        killed += 1
+    return killed
 
 
 def _kill_by_path():
