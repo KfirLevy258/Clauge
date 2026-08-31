@@ -1,0 +1,12 @@
+{
+  "name": "sleep_wake",
+  "note": "A 40s silent gap between the second and third steps -- longer than the 30s sleep threshold -- is the whole point: the board must sleep on host silence and still apply the frame that arrives after it wakes, proving the wake path applies usage rather than just clearing the display.",
+  "steps": [
+    {"at": 0,  "provider": "claude", "session_pct": 40.0, "weekly_pct": 15.0, "state": "running"},
+    {"at": 5,  "provider": "claude", "session_pct": 45.0, "weekly_pct": 16.0, "state": "running"},
+    {"at": 45, "provider": "claude", "session_pct": 50.0, "weekly_pct": 17.0, "state": "running"},
+    {"at": 50, "provider": "claude", "session_pct": 55.0, "weekly_pct": 18.0, "state": "running"}
+  ],
+  "duration_s": 60,
+  "expect": {"min_tx": 4, "min_board_usage": 4, "min_stale_lines": 0, "quiet_window_s": 35}
+}

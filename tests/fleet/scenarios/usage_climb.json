@@ -1,0 +1,14 @@
+{
+  "name": "usage_climb",
+  "note": "Baseline happy path: usage climbing steadily while the tool runs. Proves ordinary frames get sent, applied, and rendered with nothing exceptional going on -- the control scenario the other three are exceptions to.",
+  "steps": [
+    {"at": 0,  "provider": "claude", "session_pct": 10.0, "weekly_pct": 20.0, "state": "running"},
+    {"at": 5,  "provider": "claude", "session_pct": 25.0, "weekly_pct": 24.0, "state": "running"},
+    {"at": 10, "provider": "claude", "session_pct": 40.0, "weekly_pct": 28.0, "state": "running"},
+    {"at": 15, "provider": "claude", "session_pct": 55.0, "weekly_pct": 32.0, "state": "running"},
+    {"at": 20, "provider": "claude", "session_pct": 70.0, "weekly_pct": 36.0, "state": "running"},
+    {"at": 25, "provider": "claude", "session_pct": 85.0, "weekly_pct": 40.0, "state": "running"}
+  ],
+  "duration_s": 30,
+  "expect": {"min_tx": 6, "min_board_usage": 6, "min_stale_lines": 0, "quiet_window_s": 0}
+}
