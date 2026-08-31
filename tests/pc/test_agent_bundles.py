@@ -21,6 +21,8 @@ reports when a command genuinely put something there.
 """
 import json
 import os
+import pathlib
+import re
 import sys
 import types
 
@@ -236,8 +238,89 @@ def test_install_check_sandboxes_both_home_variables(tmp_path):
 
 # --- what the child must not inherit ----------------------------------
 
-LEAKY = ("BLINK_RELEASE_PUBKEY_FILE", "BLINK_OTA_DIR", "BLINK_NO_AUTO_UPDATE",
-         "BLINK_SCENARIO", "BLINK_TAP")
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+SHIPPED = [ROOT / "claude_usage_bridge.py", ROOT / "blink_main.py",
+           *sorted((ROOT / "pc").rglob("*.py"))]
+BLINK_VAR = re.compile(r"BLINK_[A-Z0-9_]+")
+
+# Names matching the pattern that are not environment variables the program
+# reads. Empty, and worth keeping empty: every entry here is a name this
+# contract stops checking, so anything added needs a reason written beside it.
+NOT_AN_ENV_VAR = frozenset()
+
+
+def _shipped_blink_vars():
+    """Every BLINK_* variable the shipped program reads, from its own source.
+
+    Read out of the sources rather than listed here on purpose. A hand-kept
+    list is a snapshot: it was already one variable out of date when the
+    review found BLINK_RELEASE_PUBKEY_FILE in it, and it would have gone out
+    of date again the next time somebody added one to pc/. This cannot.
+    """
+    found = set()
+    for path in SHIPPED:
+        found |= set(BLINK_VAR.findall(path.read_text(encoding="utf-8")))
+    return found - NOT_AN_ENV_VAR
+
+
+LEAKY = tuple(sorted(_shipped_blink_vars()))
+
+
+def test_the_variable_sweep_still_finds_the_shipped_ones():
+    """If this grep ever comes back empty the contract below proves nothing."""
+    found = _shipped_blink_vars()
+    assert {"BLINK_OTA_DIR", "BLINK_RELEASE_PUBKEY_FILE", "BLINK_SKIP_SERVICE",
+            "BLINK_TAP", "BLINK_SCENARIO", "BLINK_POLL_INTERVAL_S",
+            "BLINK_NO_AUTO_UPDATE", "BLINK_NO_WATCHDOG"} <= found
+
+
+def test_no_blink_variable_reaches_a_child_by_inheritance(tmp_path,
+                                                          monkeypatch):
+    """Neither builder may pass on a BLINK_* variable it did not set itself.
+
+    The daemon passes matter here as much as the bundle ones, and arguably
+    more: an inherited BLINK_OTA_DIR redirects the FIRMWARE feed
+    (pc/ota.py:52), and a scenario is a running daemon offering firmware to a
+    real board. A stray variable in somebody's shell could put an unrelated
+    local build in front of three of them.
+    """
+    for name in LEAKY:
+        monkeypatch.setenv(name, "inherited")
+    daemon = agent.env_for_run(tmp_path, scenario=tmp_path / "s.json",
+                               tap=tmp_path / "t.jsonl", sandbox=True)
+    bundle = agent.bundle_env(tmp_path, ota_dir=tmp_path / "feed")
+    for name in LEAKY:
+        assert daemon.get(name) != "inherited", f"{name} reached the daemon"
+        assert bundle.get(name) != "inherited", f"{name} reached the bundle"
+
+
+def test_each_builder_sets_back_exactly_what_it_means_to(tmp_path,
+                                                         monkeypatch):
+    """The whole BLINK_* surface of each child, named.
+
+    Written as an equality rather than a list of absences so that it fails
+    both ways: a variable that leaks in, and a variable the sweep took away
+    that the child actually needed.
+    """
+    for name in LEAKY:
+        monkeypatch.setenv(name, "inherited")
+    scenario, tap = tmp_path / "s.json", tmp_path / "t.jsonl"
+
+    daemon = agent.env_for_run(tmp_path, scenario=scenario, tap=tap,
+                               sandbox=True, poll_interval=7.0)
+    assert {k: v for k, v in daemon.items() if k.startswith("BLINK_")} == {
+        "BLINK_SKIP_SERVICE": "1", "BLINK_TAP": str(tap),
+        "BLINK_POLL_INTERVAL_S": "7.0", "BLINK_SCENARIO": str(scenario)}
+
+    quiet = agent.env_for_run(tmp_path, scenario=None, tap=tap, sandbox=False)
+    assert "BLINK_SCENARIO" not in quiet
+
+    feed = tmp_path / "feed"
+    assert {k: v for k, v in agent.bundle_env(tmp_path, ota_dir=feed).items()
+            if k.startswith("BLINK_")} == {"BLINK_SKIP_SERVICE": "1",
+                                           "BLINK_OTA_DIR": str(feed)}
+    assert {k: v for k, v in agent.bundle_env(tmp_path).items()
+            if k.startswith("BLINK_")} == {"BLINK_SKIP_SERVICE": "1"}
 
 
 def test_bundle_env_strips_a_signing_key_override(tmp_path, monkeypatch):
@@ -250,11 +333,8 @@ def test_bundle_env_strips_a_signing_key_override(tmp_path, monkeypatch):
     throwaway locally signed release and report that it had proved the real
     signed update path.
     """
-    for name in LEAKY:
-        monkeypatch.setenv(name, "leaked")
-    env = agent.bundle_env(tmp_path)
-    for name in LEAKY:
-        assert name not in env, f"{name} reached the child"
+    monkeypatch.setenv("BLINK_RELEASE_PUBKEY_FILE", "/tmp/throwaway.pem")
+    assert "BLINK_RELEASE_PUBKEY_FILE" not in agent.bundle_env(tmp_path)
 
 
 def test_nothing_leaky_reaches_any_child_of_either_scenario(

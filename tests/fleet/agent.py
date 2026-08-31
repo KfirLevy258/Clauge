@@ -216,6 +216,35 @@ def prepare_scenario(path, board, workdir):
     return out
 
 
+def _clean_env():
+    """This process's environment with every inherited BLINK_* variable gone.
+
+    Swept by prefix rather than removed by name, because a list of names is a
+    snapshot and this has to stay true of variables nobody has written yet. A
+    hand-kept list was already one short when review found it: an inherited
+    BLINK_RELEASE_PUBKEY_FILE would have let update_path verify a throwaway
+    locally signed manifest and report that it had proved the real update
+    path, and tests/ci/check_update.sh exports exactly that variable.
+
+    The daemon passes need this as much as the install ones and arguably
+    more, because theirs reaches hardware: BLINK_OTA_DIR redirects the
+    FIRMWARE feed (pc/ota.py:52), and a scenario is a running daemon offering
+    firmware to a real board. A stray variable in the operator's shell could
+    put an unrelated local build in front of three of them.
+
+    Sweeping cannot cost us BLINK_SKIP_SERVICE, which is the one variable
+    that must reach every child: it is SET by each builder after this runs,
+    never inherited. Both builders are pinned by a test that names their
+    whole BLINK_* surface, so a reordering that broke that would fail at
+    once -- and another test reads the shipped sources for BLINK_* and
+    requires every name it finds to be swept here or set back deliberately,
+    so the pair cannot fall behind pc/ the way a list would.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("BLINK_")}
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
 def _redirect_home(env, sandbox_dir):
     """Point every notion of "the user's home" at the sandbox. Both, always.
 
@@ -240,12 +269,10 @@ def env_for_run(sandbox_dir, scenario, tap, sandbox=True,
     sees the operator's own home directory: the point of that pass is the
     account this machine actually has, which a redirected HOME hides.
     """
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
+    env = _clean_env()
     env["BLINK_SKIP_SERVICE"] = "1"
     env["BLINK_TAP"] = str(tap)
     env["BLINK_POLL_INTERVAL_S"] = str(poll_interval)
-    env.pop("BLINK_SCENARIO", None)
     if sandbox:
         _redirect_home(env, sandbox_dir)
     if scenario is not None:
@@ -701,35 +728,22 @@ def installed_bin_under(home):
 def bundle_env(sandbox_dir, ota_dir=None):
     """The environment for running a published release the way a customer does.
 
-    Every BLINK_* variable that changes what the program does is stripped
-    rather than inherited, because each of them is a way for the operator's
-    own shell to decide the verdict:
+    Nothing BLINK_* is inherited -- see _clean_env(), which both builders go
+    through -- and this one sets back only two things. BLINK_RELEASE_PUBKEY_FILE
+    is why that matters most here: it makes the update verify against a key of
+    the caller's choosing (pc/update.py:73-85), and tests/ci/check_update.sh
+    exports it by design, so it is a variable somebody working in this
+    repository plausibly has set. Inherited, update_path would verify a
+    throwaway locally signed manifest and report that it had proved the real
+    signed update path -- the exact claim the scenario exists to make.
 
-      - BLINK_RELEASE_PUBKEY_FILE is the dangerous one. It makes the update
-        verify against a key of the caller's choosing (pc/update.py:73-85),
-        and tests/ci/check_update.sh exports it by design -- so it is a
-        variable somebody working in this repository plausibly has set. With
-        it inherited, update_path would happily verify a throwaway locally
-        signed manifest and report that it had proved the real update path.
-        The entire claim of that scenario is that a fabricated feed CANNOT
-        drive it, and this variable is the one thing that makes that false.
-      - BLINK_OTA_DIR set outside would silently choose which feed was read:
-        a green run against the wrong release.
-      - BLINK_NO_AUTO_UPDATE and a leftover BLINK_SCENARIO or BLINK_TAP from
-        the daemon passes would follow the installer into whatever it starts.
-
-    Stripped by list rather than by prefix on purpose: BLINK_SKIP_SERVICE is
-    set two lines below, and a sweep would be one refactor away from removing
-    the variable that keeps `blink install` off this desk's login services.
-    That one goes in the CHILD and only the child; the agent's own process
-    must never have it (see the module docstring).
+    BLINK_SKIP_SERVICE goes in the CHILD and only the child. It is what keeps
+    `blink install` from registering a login agent on this desk and `blink
+    update` from restarting one; the agent's own process must never have it
+    (see the module docstring).
     """
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
+    env = _clean_env()
     env["BLINK_SKIP_SERVICE"] = "1"
-    for leftover in ("BLINK_SCENARIO", "BLINK_TAP", "BLINK_OTA_DIR",
-                     "BLINK_RELEASE_PUBKEY_FILE", "BLINK_NO_AUTO_UPDATE"):
-        env.pop(leftover, None)
     _redirect_home(env, sandbox_dir)
     if ota_dir is not None:
         env["BLINK_OTA_DIR"] = str(ota_dir)
