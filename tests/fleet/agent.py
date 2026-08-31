@@ -12,6 +12,12 @@ back -- from a finally, on every path including the ones that raise, because
 this brackets somebody's working day and the desk has to be exactly as it was
 found.
 
+Given --bundle and --prev-bundle it also runs the two scenarios that need no
+board at all: installing the release the way a customer does, and updating the
+previous one off a local copy of the signed feed. Those two run BEFORE the
+service is stopped -- neither goes near the serial port -- so an unplugged
+desk still answers for the half of the product a customer meets first.
+
 It also owns the daemon's LIFETIME, which is not a detail: a scenario with
 `host_silence_s` is run in two passes with the daemon stopped in between,
 because stopping the daemon is the only thing that makes this board sleep.
@@ -68,6 +74,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 from pc.service_ctl import start_service, stop_service
+from pc.update import archive_name, platform_key
 from tests.fleet import tap_asserts
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -115,6 +122,17 @@ REAL_ACCOUNT = "real_account"
 # lines and no sleep window can be asserted.
 REAL_ACCOUNT_EXPECT = {"min_tx": 1, "min_board_usage": 1,
                        "min_stale_lines": 0, "min_sleep_wakes": 0}
+
+# The two scenarios that need no board: what a customer does on day one, and
+# what they do on the day after the next release.
+FRESH_INSTALL = "fresh_install"
+UPDATE_PATH = "update_path"
+
+# Unpacking 50 MB, an installer that self-tests the copy it made, and an
+# update that downloads, unpacks and self-tests again. The self-test alone is
+# allowed 300 s (pc/update.py:244), measured at 97 s on a machine under load
+# average 89 -- a laptop mid-build, which is exactly when somebody runs this.
+BUNDLE_TIMEOUT_S = 900.0
 
 
 def _popen(cmd, env, cwd):
@@ -196,6 +214,22 @@ def prepare_scenario(path, board, workdir):
     return out
 
 
+def _redirect_home(env, sandbox_dir):
+    """Point every notion of "the user's home" at the sandbox. Both, always.
+
+    One function rather than the same two assignments in three places,
+    because the bug this prevents is precisely the one where somebody writes
+    only the line their own platform needs: expanduser reads HOME on POSIX
+    and USERPROFILE on Windows, and setting one without the other once sent
+    twelve tests writing into a real user profile while asserting against a
+    temporary directory (tests/conftest.py). The install and update scenarios
+    below run a real installer, so for them the cost of that mistake is not a
+    confused assertion -- it is somebody's actual ~/.blink.
+    """
+    env["HOME"] = env["USERPROFILE"] = str(sandbox_dir)
+    return env
+
+
 def env_for_run(sandbox_dir, scenario, tap, sandbox=True,
                 poll_interval=POLL_INTERVAL_S):
     """The environment for one daemon run.
@@ -211,7 +245,7 @@ def env_for_run(sandbox_dir, scenario, tap, sandbox=True,
     env["BLINK_POLL_INTERVAL_S"] = str(poll_interval)
     env.pop("BLINK_SCENARIO", None)
     if sandbox:
-        env["HOME"] = env["USERPROFILE"] = str(sandbox_dir)
+        _redirect_home(env, sandbox_dir)
     if scenario is not None:
         env["BLINK_SCENARIO"] = str(scenario)
     return env
@@ -427,8 +461,17 @@ def _one_pass(name, env, tap, seconds, port, deps, label):
     finally:
         problems += _stop_daemon(proc, f"{name}'s {label} daemon")
 
+    # Wire records only. The daemon walks a candidate list looking for the
+    # board (claude_usage_bridge.py:858-863) and prints as it goes, so on the
+    # twelve-port Windows desk the first record of a pass is routinely a
+    # foreign device being probed seconds before the real board answers.
+    # Measured from that line this would report the time to the first port
+    # chatter, and a genuinely late connect would slip past
+    # CONNECT_TOLERANCE_S to be blamed on the board -- the one outcome this
+    # measurement exists to prevent.
     fresh = read_tap(tap)[before:]
-    stamps = [t for t in (tap_asserts.as_number(r.get("t")) for r in fresh)
+    stamps = [t for t in (tap_asserts.as_number(r.get("t")) for r in fresh
+                          if r.get("dir") in ("rx", "tx"))
               if t is not None]
     return problems, (min(stamps) - started if stamps else None)
 
@@ -598,6 +641,380 @@ def _check_status_wire(deps):
             f" {(done.stdout or '').strip()[:200]!r}"]
 
 
+# --- the customer's own path: install it, then update it ----------------
+#
+# Every scenario above proves the daemon can drive the board. Neither of the
+# two below touches the board at all: they prove that the thing we publish can
+# be installed and can replace itself, which is the part of the product a
+# customer meets before the board ever lights up, and the part no amount of
+# running from a source checkout exercises.
+
+def unpack_cmd(archive, dest):
+    """The argv that unpacks a release archive into `dest`.
+
+    The machine's own tool rather than Python's tarfile/zipfile, because this
+    scenario is the customer's path and the customer unpacks a download with
+    whatever their machine ships. Windows 10 and macOS both ship bsdtar, which
+    reads a zip as happily as a tarball. GNU tar does not, so a zip on Linux
+    goes to unzip -- a case that only arises when an operator hands a Linux
+    desk the Windows archive by mistake, since archive_name() produces a zip
+    only for a windows key (pc/update.py:111).
+    """
+    archive, dest = str(archive), str(dest)
+    lowered = archive.lower()
+    if lowered.endswith((".tar.gz", ".tgz")):
+        return ["tar", "-xzf", archive, "-C", dest]
+    if lowered.endswith(".zip"):
+        if sys.platform.startswith("linux"):
+            return ["unzip", "-q", "-o", archive, "-d", dest]
+        return ["tar", "-xf", archive, "-C", dest]
+    raise ValueError(f"Cannot unpack {archive}: a release archive is a .tar.gz"
+                     f" or a .zip and this is neither. Pass the file the"
+                     f" release published, not the one beside it.")
+
+
+def bundle_bin(bundle_dir):
+    """The program inside an unpacked bundle.
+
+    The extension matters: without it Windows will not launch the file, which
+    is why the installed copy carries one too (pc/cli.py:51).
+    """
+    return Path(bundle_dir) / ("blink.exe" if sys.platform == "win32"
+                               else "blink")
+
+
+def installed_bin_under(home):
+    """Where `blink install` leaves the program, for a given home.
+
+    Mirrors pc/cli.py's blink_home()/bin_dir()/installed_bin(), which resolve
+    it from expanduser("~") on every call -- so a child with HOME and
+    USERPROFILE redirected installs here and nowhere near the operator's own
+    account. This is also where an update lands: cmd_update passes
+    installed_bin() to update.apply() (pc/cli.py:1542), which rotates the
+    directory rather than the file (<bin> -> <bin>.old, <bin>.new -> <bin>).
+    """
+    return bundle_bin(Path(home) / ".blink" / "bin")
+
+
+def bundle_env(sandbox_dir, ota_dir=None):
+    """The environment for running a published release the way a customer does.
+
+    Everything the fleet run itself uses is stripped rather than inherited: a
+    BLINK_SCENARIO or BLINK_TAP left over from the daemon passes would follow
+    the installer into whatever it starts, and BLINK_OTA_DIR set in the
+    operator's shell would silently decide which feed the update scenario
+    read -- a green run against the wrong release.
+
+    BLINK_SKIP_SERVICE goes in the CHILD, and only the child. It is what keeps
+    `blink install` from registering a login agent on this desk and `blink
+    update` from restarting one; the agent's own process must never have it
+    (see the module docstring).
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["BLINK_SKIP_SERVICE"] = "1"
+    for leftover in ("BLINK_SCENARIO", "BLINK_TAP", "BLINK_OTA_DIR"):
+        env.pop(leftover, None)
+    _redirect_home(env, sandbox_dir)
+    if ota_dir is not None:
+        env["BLINK_OTA_DIR"] = str(ota_dir)
+    return env
+
+
+def reported_version(text):
+    """The version out of `blink --version` output, or None.
+
+    Parsed to a token and compared whole, never matched as a substring: the
+    output is "blink 1.2.4", and asking whether "1.2" appears in it would pass
+    a run of 1.2.4 that was meant to prove 1.2 -- and, worse, pass a failed
+    update whose old version happens to be a prefix of the new one.
+    """
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].lower() == "blink":
+            return parts[1].strip()
+        if len(parts) == 1 and parts[0][:1].isdigit():
+            return parts[0].strip()
+    return None
+
+
+def _run_program(cmd, env, runner, name, what):
+    """Run one of the release's own commands. Returns (result, problems)."""
+    try:
+        done = runner([str(c) for c in cmd], env=env, capture_output=True,
+                      encoding="utf-8", errors="replace",
+                      timeout=BUNDLE_TIMEOUT_S)
+    except Exception as e:
+        return None, [f"Scenario {name}: {what} could not be run at all: {e}."
+                      f" The command was {' '.join(str(c) for c in cmd)}."]
+    if done.returncode != 0:
+        return done, [f"Scenario {name}: {what} exited {done.returncode}."
+                      f" It printed: {_tail(done.stdout)}"
+                      f"{_tail(done.stderr, ' Errors: ')}"]
+    return done, []
+
+
+def _tail(text, prefix=""):
+    text = (text or "").strip()
+    return f"{prefix}{text[-400:]!r}" if text else ""
+
+
+def _version_of(binary, env, runner, name, what):
+    """What a program says it is. Returns (version or None, problems)."""
+    done, problems = _run_program([binary, "--version"], env, runner, name,
+                                  f"{what} at {binary}")
+    if problems:
+        return None, problems
+    version = reported_version(done.stdout)
+    if version is None:
+        return None, [f"Scenario {name}: {what} at {binary} ran but printed no"
+                      f" version. It printed: {_tail(done.stdout)}"]
+    return version, []
+
+
+def unpack_bundle(archive, dest, runner=subprocess.run, name=FRESH_INSTALL):
+    """Unpack a release archive and hand back the directory holding the program.
+
+    The archive carries one top-level `blink/` directory so that a person who
+    unpacks it by hand gets a folder rather than a spill of files
+    (pc/update.py:256), so the program is normally a level down -- but the
+    directory itself is checked too, rather than assuming a layout, and an
+    archive that yielded no program at all is reported as that instead of as a
+    version check against a file that is not there.
+    """
+    archive, dest = Path(archive), Path(dest)
+    if not archive.exists():
+        return None, [f"Scenario {name}: there is no archive at {archive}."
+                      f" Download the release's own file and pass that path."]
+    try:
+        cmd = unpack_cmd(archive, dest)
+    except ValueError as e:
+        return None, [f"Scenario {name}: {e}"]
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return None, [f"Scenario {name}: cannot create {dest}: {e}."]
+    _, problems = _run_program(cmd, dict(os.environ), runner, name,
+                               f"unpacking {archive.name} with {cmd[0]}")
+    if problems:
+        return None, problems
+    for candidate in (dest / "blink", dest):
+        if bundle_bin(candidate).exists():
+            return candidate, []
+    return None, [f"Scenario {name}: {archive} unpacked into {dest} but there"
+                  f" is no {bundle_bin(dest).name} program in it. Either the"
+                  f" archive is not a BLINK release or it was built for"
+                  f" another platform."]
+
+
+def check_feed_dir(ota_dir, name=UPDATE_PATH):
+    """Say whether the local feed can serve an update, before one is attempted.
+
+    BLINK_OTA_DIR makes ota._get read <dir>/<basename of the url>
+    (pc/ota.py:87-93), and fetch_signed_manifest goes through it
+    (pc/update.py:183), so three files have to be present or the update stops
+    at a message the scenario would then have to reverse-engineer.
+
+    It cannot check that the signature verifies -- that is the update's job,
+    and deliberately so: the manifest is verified against the public key
+    frozen into the shipped binaries (pc/update.py:196), which is exactly why
+    a hand-written manifest cannot drive this scenario. The directory has to
+    come from a genuinely signed release, draft or published. What this
+    catches is the far more common mistake of pointing it at a directory that
+    has the archive but not the .sig, where `blink update` refuses the feed
+    and the run reads as a broken update path.
+    """
+    ota_dir = Path(ota_dir)
+    if not ota_dir.is_dir():
+        return [f"Scenario {name}: there is no feed directory at {ota_dir}."
+                f" It has to hold the candidate release's manifest.json,"
+                f" manifest.json.sig and platform archive."]
+    key = platform_key()
+    if key is None:
+        return [f"Scenario {name}: there is no published BLINK build for this"
+                f" machine ({platform.system()} {platform.machine()}), so no"
+                f" feed could serve it one."]
+    missing = [leaf for leaf in ("manifest.json", "manifest.json.sig",
+                                 archive_name(key))
+               if not (ota_dir / leaf).exists()]
+    if not missing:
+        return []
+    return [f"Scenario {name}: the feed at {ota_dir} is missing"
+            f" {', '.join(missing)}. The update path verifies the manifest's"
+            f" signature against the key frozen into the binary, so all three"
+            f" files have to be the ones a real release published -- download"
+            f" them from the release (a draft is fine), do not write them."]
+
+
+def run_install_check(bundle_dir, expect_version, runner=subprocess.run,
+                      sandbox=None, name=FRESH_INSTALL):
+    """Install an unpacked release into a sandbox home and prove what landed.
+
+    Three questions in the order a customer meets them: is this the build we
+    think it is, does `blink install` finish, and does the copy it left under
+    ~/.blink/bin run and report the same version.
+
+    The third is the reason this scenario exists. The first two are answered
+    by the archive we already have in our hands, and an installer that prints
+    its way to a cheerful ending while leaving a program that will not start
+    is not a hypothetical here: `blink install` stages a copy and hands it to
+    update.swap_in(), which self-tests it (pc/cli.py:1112) -- so this is the
+    fleet's independent check on the machinery that decides whether a
+    customer's login service has anything to run at all.
+    """
+    bundle_dir = Path(bundle_dir)
+    sandbox = Path(sandbox or bundle_dir.parent / "home")
+    sandbox.mkdir(parents=True, exist_ok=True)
+    env = bundle_env(sandbox)
+    exe = bundle_bin(bundle_dir)
+
+    got, problems = _version_of(exe, env, runner, name, "the unpacked program")
+    if got is not None and got != expect_version:
+        problems.append(
+            f"Scenario {name}: the unpacked program reports {got}, not the"
+            f" {expect_version} this run was told to expect. Either --bundle"
+            f" points at the wrong archive or --expect-version is wrong;"
+            f" nothing was installed.")
+    if problems:
+        return {"ok": False, "problems": problems}
+
+    _, problems = _run_program([exe, "install"], env, runner, name,
+                               "`blink install`")
+    if problems:
+        return {"ok": False, "problems": problems}
+
+    installed = installed_bin_under(sandbox)
+    got, problems = _version_of(installed, env, runner, name,
+                                "the installed program")
+    if not problems and got != expect_version:
+        problems.append(
+            f"Scenario {name}: `blink install` finished, but the program it"
+            f" left at {installed} reports {got} rather than"
+            f" {expect_version}. The install did not put this bundle in"
+            f" place.")
+    return {"ok": not problems, "problems": problems}
+
+
+def run_update_check(prev_dir, ota_dir, expect_version, runner=subprocess.run,
+                     sandbox=None, name=UPDATE_PATH):
+    """Install the previous release, update it off the feed, prove the result.
+
+    The previous release is installed first rather than updated in place from
+    the unpacked directory, because the half of this that can go wrong is the
+    rotation over an existing install -- <bin> to <bin>.old and <bin>.new to
+    <bin> (pc/update.py:322-360), directories that a running program is inside
+    of. An update that only ever wrote into an empty ~/.blink/bin would prove
+    the download and skip the rename.
+
+    Two ways this could pass while proving nothing, both closed here:
+
+      - `blink update` exits 0 for "Already up to date." So a previous bundle
+        that already reports the candidate version is refused before anything
+        is run, and the verdict is taken from what the installed program
+        reports afterwards, not from an exit status.
+      - a feed that does not verify is REFUSED, by design: the manifest is
+        checked against the key frozen into the binary (pc/update.py:196), so
+        a fabricated one cannot drive this. That path exits 1 and is reported
+        with what the command printed, so a red run says "not properly
+        signed" rather than leaving somebody to guess.
+    """
+    prev_dir = Path(prev_dir)
+    sandbox = Path(sandbox or prev_dir.parent / "home")
+    sandbox.mkdir(parents=True, exist_ok=True)
+    env = bundle_env(sandbox)
+    exe = bundle_bin(prev_dir)
+
+    previous, problems = _version_of(exe, env, runner, name,
+                                     "the previous release")
+    if problems:
+        return {"ok": False, "problems": problems}
+    if previous == expect_version:
+        return {"ok": False, "problems": [
+            f"Scenario {name}: the previous release reports {previous}, the"
+            f" same version this run expects to end on, so `blink update`"
+            f" would answer \"Already up to date.\" and this scenario would"
+            f" pass without updating anything. Point --prev-bundle at the"
+            f" release before {expect_version}."]}
+
+    _, problems = _run_program([exe, "install"], env, runner, name,
+                               "`blink install` of the previous release")
+    if problems:
+        return {"ok": False, "problems": problems}
+    installed = installed_bin_under(sandbox)
+    got, problems = _version_of(installed, env, runner, name,
+                                "the previous release, once installed")
+    if not problems and got != previous:
+        problems.append(
+            f"Scenario {name}: the previous release was installed but the"
+            f" program at {installed} reports {got} rather than {previous}."
+            f" There is nothing here to update from.")
+    if problems:
+        return {"ok": False, "problems": problems}
+
+    _, problems = _run_program([exe, "update"], bundle_env(sandbox, ota_dir),
+                               runner, name, "`blink update`")
+    if problems:
+        return {"ok": False, "problems": problems}
+
+    got, problems = _version_of(installed, env, runner, name,
+                                "the updated program")
+    if not problems and got != expect_version:
+        problems.append(
+            f"Scenario {name}: `blink update` finished without complaining,"
+            f" but the program at {installed} still reports {got} rather than"
+            f" {expect_version}. The feed was read and nothing newer was"
+            f" taken from it: check that its manifest names a daemon version"
+            f" above {previous} and an artifact for"
+            f" {platform_key() or 'this platform'}.")
+    return {"ok": not problems, "problems": problems}
+
+
+def run_fresh_install(archive, workroot, deps, expect_version):
+    """The fresh_install scenario, from the archive a release published."""
+    work = Path(workroot) / FRESH_INSTALL
+    bundle, problems = unpack_bundle(archive, work / "unpacked", deps.runner,
+                                     FRESH_INSTALL)
+    if problems:
+        return {"ok": False, "problems": problems}
+    return run_install_check(bundle, expect_version, runner=deps.runner,
+                             sandbox=work / "home")
+
+
+def run_update_path(archive, ota_dir, workroot, deps, expect_version):
+    """The update_path scenario: the previous release, brought up to date."""
+    work = Path(workroot) / UPDATE_PATH
+    problems = check_feed_dir(ota_dir)
+    if problems:
+        return {"ok": False, "problems": problems}
+    bundle, problems = unpack_bundle(archive, work / "unpacked", deps.runner,
+                                     UPDATE_PATH)
+    if problems:
+        return {"ok": False, "problems": problems}
+    return run_update_check(bundle, ota_dir, expect_version,
+                            runner=deps.runner, sandbox=work / "home")
+
+
+def customer_path(args, workroot, deps):
+    """The scenarios that need no board, as {name: outcome}.
+
+    Each gets a home of its own, and neither of them gets the one the daemon
+    scenarios share. `blink install` writes a program into ~/.blink/bin and
+    hooks into ~/.claude/settings.json, and sandbox_home() is deliberately one
+    directory for the whole run -- an installed program appearing in it
+    halfway through would change what the passes after it are running against,
+    for no gain, since the isolation that matters is from the operator's own
+    account and is already had.
+    """
+    out = {}
+    if args.bundle:
+        out[FRESH_INSTALL] = run_fresh_install(args.bundle, workroot, deps,
+                                               args.expect_version)
+    if args.prev_bundle:
+        out[UPDATE_PATH] = run_update_path(args.prev_bundle, args.ota_dir,
+                                           workroot, deps, args.expect_version)
+    return out
+
+
 def run(args, deps=None):
     """The whole pass on this machine, as the results document.
 
@@ -623,6 +1040,17 @@ def run(args, deps=None):
         result["problems"].append(f"{e} Nothing was run and the installed"
                                   f" service was left alone.")
         return _finish(result)
+
+    # Before the service is touched, and before a board is asked for. Neither
+    # of these opens the serial port -- both run into a sandbox home with
+    # BLINK_SKIP_SERVICE set -- so neither is a reason to take somebody's
+    # daemon away, and a desk whose board is unplugged still returns a verdict
+    # on the half of the product a customer meets first.
+    for scenario, outcome in customer_path(args, workroot, deps).items():
+        result["scenarios"][scenario] = outcome
+        print(f"[fleet] {scenario}: {'ok' if outcome['ok'] else 'FAILED'}")
+        for problem in outcome["problems"]:
+            print(f"        {problem}")
 
     stopped = deps.stop()
     print(f"[fleet] stop service: {stopped}")
@@ -713,12 +1141,38 @@ def parse_args(argv=None):
     ap.add_argument("--real-timeout", type=float,
                     default=REAL_ACCOUNT_TIMEOUT_S,
                     help="Seconds to wait for a real reading")
+    ap.add_argument("--bundle", default=None,
+                    help="Release archive for this platform, installed fresh"
+                         " into a sandbox home as the fresh_install scenario")
+    ap.add_argument("--prev-bundle", default=None,
+                    help="The PREVIOUS release's archive, installed and then"
+                         " brought up to date as the update_path scenario")
+    ap.add_argument("--ota-dir", default=None,
+                    help="Directory holding the candidate release's"
+                         " manifest.json, manifest.json.sig and archive,"
+                         " served to the update as BLINK_OTA_DIR")
+    ap.add_argument("--expect-version", default=None,
+                    help="The version both customer-path scenarios must end"
+                         " up reporting")
     ap.add_argument("--poll-interval", type=float, default=POLL_INTERVAL_S,
                     help="Seconds between the daemon's usage polls. A slower"
                          " poll lengthens the wait after each scenario to"
                          " match, so raising it cannot fail a run by itself")
     args = ap.parse_args(argv)
     args.only = [n.strip() for n in args.only.split(",")] if args.only else None
+    # Refused here rather than reported as a failed scenario. A customer-path
+    # scenario with nothing to compare against would run a real installer and
+    # then have no verdict to give, and the version is the entire claim.
+    if (args.bundle or args.prev_bundle) and not args.expect_version:
+        ap.error("--bundle and --prev-bundle need --expect-version: the"
+                 " scenario's whole claim is that the program ends up"
+                 " reporting a particular version.")
+    if args.prev_bundle and not args.ota_dir:
+        ap.error("--prev-bundle needs --ota-dir, a directory holding the"
+                 " candidate release's manifest.json, manifest.json.sig and"
+                 " platform archive. The update verifies that signature"
+                 " against the key frozen into the binary, so the files have"
+                 " to come from a real release -- a draft is fine.")
     return args
 
 

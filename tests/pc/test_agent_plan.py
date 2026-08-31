@@ -536,6 +536,31 @@ def test_a_prompt_connect_is_not_flagged(tmp_path):
     assert "inconclusive" not in result["scenarios"]["x"]
 
 
+def test_the_connect_delay_is_measured_from_the_BOARD_not_from_chatter(
+        tmp_path):
+    """The first record of a pass is not necessarily the board.
+
+    The daemon walks a candidate list looking for the board
+    (claude_usage_bridge.py:858-863) and prints as it goes, so on a desk with
+    twelve ports -- the Windows one -- the first line in the transcript can be
+    a foreign device being probed seconds before the board is found. Measured
+    from that line, a genuinely late connect looks prompt, and the scenario
+    that follows is reported as a board fault instead of as inconclusive:
+    exactly the outcome this protection exists to prevent.
+    """
+    def chatter_then_a_late_board(env, attempt):
+        out = [{"dir": "console", "t": 0.2,
+                "line": "[ports] trying /dev/cu.Bluetooth-Incoming-Port"}]
+        return out + [dict(r, t=r["t"] + 30) for r in _tap_lines()]
+
+    args = agent.parse_args(["--scenarios", str(_scenario(tmp_path)),
+                             "--out", str(tmp_path / "r.json")])
+    result = agent.run(args, _deps(spawn=_spawner(chatter_then_a_late_board)))
+    entry = result["scenarios"]["x"]
+    assert entry.get("inconclusive") is True
+    assert any("30" in p and "again" in p for p in entry["problems"])
+
+
 # --- the real-account pass --------------------------------------------
 
 def test_real_account_pass_wants_a_percentage_and_a_parseable_wire(tmp_path):
