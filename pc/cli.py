@@ -480,6 +480,34 @@ class _Backend:
     def restart(self) -> str:
         return "not running under a supervisor; restart it yourself"
 
+    def stop(self, runner=None) -> str:
+        """Stop the installed service, without uninstalling it.
+
+        Restart() is what `blink update` needs; this pair is what a test run
+        needs. The fleet suite drives the real daemon against a real board, so
+        it has to take the serial port off the service that owns it and hand
+        it back afterwards -- on a machine the user works on, where anything
+        that touched the plist, the unit file or the Scheduled Task itself
+        would rewrite their own installation on the way past. So: stop and
+        start only, and a service that is not installed is an answer rather
+        than an error, because start() is called from a finally block where
+        an exception would replace the failure the run was there to find.
+
+        runner is subprocess.run unless a caller substitutes one. Resolved at
+        call time rather than bound as a default argument, so a test that
+        stubs subprocess.run is still in charge of what this can execute.
+        """
+        return "not running under a supervisor; stop it yourself"
+
+    def start(self, runner=None) -> str:
+        """Start the installed service again. See stop() for the pair.
+
+        Not a restart: this assumes stop() ran, and does not go looking for
+        anything else to kill. A caller that wants both is asking for
+        restart().
+        """
+        return "not running under a supervisor; start it yourself"
+
     def remove(self) -> str:
         return "nothing to remove"
 
@@ -521,6 +549,36 @@ class _LaunchdBackend(_Backend):
         r = subprocess.run(["launchctl", "kickstart", "-k",
                             f"gui/{os.getuid()}/{LABEL}"], capture_output=True, **update.ota.NO_WINDOW)
         return "restarted" if r.returncode == 0 else "could not restart it"
+
+    def stop(self, runner=None) -> str:
+        """bootout, not `launchctl stop`.
+
+        The plist sets KeepAlive, so a stopped job is one launchd starts
+        straight back up -- the process would be gone for about a second and
+        the serial port would be held again before anything else could take
+        it. bootout unloads the job; the plist stays exactly where it is, and
+        start() below bootstraps that same file back in.
+        """
+        if not os.path.exists(plist_path()):
+            return "not installed"
+        uid = os.getuid()
+        r = (runner or subprocess.run)(
+            ["launchctl", "bootout", f"gui/{uid}/{LABEL}"],
+            capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode == 0:
+            return "stopped"
+        return f"could not stop it: launchctl bootout gui/{uid}/{LABEL}"
+
+    def start(self, runner=None) -> str:
+        if not os.path.exists(plist_path()):
+            return "not installed"
+        uid = os.getuid()
+        r = (runner or subprocess.run)(
+            ["launchctl", "bootstrap", f"gui/{uid}", plist_path()],
+            capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode == 0:
+            return "started"
+        return f"could not start it: launchctl bootstrap gui/{uid} {plist_path()}"
 
     def remove(self) -> str:
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
@@ -615,6 +673,45 @@ class _SchtasksBackend(_Backend):
                            capture_output=True, **update.ota.NO_WINDOW)
         return "restarted" if r.returncode == 0 else "could not restart it"
 
+    def _registered(self, runner=None) -> bool:
+        r = (runner or subprocess.run)(["schtasks", "/query", "/tn", TASK_NAME],
+                                       capture_output=True, **update.ota.NO_WINDOW)
+        return r.returncode == 0
+
+    def stop(self, runner=None) -> str:
+        """/end, and then the daemon /end cannot reach.
+
+        Same trap as restart(): /end stops the instance the TASK launched,
+        while a daemon that replaced itself started its successor detached
+        (see update.restart_from_daemon). That successor keeps the serial
+        port, and a second process asking for the same COM port is refused
+        with "Access is denied" -- which looks exactly like a board fault. So
+        the kill happens even when there is no task registered at all: the
+        port is the thing being freed here, not the task.
+        """
+        run = runner or subprocess.run
+        registered = self._registered(run)
+        r = None
+        if registered:
+            r = run(["schtasks", "/end", "/tn", TASK_NAME],
+                    capture_output=True, **update.ota.NO_WINDOW)
+        _kill_recorded_daemon(runner=run)
+        if not registered:
+            return "not installed"
+        if r.returncode == 0:
+            return "stopped"
+        return f'could not stop it: schtasks /end /tn "{TASK_NAME}"'
+
+    def start(self, runner=None) -> str:
+        run = runner or subprocess.run
+        if not self._registered(run):
+            return "not installed"
+        r = run(["schtasks", "/run", "/tn", TASK_NAME],
+                capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode == 0:
+            return "started"
+        return f'could not start it: schtasks /run /tn "{TASK_NAME}"'
+
     def remove(self) -> str:
         subprocess.run(["schtasks", "/end", "/tn", TASK_NAME], capture_output=True, **update.ota.NO_WINDOW)
         subprocess.run(["schtasks", "/delete", "/f", "/tn", TASK_NAME],
@@ -666,6 +763,32 @@ class _SystemdBackend(_Backend):
         r = subprocess.run(["systemctl", "--user", "restart",
                             "blink-bridge.service"], capture_output=True, **update.ota.NO_WINDOW)
         return "restarted" if r.returncode == 0 else "could not restart it"
+
+    def stop(self, runner=None) -> str:
+        if not self._has_systemctl():
+            return super().stop(runner)
+        if not os.path.exists(unit_path()):
+            return "not installed"
+        r = (runner or subprocess.run)(
+            ["systemctl", "--user", "stop", "blink-bridge.service"],
+            capture_output=True, **update.ota.NO_WINDOW)
+        # An explicit stop is not undone by Restart=always, so unlike launchd
+        # this needs nothing stronger than the obvious command.
+        if r.returncode == 0:
+            return "stopped"
+        return "could not stop it: systemctl --user stop blink-bridge.service"
+
+    def start(self, runner=None) -> str:
+        if not self._has_systemctl():
+            return super().start(runner)
+        if not os.path.exists(unit_path()):
+            return "not installed"
+        r = (runner or subprocess.run)(
+            ["systemctl", "--user", "start", "blink-bridge.service"],
+            capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode == 0:
+            return "started"
+        return "could not start it: systemctl --user start blink-bridge.service"
 
     def remove(self) -> str:
         if not self._has_systemctl():
@@ -760,7 +883,7 @@ def _remove_service() -> str:
 _rm = update._rm
 
 
-def _kill_recorded_daemon():
+def _kill_recorded_daemon(runner=None):
     """Stop the bridge by the pid it wrote for itself, not by its name.
 
     Ending the Scheduled Task ends the process the task launched. PyInstaller's
@@ -790,9 +913,14 @@ def _kill_recorded_daemon():
             continue
         if pid == os.getpid():
             continue              # somehow ours; nothing to stop
-        subprocess.run(["taskkill", "/f", "/t", "/pid", str(pid),
-                        "/fi", "IMAGENAME eq " + os.path.basename(installed_bin())],
-                       capture_output=True, **update.ota.NO_WINDOW)
+        # runner, so _Backend.stop() can be handed one and have every command
+        # it causes go the same way. None is subprocess.run, resolved here
+        # rather than as a default argument so the existing callers -- and the
+        # tests that stub subprocess.run for them -- are unaffected.
+        (runner or subprocess.run)(
+            ["taskkill", "/f", "/t", "/pid", str(pid),
+             "/fi", "IMAGENAME eq " + os.path.basename(installed_bin())],
+            capture_output=True, **update.ota.NO_WINDOW)
 
 
 def _kill_by_path():
