@@ -483,9 +483,15 @@ def run_scenario(path, board, workroot, port, deps,
             deps.sleep(silence)
             wake = tap_asserts.as_number(doc.get("wake_duration_s")) or \
                 _scenario_duration(doc)
-            more, _ = _one_pass(name, env, tap, wake + grace, port, deps,
-                                "wake")
+            more, wake_delay = _one_pass(name, env, tap, wake + grace, port,
+                                         deps, "wake")
             problems += more
+            # The wake pass needs the same protection as the first one, and
+            # needs it more: min_tx counts on the second daemon replaying
+            # every step, so a slow connect there merges two of them and
+            # comes up short -- which is the board being blamed for the port.
+            delay = max([d for d in (delay, wake_delay) if d is not None],
+                        default=None)
 
     problems += tap_asserts.check(read_tap(tap), doc.get("expect", {}), name)
     outcome = {"ok": not problems, "problems": problems}

@@ -95,14 +95,16 @@ def as_number(value):
     return float(value)
 
 
-def _frames(n):
-    """'1 usage frame', '3 usage frames'.
+def _plural(n, noun="usage frame"):
+    """'1 usage frame', '3 usage frames', '1 time', '2 times'.
 
     Trivial, and worth a function: "expected at least 1 usage frames" is the
     kind of line that makes a reader wonder whether the tool knows what it is
-    talking about, at the moment they most need to trust it.
+    talking about, at the moment they most need to trust it. Every count in
+    every message goes through here, so there is nowhere left for one to be
+    forgotten.
     """
-    return f"{n:.0f} usage frame" + ("" if n == 1 else "s")
+    return f"{n:.0f} {noun}" + ("" if n == 1 else "s")
 
 
 def _records(tap_lines, direction):
@@ -225,7 +227,7 @@ def check(tap_lines, expect, name=None):
 
     sent, refused = _usage_tx(tap_lines)
     if sent < min_tx:
-        note(f"expected at least {_frames(min_tx)} on the wire, and the host"
+        note(f"expected at least {_plural(min_tx)} on the wire, and the host"
              f" sent {sent}.")
     if refused:
         # send() refuses a line over 512 bytes, which is nearly always what
@@ -242,21 +244,22 @@ def check(tap_lines, expect, name=None):
 
     applied = _applied_lines(tap_lines)
     if len(applied) < min_board:
-        note(f"expected the board to apply at least {_frames(min_board)}, and"
+        note(f"expected the board to apply at least {_plural(min_board)}, and"
              f" it printed {len(applied)} '{APPLIED_MARKER.strip()}' lines.")
 
     stale = sum(1 for _, line in applied if STALE_MARKER in line)
     if stale < min_stale:
-        note(f"expected at least {min_stale:.0f} applied frames marked STALE,"
-             f" and {stale} of {len(applied)} were.")
+        note(f"expected at least {_plural(min_stale, 'applied frame')}"
+             f" marked STALE, and {stale} of {len(applied)} were.")
 
     if min_wakes > 0:
         wakes = _sleep_wakes(tap_lines)
         if wakes < min_wakes:
             note(f"expected the board to sleep and wake"
-                 f" {min_wakes:.0f} time(s) -- a"
+                 f" {_plural(min_wakes, 'time')} -- a"
                  f" '{WOKE_MARKER}' line followed by an applied frame -- and"
-                 f" it did that {wakes} time(s), so it never slept, or woke"
+                 f" it did that {_plural(wakes, 'time')}, so it never slept,"
+                 f" or woke"
                  f" and showed nothing. The board prints that line only from"
                  f" inside its sleep loop, which needs the DAEMON stopped for"
                  f" longer than the firmware's 30s host timeout: check the"

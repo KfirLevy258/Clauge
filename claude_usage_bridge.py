@@ -181,18 +181,37 @@ class Tap:
         return write2, rx2
 
 
-def install_tap(write_msg, on_message):
+def open_tap():
+    """The Tap for this connection, or None when BLINK_TAP is unset.
+
+    Separate from install_tap() because the transcript has to start earlier
+    than the read loop does. The port is opened, then probed, and the probe
+    reads and discards whatever the board said -- which is precisely when the
+    board says what it is and what state it was in. One connection, one Tap,
+    created before the first read.
+    """
+    path = os.environ.get("BLINK_TAP")
+    return Tap(path) if path else None
+
+
+def install_tap(write_msg, on_message, tap=None):
     """(tap, write_msg, on_message) for this connection.
 
     Unset BLINK_TAP hands back the two callables it was given, unchanged and
     unwrapped, and no file is opened. A daemon that behaves differently
     because a test facility exists is a defect, so the inert path costs one
     environment lookup and nothing else.
+
+    A caller that already has this connection's Tap passes it in, and gets it
+    back rather than a second one. That matters beyond tidiness: the Tap
+    holds the tail of a console line until its newline arrives, and the
+    probe's last read routinely ends mid-print. A fresh Tap here would drop
+    that tail on the floor and the line would arrive in the transcript with
+    its beginning missing.
     """
-    path = os.environ.get("BLINK_TAP")
-    if not path:
+    tap = tap or open_tap()
+    if tap is None:
         return None, write_msg, on_message
-    tap = Tap(path)
     write2, rx2 = tap.wrap(write_msg, on_message)
     return tap, write2, rx2
 
@@ -486,7 +505,7 @@ def learn_board(known, port, msg):
             "fw": msg.get("fw") or msg.get("cur") or known.get("fw")}
 
 
-def probe_is_our_board(ser, timeout=PROBE_S):
+def probe_is_our_board(ser, timeout=PROBE_S, tap=None):
     """Ask the thing on this port whether it is a Blink board, without a reset.
 
     Why this exists: the reset below is not free, and it is not aimed at a
@@ -503,6 +522,17 @@ def probe_is_our_board(ser, timeout=PROBE_S):
 
     A pleasant side effect: our own board stops being rebooted every time the
     daemon restarts, which it was, on every login and every service restart.
+
+    `tap` is the connection's transcript, when one is being kept, and this is
+    the only reason it is a parameter. What the board says here would
+    otherwise be read and thrown away: ser.read(n) does not return early on
+    partial data, so a single 0.2 s read comes back holding everything said
+    in that window -- the connect print, the pref reply, and anything the
+    welcome itself provoked. The one that provoked it matters most: a
+    sleeping board wakes on this welcome and prints that it is waking, so the
+    only evidence that it ever slept was being consumed by the question that
+    woke it. Unset BLINK_TAP means tap is None and this path is exactly what
+    it always was.
     """
     try:
         ser.reset_input_buffer()
@@ -514,6 +544,11 @@ def probe_is_our_board(ser, timeout=PROBE_S):
             chunk = ser.read(256)
             if not chunk:
                 continue
+            if tap:
+                # Before the identification below returns, not after: the
+                # chunk that identifies the board is usually the one carrying
+                # everything else it had to say.
+                tap.console(chunk)
             for msg in reader.feed(chunk):
                 # Any well-formed message of ours will do. The board sends
                 # ota_query on welcome and pings on its own schedule; which one
@@ -780,12 +815,17 @@ def main(argv=None):
             # purpose, and clears DTR first so GPIO0 is high when EN releases
             # (run mode, not the ROM loader).
             ser = serial.Serial(port, args.baud, timeout=0.2)
+            # The transcript starts at the port, not at the read loop. Built
+            # here, per connection, and handed to install_tap further down so
+            # a console line torn between the probe and the loop is still one
+            # line. None unless BLINK_TAP is set, which is every customer.
+            tap = open_tap()
             # Ask before pulling the reset line. See probe_is_our_board: the
             # VID:PID that got us here belongs to a chip used by a great deal
             # of hardware that is not ours, and a reset is not a question, it
             # is an action taken on someone's device.
             already_running = probe_is_our_board(
-                ser, PROBE_PATIENT_S if patient else PROBE_S)
+                ser, PROBE_PATIENT_S if patient else PROBE_S, tap)
             asked.add(port)
 
             # May this port be reset if it stays silent?
@@ -964,15 +1004,16 @@ def main(argv=None):
             update.restart_from_daemon(self_bin)     # does not return
             return True
 
-        # The tap sits around the two callables that carry the link, and is
-        # rebuilt per connection so a half-line left over from a board that
-        # was unplugged mid-print cannot glue itself to the next session.
+        # The tap sits around the two callables that carry the link. It was
+        # built at the top of this connection (so the probe's reads are in it)
+        # and is not shared with the next one: a half-line left over from a
+        # board unplugged mid-print cannot glue itself to a later session.
         # dispatch reaches `bridge` late, by closure: it is assigned just
         # below and nothing calls dispatch before the read loop.
         def dispatch(m):
             return bridge.on_message(m)
 
-        tap, write_msg, dispatch = install_tap(send, dispatch)
+        tap, write_msg, dispatch = install_tap(send, dispatch, tap)
 
         bridge = Bridge(write_msg=write_msg, fetch_usage=fetch,
                         flash_image=flash_image,

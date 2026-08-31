@@ -188,11 +188,17 @@ def test_malformed_records_do_not_raise():
 
 
 def test_counts_of_one_are_not_pluralised():
-    exp = dict(BASE, min_tx=1, min_board_usage=1)
+    """Every count in every message, not just the two that were noticed."""
+    exp = {"min_tx": 1, "min_board_usage": 1, "min_stale_lines": 1,
+           "min_sleep_wakes": 1}
     problems = check([_rx(0, "hello")], exp)
-    assert any("1 usage frame," in p or "1 usage frame " in p
-               for p in problems)
-    assert not any("1 usage frames" in p for p in problems)
+    assert len(problems) == 4, problems
+    # "0 times" is right; only a count of one takes the singular.
+    for wrong in ("1 usage frames", "1 applied frames", "1 times",
+                  "time(s)", "frame(s)"):
+        assert not any(wrong in p for p in problems), wrong
+    assert any("1 applied frame marked STALE" in p for p in problems)
+    assert any("sleep and wake 1 time " in p for p in problems)
 
 
 def test_problems_name_the_scenario():

@@ -507,6 +507,28 @@ def test_a_late_connect_is_inconclusive_rather_than_a_board_fault(tmp_path):
     assert any("30" in p and "again" in p for p in entry["problems"])
 
 
+def test_a_late_connect_on_the_WAKE_pass_is_inconclusive_too(tmp_path):
+    """min_tx counts on the second daemon replaying every step.
+
+    So the pass most likely to merge two steps into one frame is the one
+    after the silence, and it was the pass whose connect delay was thrown
+    away.
+    """
+    def late_second(env, attempt):
+        out = _tap_lines({"steps": [{"at": 0}, {"at": 5}]})
+        if os.path.getsize(env["BLINK_TAP"]) > 0:      # the wake pass
+            out.insert(0, {"dir": "console", "t": 0.0,
+                           "line": "[sleep] host back; opening eyes"})
+            out = [dict(r, t=r["t"] + 30) for r in out]
+        return out
+
+    d = _sleep_scenario(tmp_path)
+    outcome = agent.run_scenario(d / "naps.json", "claude", tmp_path / "w",
+                                 "auto", _deps(spawn=_spawner(late_second)))
+    assert outcome.get("inconclusive") is True
+    assert any("30" in p and "again" in p for p in outcome["problems"])
+
+
 def test_a_prompt_connect_is_not_flagged(tmp_path):
     args = agent.parse_args(["--scenarios", str(_scenario(tmp_path)),
                              "--out", str(tmp_path / "r.json")])

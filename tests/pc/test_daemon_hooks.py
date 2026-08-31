@@ -217,6 +217,98 @@ def test_blink_tap_installs_the_tap(tmp_path, monkeypatch):
     assert [l["dir"] for l in _lines(path)] == ["tx"]
 
 
+class _FakeSerial:
+    """Enough of a serial port for the probe: it answers once, then nothing.
+
+    read(n) returning one chunk that holds several lines is not a contrivance
+    -- it is what the real port does. ser.read(n) waits for n bytes or the
+    full timeout, so a 0.2 s probe read comes back with everything the board
+    said in that window, glued together.
+    """
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        self.written = []
+
+    def reset_input_buffer(self):
+        pass
+
+    def write(self, raw):
+        self.written.append(raw)
+
+    def read(self, n):
+        return self.chunks.pop(0) if self.chunks else b""
+
+
+# What the board says when the probe's welcome wakes it: proto.c prints on
+# connect, answers with pref, and the sleep loop notices within a frame or
+# two at 12 fps. All of it arrives inside the probe's window, in one chunk.
+WAKE_CHUNK = (b'[proto] host connected\n'
+              b'{"t":"pref","v":1,"provider":"claude"}\n'
+              b'[sleep] host back; opening eyes\n')
+
+
+def test_the_probe_window_is_in_the_transcript(tmp_path):
+    """The board's answer to the probe is the wire, so it belongs on the tap.
+
+    The probe runs before the read loop exists, reads a chunk, takes its
+    identification from it and drops the rest. Everything the board says
+    about what it is and what state it woke in is in that chunk -- including
+    the one line that proves it was asleep, which is printed BECAUSE the
+    probe's welcome arrived. A transcript that starts after the probe cannot
+    show any of it.
+    """
+    tap = cub.Tap(str(tmp_path / "tap.jsonl"))
+
+    assert cub.probe_is_our_board(_FakeSerial([WAKE_CHUNK]), 0.2, tap) is True
+
+    lines = [l["line"] for l in _lines(tmp_path / "tap.jsonl")
+             if l["dir"] == "console"]
+    assert "[sleep] host back; opening eyes" in lines
+    assert "[proto] host connected" in lines
+
+
+def test_one_tap_spans_the_probe_and_the_read_loop(tmp_path):
+    """A line torn across the two must not be torn in the transcript.
+
+    The probe's last read routinely ends mid-print. Only the same Tap object
+    can hold that tail until the read loop delivers its newline, which is why
+    the daemon builds the tap once per connection and hands it to
+    install_tap rather than letting install_tap make a second one.
+    """
+    path = tmp_path / "tap.jsonl"
+    tap = cub.Tap(str(path))
+    cub.probe_is_our_board(
+        _FakeSerial([b'{"t":"ping","v":1}\n[sleep] host back;']), 0.2, tap)
+
+    same, _, _ = cub.install_tap(lambda m: None, lambda m: None, tap)
+    assert same is tap
+    same.console(b" opening eyes\n")
+
+    lines = [l["line"] for l in _lines(path) if l["dir"] == "console"]
+    assert "[sleep] host back; opening eyes" in lines
+
+
+def test_the_probe_is_unchanged_for_anyone_not_recording(tmp_path,
+                                                         monkeypatch):
+    monkeypatch.delenv("BLINK_TAP", raising=False)
+    monkeypatch.chdir(tmp_path)
+    port = _FakeSerial([WAKE_CHUNK])
+
+    assert cub.open_tap() is None
+    assert cub.probe_is_our_board(port, 0.2, cub.open_tap()) is True
+    assert cub.probe_is_our_board(port, 0.2) is False   # nothing left to say
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_open_tap_follows_the_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("BLINK_TAP", str(tmp_path / "tap.jsonl"))
+    tap = cub.open_tap()
+    assert tap is not None
+    tap.console(b"hello\n")
+    assert _lines(tmp_path / "tap.jsonl")[0]["line"] == "hello"
+
+
 def test_an_unwritable_tap_is_reported_but_never_reaches_the_read_loop(
         tmp_path, capsys):
     # console() runs inside the daemon's read loop, whose except catches
