@@ -62,9 +62,12 @@ DEFAULT_SCENARIOS = REPO_ROOT / "tests" / "fleet" / "scenarios"
 # and the sequence under test would never reach the board.
 POLL_INTERVAL_S = 3.0
 
-# Time past the scenario's own duration before the daemon is stopped: the
-# last step still has to be polled, sent, applied and printed.
-GRACE_S = 8.0
+# Time past the scenario's own duration before the daemon is stopped. See
+# grace_s(): a fixed allowance is the wrong shape, because what has to happen
+# after the last step differs per scenario.
+GRACE_BASE_S = 8.0
+GRACE_POLLS = 2
+QUIET_GRACE_FRACTION = 0.25
 
 # The handshake that absorbs an asynchronous bootout.
 SETTLE_TIMEOUT_S = 15.0
@@ -179,6 +182,53 @@ def env_for_run(sandbox_dir, scenario, tap, sandbox=True,
     return env
 
 
+def grace_s(doc, poll_interval=POLL_INTERVAL_S):
+    """How long to keep the daemon alive past the scenario's own duration.
+
+    Three things have to happen after the last step's `at`, and only the
+    first of them is a constant:
+
+      - the daemon has to start, connect, apply the frame and print it. That
+        is the base allowance;
+      - a poll has to come round to notice the step at all. One poll can also
+        be missed while the daemon is still opening the port, so two are
+        allowed for -- which means a run told to poll slowly waits longer,
+        rather than failing for having been told;
+      - a board that was asleep has to wake up first. Only a scenario with a
+        quiet window has that problem, and the longer the silence the deeper
+        the sleep, so the allowance is a fraction of the window itself.
+
+    A fixed grace made sleep_wake -- the one scenario that spends most of its
+    duration deliberately silent -- the first to lose its final frame on a
+    slow desk. A flaky scenario inside a release gate is worse than a slow
+    one: it teaches people to re-run until green, and that ends the gate.
+    """
+    quiet = tap_asserts.as_number((doc.get("expect") or {})
+                                  .get("quiet_window_s")) or 0.0
+    return (GRACE_BASE_S + GRACE_POLLS * poll_interval
+            + QUIET_GRACE_FRACTION * max(quiet, 0.0))
+
+
+def sandbox_home(workroot):
+    """The one home directory every sandboxed pass in this run shares.
+
+    Per run, not per scenario. A fresh home has no cached release manifest,
+    so the daemon offers an update on every hello -- and a home per scenario
+    means an Install prompt on the panel at the start of every pass. It
+    cannot flash unattended, but it is noise on the one screen the run exists
+    to watch, and an invitation to a stray tap on a desk with somebody
+    sitting at it.
+
+    Sharing costs nothing that matters: the isolation this provides is from
+    the operator's real home, and one directory per run is as isolated as
+    five. It is also closer to how the daemon actually runs, which is the
+    thing the suite is trying to observe.
+    """
+    home = Path(workroot) / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    return home
+
+
 def select_scenarios(directory, only=None):
     """The scenario files to run, in name order.
 
@@ -257,24 +307,28 @@ def _heard_from_board(records):
     return any(r.get("dir") == "rx" for r in records)
 
 
-def preflight(workroot, port, deps):
+def preflight(workroot, port, deps, poll_interval=POLL_INTERVAL_S):
     """Wait for the port to actually be free, then say whether it ever was.
 
     stop_service() has returned by the time this runs, but launchctl bootout
     is asynchronous: the agent is gone and the file descriptor may not be.
-    The daemon is started under an empty sandbox home with no scenario, so it
-    has nothing to report and does nothing but greet the board -- all this
-    needs is one inbound message.
+    The daemon is started under the run's sandbox home with no scenario, so
+    it has nothing to report and does nothing but greet the board -- all this
+    needs is one inbound message. It is also the pass that warms that home's
+    release manifest, so the scenarios after it are not each met with a
+    firmware offer.
 
     A failure deliberately does not name a culprit. "Still held" and "no
     board attached" look identical from here, and a message that guessed
     would send someone at 2am to the wrong end of the desk.
     """
+    home = sandbox_home(workroot)
+    taps = Path(workroot) / "preflight"
+    taps.mkdir(parents=True, exist_ok=True)
     for attempt in range(1, SETTLE_ATTEMPTS + 1):
-        home = Path(workroot) / f"preflight-{attempt}"
-        home.mkdir(parents=True, exist_ok=True)
-        tap = home / "tap.jsonl"
-        env = env_for_run(home, scenario=None, tap=tap, sandbox=True)
+        tap = taps / f"tap-{attempt}.jsonl"
+        env = env_for_run(home, scenario=None, tap=tap, sandbox=True,
+                          poll_interval=poll_interval)
         try:
             proc = deps.spawn(daemon_cmd(port), env, REPO_ROOT)
         except Exception as e:
@@ -295,15 +349,24 @@ def preflight(workroot, port, deps):
                    f" no board is attached to this machine.")
 
 
-def run_scenario(path, board, workroot, port, deps):
-    """One scenario end to end: spawn, wait it out, stop, read, judge."""
+def run_scenario(path, board, workroot, port, deps,
+                 poll_interval=POLL_INTERVAL_S):
+    """One scenario end to end: spawn, wait it out, stop, read, judge.
+
+    The transcript and the rewritten scenario live in a directory of this
+    scenario's own; the daemon's home is the run's shared one. Keeping the
+    tap out of that home matters twice over: five passes appending to one
+    file could not be told apart, and a scenario's own artefacts have no
+    business in a directory the daemon treats as somebody's account.
+    """
     doc = json.loads(Path(path).read_text(encoding="utf-8"))
     name = doc.get("name", Path(path).stem)
-    home = Path(workroot) / name
-    home.mkdir(parents=True, exist_ok=True)
-    tap = home / "tap.jsonl"
-    scenario = prepare_scenario(path, board, home / "scenario")
-    env = env_for_run(home, scenario=scenario, tap=tap, sandbox=True)
+    work = Path(workroot) / name
+    work.mkdir(parents=True, exist_ok=True)
+    tap = work / "tap.jsonl"
+    scenario = prepare_scenario(path, board, work / "scenario")
+    env = env_for_run(sandbox_home(workroot), scenario=scenario, tap=tap,
+                      sandbox=True, poll_interval=poll_interval)
 
     problems = []
     proc = deps.spawn(daemon_cmd(port), env, REPO_ROOT)
@@ -312,7 +375,7 @@ def run_scenario(path, board, workroot, port, deps):
         if duration is None:
             duration = max([tap_asserts.as_number(s.get("at")) or 0
                             for s in doc.get("steps", [])] or [0]) + 10
-        deps.sleep(duration + GRACE_S)
+        deps.sleep(duration + grace_s(doc, poll_interval))
         if proc.poll() is not None:
             problems.append(f"Scenario {name}: the daemon exited on its own"
                             f" before the scenario was over (status"
@@ -340,7 +403,8 @@ def _real_usage_seen(records):
     return False
 
 
-def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S):
+def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S,
+                     poll_interval=POLL_INTERVAL_S):
     """The pass no scenario can stand in for: this machine's own account.
 
     Everything else in the suite replays an invented timeline, which proves
@@ -353,10 +417,11 @@ def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S):
     because it is the command a support conversation starts with and it must
     not be competing with the daemon for the port while it answers.
     """
-    home = Path(workroot) / REAL_ACCOUNT
-    home.mkdir(parents=True, exist_ok=True)
-    tap = home / "tap.jsonl"
-    env = env_for_run(home, scenario=None, tap=tap, sandbox=False)
+    work = Path(workroot) / REAL_ACCOUNT
+    work.mkdir(parents=True, exist_ok=True)
+    tap = work / "tap.jsonl"
+    env = env_for_run(work, scenario=None, tap=tap, sandbox=False,
+                      poll_interval=poll_interval)
 
     problems = []
     proc = deps.spawn(daemon_cmd(port), env, REPO_ROOT)
@@ -452,7 +517,8 @@ def run(args, deps=None):
         return _finish(result)
 
     try:
-        ready, detail = preflight(workroot, args.port, deps)
+        ready, detail = preflight(workroot, args.port, deps,
+                                  args.poll_interval)
         print(f"[fleet] preflight: {detail}")
         # Kept even when it succeeded: "the board answered on attempt 3" is
         # how a reader learns the port took ten seconds to come free on this
@@ -470,7 +536,7 @@ def run(args, deps=None):
         else:
             for path in paths:
                 outcome = run_scenario(path, args.board, workroot, args.port,
-                                       deps)
+                                       deps, args.poll_interval)
                 result["scenarios"][path.stem] = outcome
                 print(f"[fleet] {path.stem}:"
                       f" {'ok' if outcome['ok'] else 'FAILED'}")
@@ -478,7 +544,8 @@ def run(args, deps=None):
                     print(f"        {problem}")
             if args.real_account:
                 outcome = run_real_account(workroot, args.port, deps,
-                                           args.real_timeout)
+                                           args.real_timeout,
+                                           args.poll_interval)
                 result["scenarios"][REAL_ACCOUNT] = outcome
     except Exception as e:
         result["problems"].append(
@@ -520,6 +587,10 @@ def parse_args(argv=None):
     ap.add_argument("--real-timeout", type=float,
                     default=REAL_ACCOUNT_TIMEOUT_S,
                     help="Seconds to wait for a real reading")
+    ap.add_argument("--poll-interval", type=float, default=POLL_INTERVAL_S,
+                    help="Seconds between the daemon's usage polls. A slower"
+                         " poll lengthens the wait after each scenario to"
+                         " match, so raising it cannot fail a run by itself")
     args = ap.parse_args(argv)
     args.only = [n.strip() for n in args.only.split(",")] if args.only else None
     return args

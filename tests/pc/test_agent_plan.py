@@ -80,8 +80,9 @@ def _clock():
     return lambda: float(next(ticks))
 
 
-def _deps(**over):
-    base = dict(spawn=_spawner(), sleep=lambda s: None,
+def _deps(sleeps=None, **over):
+    base = dict(spawn=_spawner(),
+                sleep=(sleeps.append if sleeps is not None else lambda s: None),
                 now=_clock(),
                 runner=lambda *a, **k: types.SimpleNamespace(
                     returncode=0, stdout='{"t": "usage"}\n', stderr=""),
@@ -275,6 +276,90 @@ def test_a_board_that_never_speaks_fails_every_scenario_by_name(tmp_path):
     assert result["ok"] is False
     assert result["scenarios"]["x"]["ok"] is False
     assert any("port" in p for p in result["problems"])
+
+
+# --- one home for the whole run ---------------------------------------
+
+def test_every_sandboxed_pass_shares_one_home(tmp_path):
+    """A fresh home per scenario is a firmware offer per scenario.
+
+    With no cached manifest the daemon offers an update on every hello, and
+    the panel under test shows an Install prompt at the start of every pass --
+    noise on the one screen the run exists to watch, and an invitation to a
+    stray tap on a desk with somebody sitting at it. One home per run still
+    keeps the operator's real one untouched, which is the isolation that
+    matters, and it is closer to how the daemon actually runs.
+    """
+    d = _scenario(tmp_path, "one")
+    _scenario(tmp_path, "two")
+    spawn = _spawner()
+    args = agent.parse_args(["--scenarios", str(d),
+                             "--out", str(tmp_path / "r.json")])
+    assert agent.run(args, _deps(spawn=spawn))["ok"] is True
+    homes = {c["env"]["HOME"] for c in spawn.calls}
+    assert len(homes) == 1, f"one home per run, saw {homes}"
+    home = homes.pop()
+    assert all(c["env"]["USERPROFILE"] == home for c in spawn.calls)
+    taps = {c["env"]["BLINK_TAP"] for c in spawn.calls}
+    assert len(taps) == len(spawn.calls), "each pass keeps its own transcript"
+    assert not any(t.startswith(home + os.sep) for t in taps), (
+        "transcripts must not accumulate inside the daemon's home")
+
+
+def test_the_real_account_pass_is_not_given_the_shared_home(tmp_path):
+    spawn = _spawner()
+    args = agent.parse_args(["--scenarios", str(_scenario(tmp_path)),
+                             "--out", str(tmp_path / "r.json"),
+                             "--real-account"])
+    agent.run(args, _deps(spawn=spawn))
+    real = [c for c in spawn.calls if "real_account" in c["env"]["BLINK_TAP"]]
+    sandboxed = [c for c in spawn.calls if c not in real]
+    assert real and real[0]["env"]["HOME"] not in {
+        c["env"]["HOME"] for c in sandboxed}
+
+
+# --- grace that scales with what the scenario is waiting for ----------
+
+def test_grace_grows_with_the_quiet_window_and_the_poll_interval():
+    plain = {"expect": {"quiet_window_s": 0}}
+    sleeper = {"expect": {"quiet_window_s": 35}}
+    assert agent.grace_s(sleeper, 3.0) > agent.grace_s(plain, 3.0)
+    assert agent.grace_s(plain, 6.0) > agent.grace_s(plain, 3.0)
+    assert agent.grace_s({}, 3.0) == agent.grace_s(plain, 3.0)
+
+
+def test_a_scenario_that_waits_gets_time_to_finish_waiting(tmp_path):
+    """The wait is duration plus this scenario's own grace, not a constant.
+
+    sleep_wake spends 40 of its 60 seconds deliberately silent, so the frame
+    that proves the wake path is the last one to arrive. A fixed grace makes
+    that scenario the first to go flaky on a slow desk, and a flaky scenario
+    inside a release gate teaches people to re-run until green.
+    """
+    doc = {"duration_s": 60,
+           "expect": {"min_tx": 1, "min_board_usage": 1,
+                      "min_stale_lines": 0, "quiet_window_s": 35}}
+    d = _scenario(tmp_path, "waits", **doc)
+    sleeps = []
+    args = agent.parse_args(["--scenarios", str(d),
+                             "--out", str(tmp_path / "r.json")])
+    agent.run(args, _deps(sleeps=sleeps))
+    assert max(sleeps) == 60 + agent.grace_s(doc, agent.POLL_INTERVAL_S)
+
+
+def test_the_poll_interval_reaches_both_the_child_and_the_grace(tmp_path):
+    spawn = _spawner()
+    doc = {"duration_s": 10, "expect": {"min_tx": 1, "min_board_usage": 1,
+                                        "min_stale_lines": 0,
+                                        "quiet_window_s": 0}}
+    d = _scenario(tmp_path, "x", **doc)
+    sleeps = []
+    args = agent.parse_args(["--scenarios", str(d),
+                             "--out", str(tmp_path / "r.json"),
+                             "--poll-interval", "7"])
+    agent.run(args, _deps(sleeps=sleeps, spawn=spawn))
+    assert all(c["env"]["BLINK_POLL_INTERVAL_S"] == "7.0" for c in spawn.calls)
+    assert max(sleeps) == 10 + agent.grace_s(doc, 7.0)
 
 
 # --- the real-account pass --------------------------------------------

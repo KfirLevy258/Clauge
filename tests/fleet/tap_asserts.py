@@ -172,11 +172,17 @@ def check(tap_lines, expect, name=None):
         note(f"expected at least {min_tx:.0f} usage frames on the wire, and"
              f" the host sent {sent}.")
     if refused:
-        # send() refuses a line over 512 bytes. The frame never reached the
-        # board, so this reads as a firmware fault unless it is named here as
-        # the host-side drop it is.
-        note(f"the daemon refused to write {refused} usage frame(s): they were"
-             f" over the board's 512-byte line limit and never left the host.")
+        # send() refuses a line over 512 bytes, which is nearly always what
+        # this is: a loaded two-provider frame already measures 484. The
+        # frame never reached the board, so without naming the host-side drop
+        # this reads as a firmware fault and the hunt starts at the wrong end.
+        # The one other way to land here is the link dropping mid-write, and
+        # the daemon's own log tells the two apart, so it is pointed at.
+        note(f"the daemon refused to write {refused} usage frame(s), which"
+             f" never left the host -- almost certainly the board's 512-byte"
+             f" line limit, which a loaded two-provider frame comes within 28"
+             f" bytes of. The daemon logged its own reason as 'NOT SENT'"
+             f" beside the tap.")
 
     applied = _applied_lines(tap_lines)
     if len(applied) < min_board:

@@ -68,6 +68,9 @@ def test_refused_frame_is_not_counted_as_sent():
     problems = check(lines, BASE)
     assert any("refused" in p for p in problems)
     assert any("at least 2 usage" in p for p in problems)
+    # A refusal at 2am needs a diagnosis, not a mystery: name the limit that
+    # almost always causes it and where the daemon wrote its own reason.
+    assert any("512" in p and "NOT SENT" in p for p in problems)
 
 
 def test_time_messages_do_not_count_towards_min_tx():
