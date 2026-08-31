@@ -88,13 +88,48 @@ class Tap:
         # Serial hands over whatever has arrived, which routinely cuts a
         # printk in half. Hold the tail until its newline turns up.
         self._pending = b""
+        self._complained = False
 
     def _append(self, record):
-        with open(self._path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+        """Append one record, and never let a bad tap path stop the daemon.
 
-    def tx(self, msg):
-        self._append({"dir": "tx", "t": time.time(), "msg": msg})
+        An unwritable or full BLINK_TAP path raises OSError as the file is
+        opened, and console() runs in the read loop -- whose except treats it
+        as a disconnected board. Left to propagate, a broken tap would present
+        as hardware that keeps dropping off the bus, which is the most
+        expensive possible way to report a wrong filename. So it is caught and
+        named as what it is.
+
+        Reported once, then silently skipped, following pc/ingest's rule for a
+        source that has already failed: the board pings every ten seconds and
+        the loop reads continuously, so one line per failed write would bury
+        the daemon's real log within minutes.
+        """
+        try:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as e:
+            if not self._complained:
+                self._complained = True
+                print(f"[tap] cannot write {self._path}: {e}."
+                      f" The transcript is incomplete.", file=sys.stderr)
+
+    def tx(self, msg, sent):
+        """Record an outbound message, and whether it reached the wire.
+
+        `sent` is not decoration. send() refuses any line over the board's
+        512-byte limit -- and a fully loaded two-provider frame already
+        measures 484 -- so the refusal happens in exactly the boundary cases
+        this suite exists to catch. A transcript that recorded the refusal as
+        a plain tx would say the host sent a frame the board ignored, and the
+        hunt would start in the firmware for a bug that is in the host.
+
+        Required rather than defaulted so no future caller can record a tx
+        without having decided the question. Later tasks count sent frames, so
+        the key is on every tx record, not only the failures.
+        """
+        self._append({"dir": "tx", "t": time.time(), "msg": msg,
+                      "sent": bool(sent)})
 
     def rx(self, msg):
         self._append({"dir": "rx", "t": time.time(), "msg": msg})
@@ -123,10 +158,20 @@ class Tap:
         Wrappers rather than edits at the call sites: the daemon's send() and
         its inbound dispatch keep their exact behaviour, and the whole
         facility stays removable.
+
+        The tx record is written after delegating, not before, because only
+        the delegate knows whether the message actually went out -- and from
+        a finally, so a delegate that raises (a board unplugged mid-write)
+        still leaves a not-sent record. That is the moment the transcript is
+        most worth reading, so it is the last one that should be missing.
         """
         def write2(m):
-            self.tx(m)
-            return write_msg(m)
+            ok = False
+            try:
+                ok = write_msg(m)
+                return ok
+            finally:
+                self.tx(m, sent=ok)
 
         def rx2(m):
             self.rx(m)
@@ -782,6 +827,10 @@ def main(argv=None):
         reader = protocol.LineReader()
 
         def send(m):
+            # Returns whether the message reached the wire. Nothing in Bridge
+            # reads it; the tap does, so a message refused below is recorded
+            # as refused instead of as sent.
+            #
             # ota_data is not logged: an image is ~5000 chunks and each line
             # carries 344 characters of base64, which would bury every other
             # message in the log. Bridge prints its own progress every 200.
@@ -801,8 +850,9 @@ def main(argv=None):
             raw, why = protocol.encode_checked(m)
             if raw is None:
                 print(f"[bridge] NOT SENT: {why}", file=sys.stderr)
-                return
+                return False
             ser.write(raw)
+            return True
 
         # The board approved an update. esptool needs the port to itself, so
         # close it, write slot0, and let the outer reconnect loop pick the
