@@ -39,3 +39,23 @@ def test_age_s_backdates_observed_at(tmp_path):
 def test_provider_id():
     import pc.providers.scripted as m
     assert m.ScriptedProvider.__name__  # module imports cleanly
+
+
+def test_unknown_key_step_is_skipped(tmp_path):
+    p = _write(tmp_path, [
+        {"at": 0, "provider": "claude", "sesion_pct": 50.0},   # typo key
+        {"at": 0, "provider": "claude", "session_pct": 60.0},  # good step
+    ])
+    sp = ScriptedProvider(p, now=lambda: 1000.0)
+    frames = sp.poll(1000.0)
+    assert [f.session_pct for f in frames] == [60.0]
+
+
+def test_step_missing_at_is_skipped(tmp_path):
+    p = _write(tmp_path, [
+        {"provider": "claude", "session_pct": 10.0},           # no "at"
+        {"at": 0, "provider": "claude", "session_pct": 20.0},  # good step
+    ])
+    sp = ScriptedProvider(p, now=lambda: 1000.0)
+    frames = sp.poll(1000.0)
+    assert [f.session_pct for f in frames] == [20.0]

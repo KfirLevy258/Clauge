@@ -34,9 +34,15 @@ that are not part of the frame itself:
     four hours old the instant it fires.
 """
 import json
+import sys
 import time
 
 from pc.providers.base import NormalizedUsageFrame, ProviderParser
+
+
+def _is_number(v):
+    # bool is an int subclass; a step should never mean "at": true.
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
 class ScriptedProvider(ProviderParser):
@@ -44,10 +50,28 @@ class ScriptedProvider(ProviderParser):
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         self.name = doc.get("name", "scenario")
-        self._steps = sorted(doc.get("steps", []), key=lambda s: s["at"])
+        self._steps = sorted(self._usable_steps(doc.get("steps", [])),
+                              key=lambda s: s["at"])
         self._emitted = set()
         self._now = now
         self._t0 = now()
+
+    @staticmethod
+    def _usable_steps(raw_steps):
+        """Scenario steps shaped enough to sort and replay.
+
+        A scenario file is hand-authored, and a typo in it -- a step with no
+        `at`, or one that is not even an object -- must not take the
+        provider down before it can construct at all. Same "return nothing
+        usable" spirit as parse_cli_event; here that means dropping the one
+        step rather than the whole scenario.
+        """
+        for i, step in enumerate(raw_steps):
+            if not isinstance(step, dict) or not _is_number(step.get("at")):
+                print(f"scripted: skipping step {i}, no numeric 'at'",
+                      file=sys.stderr)
+                continue
+            yield step
 
     def get_provider_id(self) -> str:
         return "scripted"
@@ -64,13 +88,32 @@ class ScriptedProvider(ProviderParser):
             if i in self._emitted or step["at"] > elapsed:
                 continue
             self._emitted.add(i)
+            frame = self._build_frame(step)
+            if frame is not None:
+                out.append(frame)
+        out.reverse()  # freshest first
+        return out
+
+    def _build_frame(self, step):
+        """One step as a frame, or None when the step doesn't fit.
+
+        A field name that doesn't match NormalizedUsageFrame -- a typo, or a
+        step that collides with `provider`/`src`/`observed_at` -- raises
+        TypeError out of the constructor. This is the fleet-test analogue of
+        the no-raise rule every other provider follows (base.py:154-157): a
+        daemon on all three machines must not die because one scenario file
+        has a typo in it. The step is dropped instead, same as an unusable
+        real-source reading.
+        """
+        try:
             age = step.get("age_s", 0)
             fields = {k: v for k, v in step.items()
                       if k not in ("at", "age_s", "provider")}
-            out.append(NormalizedUsageFrame(
+            return NormalizedUsageFrame(
                 provider=step.get("provider", "claude"),
                 src="scripted",
                 observed_at=self._now() - age,
-                **fields))
-        out.reverse()  # freshest first
-        return out
+                **fields)
+        except TypeError as e:
+            print(f"scripted: skipping malformed step ({e})", file=sys.stderr)
+            return None
