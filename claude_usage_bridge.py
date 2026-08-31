@@ -56,6 +56,121 @@ CHIP_NAMES = {
 }
 
 
+class Tap:
+    """BLINK_TAP: a transcript of everything crossing the serial link.
+
+    The fleet suite runs this daemon against a real board and then has to
+    prove what happened. Nothing else can: the daemon's own stderr log is
+    prose meant for a person, and the board cannot be interrogated after the
+    fact. So when BLINK_TAP names a file, every message and every line the
+    board printed is appended to it as JSON, one object per line, and the
+    test asserts against that.
+
+    Three streams, because two are not enough. `tx` and `rx` prove what the
+    host sent and what the board answered -- but the board answers only
+    hello/ping/pref/ota_*; there is no per-frame ack, so rx alone can never
+    show that a usage frame was applied. What can show it is the board's own
+    console: proto.c prints the usage it took ("[usage] session 50% (12s)
+    ...") on the same wire. That line is the end-to-end evidence, so
+    `console` records it.
+
+    Appended and reopened per write so a test tailing the file sees whole
+    lines, and so a daemon that dies mid-run leaves everything it had.
+
+    Note the deliberate collision of two different `t`s: the tap's own field
+    is the epoch timestamp of the record, while the protocol keys a message's
+    type as "t" inside `msg`. They never meet -- one is the envelope, the
+    other the payload.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        # Serial hands over whatever has arrived, which routinely cuts a
+        # printk in half. Hold the tail until its newline turns up.
+        self._pending = b""
+
+    def _append(self, record):
+        with open(self._path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+    def tx(self, msg):
+        self._append({"dir": "tx", "t": time.time(), "msg": msg})
+
+    def rx(self, msg):
+        self._append({"dir": "rx", "t": time.time(), "msg": msg})
+
+    def console(self, data):
+        """Record raw board output, whole lines only.
+
+        Decoded with errors="replace": board output is not guaranteed clean
+        UTF-8 -- a reset mid-line emits noise -- and this is called from the
+        daemon's read loop, where raising would take the link down over a
+        test facility.
+
+        The board's JSON arrives on this same wire, so protocol lines appear
+        here too. That is the point of a raw console tap; a test that wants
+        only messages reads the rx records instead.
+        """
+        self._pending += data
+        *whole, self._pending = self._pending.split(b"\n")
+        for line in whole:
+            text = line.decode("utf-8", errors="replace").rstrip("\r")
+            self._append({"dir": "console", "t": time.time(), "line": text})
+
+    def wrap(self, write_msg, on_message):
+        """(write_msg, on_message) that record, then delegate.
+
+        Wrappers rather than edits at the call sites: the daemon's send() and
+        its inbound dispatch keep their exact behaviour, and the whole
+        facility stays removable.
+        """
+        def write2(m):
+            self.tx(m)
+            return write_msg(m)
+
+        def rx2(m):
+            self.rx(m)
+            return on_message(m)
+
+        return write2, rx2
+
+
+def install_tap(write_msg, on_message):
+    """(tap, write_msg, on_message) for this connection.
+
+    Unset BLINK_TAP hands back the two callables it was given, unchanged and
+    unwrapped, and no file is opened. A daemon that behaves differently
+    because a test facility exists is a defect, so the inert path costs one
+    environment lookup and nothing else.
+    """
+    path = os.environ.get("BLINK_TAP")
+    if not path:
+        return None, write_msg, on_message
+    tap = Tap(path)
+    write2, rx2 = tap.wrap(write_msg, on_message)
+    return tap, write2, rx2
+
+
+def build_bus():
+    """The daemon's usage source: scripted when BLINK_SCENARIO says so.
+
+    A fleet test has to reproduce the same invented usage history -- "past
+    100%", "four hours stale" -- on three machines, which no real provider
+    can do, since a real provider reports whatever that machine's tools
+    happened to write. Pointing BLINK_SCENARIO at a scenario file replaces
+    the whole provider set with the one that replays it.
+
+    It replaces rather than joins the set on purpose: a real Claude install
+    on the test machine would otherwise merge its own readings into the
+    scenario and the assertion would depend on whose desk it ran on.
+    """
+    scenario = os.environ.get("BLINK_SCENARIO")
+    if not scenario:
+        return ingest.IngestionBus()
+    from pc.providers.scripted import ScriptedProvider
+    return ingest.IngestionBus(providers=[ScriptedProvider(scenario)])
+
+
 def describe_ports():
     """[(device, chip)] for every candidate port, in candidate_ports() order.
 
@@ -493,7 +608,7 @@ def main(argv=None):
     # authenticates to Anthropic, and the daemon deliberately does not know
     # which providers exist -- pc/ingest owns that, so onboarding a second
     # tool never reaches this loop.
-    bus = ingest.IngestionBus()
+    bus = build_bus()
     fetch = bus.poll
 
     last_err = None
@@ -746,7 +861,17 @@ def main(argv=None):
             update.restart_from_daemon(self_bin)     # does not return
             return True
 
-        bridge = Bridge(write_msg=send, fetch_usage=fetch,
+        # The tap sits around the two callables that carry the link, and is
+        # rebuilt per connection so a half-line left over from a board that
+        # was unplugged mid-print cannot glue itself to the next session.
+        # dispatch reaches `bridge` late, by closure: it is assigned just
+        # below and nothing calls dispatch before the read loop.
+        def dispatch(m):
+            return bridge.on_message(m)
+
+        tap, write_msg, dispatch = install_tap(send, dispatch)
+
+        bridge = Bridge(write_msg=write_msg, fetch_usage=fetch,
                         flash_image=flash_image,
                         report_failure=report_failure,
                         set_preferred=bus.set_preferred,
@@ -783,9 +908,11 @@ def main(argv=None):
                     # Echo raw board console (logs + its [usage] prints) for visibility.
                     sys.stderr.buffer.write(data)
                     sys.stderr.buffer.flush()
+                    if tap:
+                        tap.console(data)
                     for msg in reader.feed(data):
                         print(f"[bridge] <- {msg}", file=sys.stderr)
-                        bridge.on_message(msg)
+                        dispatch(msg)
                         # A message of ours off this port is the only
                         # positive identification there is. Write it down:
                         # the next start opens this port directly instead
