@@ -6,6 +6,7 @@ Run inside the Zephyr venv (has pyserial) or `pip install pyserial`:
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -216,6 +217,15 @@ def poll_interval():
     hammer a rate-limited usage endpoint as fast as the loop spins. It falls
     back to the default and says so -- once, because main() resolves this at
     startup and never asks again.
+
+    Non-finite is refused for the opposite reason, and is the quieter hazard
+    of the two. "nan", "inf" and "1e400" all parse without raising, and a
+    positivity check alone lets them through -- every comparison against nan
+    is False, so `nan <= 0` is False. Either one poisons
+    `next_poll = monotonic() + interval`, after which `monotonic() >=
+    next_poll` is False for the rest of the run: polling stops dead, the
+    board never receives usage again, and nothing anywhere says why. Hence
+    isfinite FIRST, before any comparison that nan would win by default.
     """
     raw = os.environ.get("BLINK_POLL_INTERVAL_S")
     if raw is None:
@@ -224,8 +234,11 @@ def poll_interval():
         seconds = float(raw)
     except ValueError:
         seconds = 0
-    if seconds <= 0:
-        print(f"[bridge] BLINK_POLL_INTERVAL_S={raw!r} is not a positive"
+    if not math.isfinite(seconds) or seconds <= 0:
+        # "usable" rather than "positive": inf IS positive, and telling
+        # someone who typed it that it is not would send them looking in the
+        # wrong direction.
+        print(f"[bridge] BLINK_POLL_INTERVAL_S={raw!r} is not a usable"
               f" number of seconds; polling every {POLL_INTERVAL_S} s.",
               file=sys.stderr)
         return POLL_INTERVAL_S

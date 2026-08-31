@@ -166,11 +166,19 @@ def test_a_fractional_poll_interval_is_honoured(monkeypatch):
     assert cub.poll_interval() == 2.5
 
 
-@pytest.mark.parametrize("junk", ["abc", "0", "-5", "", "  "])
+@pytest.mark.parametrize("junk", ["abc", "0", "-5", "", "  ",
+                                  "nan", "inf", "-inf", "1e400"])
 def test_a_nonsense_poll_interval_falls_back_and_says_so(
         junk, monkeypatch, capsys):
     # Zero or negative would busy-poll a rate-limited endpoint as fast as the
     # read loop turns, so it is refused rather than obeyed.
+    #
+    # nan and inf parse without raising and are the quietest failure of the
+    # lot: next_poll becomes nan or inf, `monotonic() >= next_poll` is then
+    # False for the rest of the run, and the board silently never receives
+    # usage again with nothing anywhere saying why. Note nan <= 0 is False,
+    # so a bare positivity check does not catch it. "1e400" is the same trap
+    # spelled as a number a person might plausibly type.
     monkeypatch.setenv("BLINK_POLL_INTERVAL_S", junk)
 
     assert cub.poll_interval() == 60
