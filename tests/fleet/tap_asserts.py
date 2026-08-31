@@ -19,6 +19,16 @@ assertions are wrong here:
     carrying STALE when the frame was stale. That line is the end-to-end
     evidence and the only one there is.
 
+  - Silence in the DATA is not silence on the HOST, so a gap between applied
+    frames says nothing about sleep. dispatch() stamps last_host_ms on any
+    host protocol line (firmware/src/proto.c:262) and the daemon answers
+    every ten-second ping with a pong (pc/bridge.py:145-149), so a daemon
+    that is alive can never leave the board 30 s silent (HOST_TIMEOUT_MS,
+    proto.c:29) at any poll interval. Sleep is a daemon-lifecycle event, not
+    a data event: it fires when the daemon is GONE. What proves it happened
+    is "[sleep] host back; opening eyes", printed from inside ui_sleep_run()
+    (firmware/src/ui_sleep.c:100) and reachable from nowhere else.
+
   - Counting tx records over-counts. poll_once() (pc/bridge.py:396-401)
     writes a `time` message on EVERY poll, before and independently of the
     usage message, so a five-poll run leaves ten tx records for five frames.
@@ -54,8 +64,22 @@ APPLIED_MARKER = "[usage] session "
 # The same print's flag for a frame whose reading was already old.
 STALE_MARKER = "STALE"
 
-# Without these two the block asserts nothing about the wire at all.
-REQUIRED_EXPECT_KEYS = ("min_tx", "min_board_usage")
+# ui_sleep.c:100. The board prints this on the way out of its sleep loop and
+# nowhere else, so it cannot appear unless sleep_should_start() fired -- which
+# needs proto_host_lost(), which needs 30 s with no host line at all. It is
+# also the first half of the cycle the tap can actually SEE: "[proto] host
+# went away" and "[sleep] host silent; closing eyes" are both printed while
+# the daemon is stopped and nothing is reading the port, so they are lost.
+# This one is printed because the daemon came back, with the port open.
+WOKE_MARKER = "[sleep] host back; opening eyes"
+
+# All four, and no defaulting. A key that falls back to zero when it is
+# missing deletes its own assertion: a stale_age-shaped run with no STALE
+# lines in it passed while min_stale_lines was merely absent. A scenario that
+# means to assert nothing on a dimension writes an explicit 0, where a reader
+# can see the decision.
+REQUIRED_EXPECT_KEYS = ("min_tx", "min_board_usage", "min_stale_lines",
+                        "min_sleep_wakes")
 
 
 def as_number(value):
@@ -69,6 +93,16 @@ def as_number(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def _frames(n):
+    """'1 usage frame', '3 usage frames'.
+
+    Trivial, and worth a function: "expected at least 1 usage frames" is the
+    kind of line that makes a reader wonder whether the tool knows what it is
+    talking about, at the moment they most need to trust it.
+    """
+    return f"{n:.0f} usage frame" + ("" if n == 1 else "s")
 
 
 def _records(tap_lines, direction):
@@ -102,21 +136,32 @@ def _applied_lines(tap_lines):
     return out
 
 
-def _longest_applied_gap(applied):
-    """The longest silence between two applied frames, in seconds.
+def _sleep_wakes(tap_lines):
+    """How many times the board woke from sleep and then applied a frame.
 
-    Deliberately measured between applied frames rather than between any two
-    tap records. The board pings every ten seconds and the poll writes a
-    `time` message every three, so the transcript is never quiet for long
-    enough to mean anything -- while the display going untouched for forty
-    seconds and then updating is exactly the sleep-and-wake this measures.
+    A cycle is the wake line followed, later in the transcript, by an applied
+    frame. Both halves are required because both halves are the feature: a
+    board that wakes and then shows nothing has failed exactly as badly as
+    one that never wakes, and it is the half more likely to break, since
+    waking restores the dashboard with its figures flagged stale
+    (ui_sleep.c:104-108) and only the daemon's next poll refills them.
 
-    The gap has to end in an applied frame, so a board that went quiet and
-    stayed quiet scores nothing: the pair is (earlier frame, later frame),
-    never (frame, end of run).
+    Counted rather than measured. Nothing here looks at timestamps at all,
+    which also means nothing here can be fooled by records that arrive out of
+    order -- the transcript is append-ordered, and order is all this needs.
     """
-    stamps = [t for t, _ in applied if t is not None]
-    return max((b - a for a, b in zip(stamps, stamps[1:])), default=0.0)
+    wakes = 0
+    armed = False
+    for rec in _records(tap_lines, "console"):
+        line = rec.get("line")
+        if not isinstance(line, str):
+            continue
+        if WOKE_MARKER in line:
+            armed = True
+        elif armed and APPLIED_MARKER in line:
+            wakes += 1
+            armed = False
+    return wakes
 
 
 def check(tap_lines, expect, name=None):
@@ -125,8 +170,8 @@ def check(tap_lines, expect, name=None):
     tap_lines are the parsed BLINK_TAP records; expect is the scenario's own
     block: min_tx (usage frames actually sent), min_board_usage (frames the
     board applied), min_stale_lines (how many of those carried STALE) and
-    quiet_window_s (0 for no requirement; above 0, an applied frame must
-    follow a silence of at least that long).
+    min_sleep_wakes (how many times the board must have woken from sleep and
+    then applied a frame). All four are required; see REQUIRED_EXPECT_KEYS.
 
     name is the scenario, and rides along only so the problems can say which
     run they came from. The person reading them is looking at three machines'
@@ -140,15 +185,26 @@ def check(tap_lines, expect, name=None):
 
     # An `expect` block that demands nothing would pass a dead board, so a
     # malformed one is reported here rather than silently defaulted to zero.
-    missing = [k for k in REQUIRED_EXPECT_KEYS if as_number(expect.get(k)) is None]
+    # Absent and unusable are told apart: reporting a key that is sitting
+    # right there as "missing" sends the reader hunting for the wrong thing.
+    missing = [k for k in REQUIRED_EXPECT_KEYS if k not in expect]
+    unusable = [k for k in REQUIRED_EXPECT_KEYS
+                if k in expect and as_number(expect[k]) is None]
     if missing:
         note(f"the expect block is missing {', '.join(missing)}, so this"
-             f" scenario asserts nothing about the wire.")
+             f" scenario asserts nothing on"
+             f" {'those dimensions' if len(missing) > 1 else 'that dimension'}."
+             f" A scenario that means to assert nothing writes an explicit 0.")
+    if unusable:
+        note("the expect block has " + ", ".join(
+            f"{k}={expect[k]!r}" for k in unusable)
+            + ", which is not a number.")
+    if missing or unusable:
         return problems
     min_tx = as_number(expect["min_tx"])
     min_board = as_number(expect["min_board_usage"])
-    min_stale = as_number(expect.get("min_stale_lines")) or 0.0
-    quiet = as_number(expect.get("quiet_window_s")) or 0.0
+    min_stale = as_number(expect["min_stale_lines"])
+    min_wakes = as_number(expect["min_sleep_wakes"])
     if min_tx < 1 or min_board < 1:
         note(f"the expect block asks for {min_tx:.0f} frames sent and"
              f" {min_board:.0f} applied, which a board that never woke up"
@@ -169,8 +225,8 @@ def check(tap_lines, expect, name=None):
 
     sent, refused = _usage_tx(tap_lines)
     if sent < min_tx:
-        note(f"expected at least {min_tx:.0f} usage frames on the wire, and"
-             f" the host sent {sent}.")
+        note(f"expected at least {_frames(min_tx)} on the wire, and the host"
+             f" sent {sent}.")
     if refused:
         # send() refuses a line over 512 bytes, which is nearly always what
         # this is: a loaded two-provider frame already measures 484. The
@@ -186,20 +242,24 @@ def check(tap_lines, expect, name=None):
 
     applied = _applied_lines(tap_lines)
     if len(applied) < min_board:
-        note(f"expected the board to apply at least {min_board:.0f} usage"
-             f" frames, and it printed {len(applied)}"
-             f" '{APPLIED_MARKER.strip()}' lines.")
+        note(f"expected the board to apply at least {_frames(min_board)}, and"
+             f" it printed {len(applied)} '{APPLIED_MARKER.strip()}' lines.")
 
     stale = sum(1 for _, line in applied if STALE_MARKER in line)
     if stale < min_stale:
         note(f"expected at least {min_stale:.0f} applied frames marked STALE,"
              f" and {stale} of {len(applied)} were.")
 
-    if quiet > 0:
-        gap = _longest_applied_gap(applied)
-        if gap < quiet:
-            note(f"expected an applied frame after at least {quiet:.0f}s of"
-                 f" quiet, which is what proves the board woke from sleep and"
-                 f" applied it; the longest quiet before an applied frame was"
-                 f" {gap:.1f}s.")
+    if min_wakes > 0:
+        wakes = _sleep_wakes(tap_lines)
+        if wakes < min_wakes:
+            note(f"expected the board to sleep and wake"
+                 f" {min_wakes:.0f} time(s) -- a"
+                 f" '{WOKE_MARKER}' line followed by an applied frame -- and"
+                 f" it did that {wakes} time(s), so it never slept, or woke"
+                 f" and showed nothing. The board prints that line only from"
+                 f" inside its sleep loop, which needs the DAEMON stopped for"
+                 f" longer than the firmware's 30s host timeout: check the"
+                 f" scenario's host_silence_s, and that the daemon really did"
+                 f" stop (an orphan holding the port keeps the board awake).")
     return problems

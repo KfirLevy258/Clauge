@@ -7,5 +7,5 @@
     {"at": 12, "provider": "claude", "session_pct": 55.0, "weekly_pct": 30.0, "state": "running", "age_s": 14400, "stale": true}
   ],
   "duration_s": 20,
-  "expect": {"min_tx": 3, "min_board_usage": 3, "min_stale_lines": 2, "quiet_window_s": 0}
+  "expect": {"min_tx": 3, "min_board_usage": 3, "min_stale_lines": 2, "min_sleep_wakes": 0}
 }

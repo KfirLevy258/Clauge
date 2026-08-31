@@ -23,15 +23,17 @@ from tests.fleet import agent
 
 
 class _FakeProc:
-    def __init__(self):
+    def __init__(self, events=None):
         self.terminated = False
         self.killed = False
+        self._events = events if events is not None else []
 
     def poll(self):
         return 0 if self.terminated else None
 
     def terminate(self):
         self.terminated = True
+        self._events.append("stop")
 
     def kill(self):
         self.killed = True
@@ -55,16 +57,18 @@ def _tap_lines(scenario_doc=None):
     return lines
 
 
-def _spawner(lines_for=lambda env, attempt: _tap_lines()):
+def _spawner(lines_for=lambda env, attempt: _tap_lines(), events=None):
     """A stand-in for Popen that writes a tap and hands back a fake process."""
     calls = []
 
     def spawn(cmd, env, cwd):
         calls.append({"cmd": cmd, "env": env, "cwd": cwd})
+        if events is not None:
+            events.append("spawn")
         with open(env["BLINK_TAP"], "a", encoding="utf-8") as f:
             for rec in lines_for(env, len(calls)):
                 f.write(json.dumps(rec) + "\n")
-        return _FakeProc()
+        return _FakeProc(events)
 
     spawn.calls = calls
     return spawn
@@ -83,7 +87,7 @@ def _clock():
 def _deps(sleeps=None, **over):
     base = dict(spawn=_spawner(),
                 sleep=(sleeps.append if sleeps is not None else lambda s: None),
-                now=_clock(),
+                now=_clock(), wall=lambda: 0.0,
                 runner=lambda *a, **k: types.SimpleNamespace(
                     returncode=0, stdout='{"t": "usage"}\n', stderr=""),
                 stop=lambda: Outcome(True, False, "stopped"),
@@ -96,7 +100,7 @@ def _scenario(tmp_path, name="x", **over):
     doc = {"name": name, "duration_s": 1,
            "steps": [{"at": 0, "provider": "claude", "session_pct": 50.0}],
            "expect": {"min_tx": 1, "min_board_usage": 1,
-                      "min_stale_lines": 0, "quiet_window_s": 0}}
+                      "min_stale_lines": 0, "min_sleep_wakes": 0}}
     doc.update(over)
     d = tmp_path / "scenarios"
     d.mkdir(exist_ok=True)
@@ -318,11 +322,120 @@ def test_the_real_account_pass_is_not_given_the_shared_home(tmp_path):
         c["env"]["HOME"] for c in sandboxed}
 
 
+# --- the sleep scenario: a daemon lifecycle, not a data timeline ------
+
+def _sleep_scenario(tmp_path, name="naps"):
+    return _scenario(
+        tmp_path, name, duration_s=12, host_silence_s=45, wake_duration_s=12,
+        steps=[{"at": 0, "provider": "claude", "session_pct": 40.0},
+               {"at": 5, "provider": "claude", "session_pct": 45.0}],
+        expect={"min_tx": 4, "min_board_usage": 4, "min_stale_lines": 0,
+                "min_sleep_wakes": 1})
+
+
+def _sleeper(events=None):
+    """A board that sleeps while the daemon is gone and says so on waking."""
+    def lines(env, attempt):
+        woke = os.path.getsize(env["BLINK_TAP"]) > 0 if os.path.exists(
+            env["BLINK_TAP"]) else False
+        out = _tap_lines({"steps": [{"at": 0}, {"at": 5}]})
+        if woke:
+            out.insert(0, {"dir": "console", "t": 0.0,
+                           "line": "[sleep] host back; opening eyes"})
+        return out
+    return _spawner(lines, events)
+
+
+def test_a_sleep_scenario_stops_the_daemon_and_brings_it_back(tmp_path):
+    """The board can only sleep when the daemon is gone, so it is gone.
+
+    dispatch() stamps last_host_ms on any host line and the daemon pongs
+    every ping, so no poll interval can ever produce 30s of host silence.
+    Stopping the daemon is the whole scenario.
+    """
+    events = []
+    d = _sleep_scenario(tmp_path)
+    spawn = _sleeper(events)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if seconds == 45:
+            events.append("silence")
+
+    args = agent.parse_args(["--scenarios", str(d),
+                             "--out", str(tmp_path / "r.json")])
+    result = agent.run(args, _deps(spawn=spawn, sleep=sleep))
+    assert result["ok"] is True, result["scenarios"]
+
+    passes = [c for c in spawn.calls if "naps" in c["env"]["BLINK_TAP"]]
+    assert len(passes) == 2, "one pass before the silence and one after"
+    assert passes[0]["env"]["BLINK_TAP"] == passes[1]["env"]["BLINK_TAP"], (
+        "both passes write one transcript, or the wake cannot be seen after"
+        " the frames that preceded it")
+    assert 45 in sleeps, "the daemon must be gone for the scenario's silence"
+
+    # The silence has to be silent: preflight and the first pass are both
+    # stopped before it begins, and only then does the daemon come back.
+    assert events == ["spawn", "stop",      # preflight
+                      "spawn", "stop",      # the first pass
+                      "silence",
+                      "spawn", "stop"], events
+
+
+def test_the_silence_only_happens_once_the_daemon_is_confirmed_gone(tmp_path):
+    """An orphan still holding the port keeps the board awake.
+
+    Waiting out 45 seconds that something is still talking through would end
+    in a board that never slept and a scenario that blamed it for that.
+    """
+    d = _sleep_scenario(tmp_path)
+    sleeps = []
+    outcome = agent.run_scenario(
+        d / "naps.json", "claude", tmp_path / "w", "auto",
+        _deps(sleeps=sleeps, spawn=_stubborn_spawner()))
+    assert 45 not in sleeps
+    assert any("silence was skipped" in p for p in outcome["problems"])
+
+
+def _stubborn_spawner():
+    class _Undead(_FakeProc):
+        def terminate(self):
+            raise OSError("no such process")
+
+        def kill(self):
+            raise OSError("no such process")
+
+    def spawn(cmd, env, cwd):
+        open(env["BLINK_TAP"], "a", encoding="utf-8").close()
+        return _Undead()
+    spawn.calls = []
+    return spawn
+
+
+def test_a_daemon_that_will_not_die_is_reported_not_ignored(tmp_path):
+    """Restarting the service on top of an orphan leaves a dark desk.
+
+    The service comes back, the port is still held by the child, the board
+    never gets another frame -- and nothing anywhere says so unless this
+    does.
+    """
+    args = agent.parse_args(["--scenarios", str(_scenario(tmp_path)),
+                             "--out", str(tmp_path / "r.json")])
+    result = agent.run(args, _deps(spawn=_stubborn_spawner()))
+    assert result["ok"] is False
+    everything = result["problems"] + [
+        p for s in result["scenarios"].values() for p in s["problems"]]
+    assert any("Neither terminate nor kill" in p for p in everything), (
+        "an orphan holding the port must be named, not inferred from a"
+        f" board that then looks dead: {everything}")
+
+
 # --- grace that scales with what the scenario is waiting for ----------
 
-def test_grace_grows_with_the_quiet_window_and_the_poll_interval():
-    plain = {"expect": {"quiet_window_s": 0}}
-    sleeper = {"expect": {"quiet_window_s": 35}}
+def test_grace_grows_for_a_sleeping_scenario_and_for_a_slower_poll():
+    plain = {"expect": {"min_sleep_wakes": 0}}
+    sleeper = {"host_silence_s": 45, "expect": {"min_sleep_wakes": 1}}
     assert agent.grace_s(sleeper, 3.0) > agent.grace_s(plain, 3.0)
     assert agent.grace_s(plain, 6.0) > agent.grace_s(plain, 3.0)
     assert agent.grace_s({}, 3.0) == agent.grace_s(plain, 3.0)
@@ -331,14 +444,13 @@ def test_grace_grows_with_the_quiet_window_and_the_poll_interval():
 def test_a_scenario_that_waits_gets_time_to_finish_waiting(tmp_path):
     """The wait is duration plus this scenario's own grace, not a constant.
 
-    sleep_wake spends 40 of its 60 seconds deliberately silent, so the frame
-    that proves the wake path is the last one to arrive. A fixed grace makes
-    that scenario the first to go flaky on a slow desk, and a flaky scenario
-    inside a release gate teaches people to re-run until green.
+    A fixed grace makes the longest scenario the first to go flaky on a slow
+    desk, and a flaky scenario inside a release gate teaches people to re-run
+    until green.
     """
     doc = {"duration_s": 60,
            "expect": {"min_tx": 1, "min_board_usage": 1,
-                      "min_stale_lines": 0, "quiet_window_s": 35}}
+                      "min_stale_lines": 0, "min_sleep_wakes": 0}}
     d = _scenario(tmp_path, "waits", **doc)
     sleeps = []
     args = agent.parse_args(["--scenarios", str(d),
@@ -351,7 +463,7 @@ def test_the_poll_interval_reaches_both_the_child_and_the_grace(tmp_path):
     spawn = _spawner()
     doc = {"duration_s": 10, "expect": {"min_tx": 1, "min_board_usage": 1,
                                         "min_stale_lines": 0,
-                                        "quiet_window_s": 0}}
+                                        "min_sleep_wakes": 0}}
     d = _scenario(tmp_path, "x", **doc)
     sleeps = []
     args = agent.parse_args(["--scenarios", str(d),
@@ -360,6 +472,46 @@ def test_the_poll_interval_reaches_both_the_child_and_the_grace(tmp_path):
     agent.run(args, _deps(sleeps=sleeps, spawn=spawn))
     assert all(c["env"]["BLINK_POLL_INTERVAL_S"] == "7.0" for c in spawn.calls)
     assert max(sleeps) == 10 + agent.grace_s(doc, 7.0)
+
+
+# --- the port between scenarios ---------------------------------------
+
+def test_a_settle_precedes_every_scenario(tmp_path):
+    """The previous daemon's port does not come free the instant it exits."""
+    d = _scenario(tmp_path, "one")
+    _scenario(tmp_path, "two")
+    sleeps = []
+    args = agent.parse_args(["--scenarios", str(d),
+                             "--out", str(tmp_path / "r.json")])
+    agent.run(args, _deps(sleeps=sleeps))
+    assert sleeps.count(agent.PORT_SETTLE_S) == 2
+
+
+def test_a_late_connect_is_inconclusive_rather_than_a_board_fault(tmp_path):
+    """A shifted timeline can merge two steps into one frame.
+
+    ScriptedProvider stamps its t0 when the daemon is CONSTRUCTED, not when
+    it reaches the board, so a daemon kept waiting for the port emits its
+    first two steps on one poll and comes up short on min_tx. That is not the
+    board's fault and must not be reported as though it were.
+    """
+    def late(env, attempt):
+        return [dict(r, t=r["t"] + 30) for r in _tap_lines()]
+
+    args = agent.parse_args(["--scenarios", str(_scenario(tmp_path)),
+                             "--out", str(tmp_path / "r.json")])
+    result = agent.run(args, _deps(spawn=_spawner(late)))
+    entry = result["scenarios"]["x"]
+    assert entry.get("inconclusive") is True
+    assert entry["ok"] is False
+    assert any("30" in p and "again" in p for p in entry["problems"])
+
+
+def test_a_prompt_connect_is_not_flagged(tmp_path):
+    args = agent.parse_args(["--scenarios", str(_scenario(tmp_path)),
+                             "--out", str(tmp_path / "r.json")])
+    result = agent.run(args, _deps())
+    assert "inconclusive" not in result["scenarios"]["x"]
 
 
 # --- the real-account pass --------------------------------------------

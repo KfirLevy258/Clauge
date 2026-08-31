@@ -1,12 +1,12 @@
 {
   "name": "sleep_wake",
-  "note": "A 40s silent gap between the second and third steps -- longer than the 30s sleep threshold -- is the whole point: the board must sleep on host silence and still apply the frame that arrives after it wakes, proving the wake path applies usage rather than just clearing the display.",
+  "note": "The daemon is STOPPED mid-scenario, because that is the only way this board ever sleeps. Quiet data is not a quiet host: dispatch() stamps last_host_ms on any host protocol line (proto.c:262) and the daemon answers every 10s ping with a pong (bridge.py:145-149), so a live daemon cannot leave the board 30s silent (HOST_TIMEOUT_MS, proto.c:29) at any poll interval -- an earlier version of this file asked for a 40s gap between steps and would have passed against firmware with sleep deleted. With the daemon gone for 45s the board loses the host, sleeps, and must wake and apply a fresh frame when the daemon returns. The evidence is '[sleep] host back; opening eyes' (ui_sleep.c:100), printed nowhere but inside ui_sleep_run(); the earlier lines of the cycle are printed while nothing holds the port and are lost. The steps replay from the start in the second daemon -- ScriptedProvider stamps its t0 at construction -- which is why min_tx is twice the step count.",
   "steps": [
-    {"at": 0,  "provider": "claude", "session_pct": 40.0, "weekly_pct": 15.0, "state": "running"},
-    {"at": 5,  "provider": "claude", "session_pct": 45.0, "weekly_pct": 16.0, "state": "running"},
-    {"at": 45, "provider": "claude", "session_pct": 50.0, "weekly_pct": 17.0, "state": "running"},
-    {"at": 50, "provider": "claude", "session_pct": 55.0, "weekly_pct": 18.0, "state": "running"}
+    {"at": 0, "provider": "claude", "session_pct": 40.0, "weekly_pct": 15.0, "state": "running"},
+    {"at": 5, "provider": "claude", "session_pct": 45.0, "weekly_pct": 16.0, "state": "running"}
   ],
-  "duration_s": 60,
-  "expect": {"min_tx": 4, "min_board_usage": 4, "min_stale_lines": 0, "quiet_window_s": 35}
+  "duration_s": 12,
+  "host_silence_s": 45,
+  "wake_duration_s": 12,
+  "expect": {"min_tx": 4, "min_board_usage": 4, "min_stale_lines": 0, "min_sleep_wakes": 1}
 }

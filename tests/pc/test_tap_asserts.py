@@ -14,7 +14,7 @@ from tests.fleet.tap_asserts import check
 SCENARIOS = Path(__file__).resolve().parents[2] / "tests" / "fleet" / "scenarios"
 
 BASE = {"min_tx": 2, "min_board_usage": 2, "min_stale_lines": 0,
-        "quiet_window_s": 0}
+        "min_sleep_wakes": 0}
 
 
 def _tx(t, kind="usage", sent=True, **fields):
@@ -99,27 +99,54 @@ def test_stale_lines_are_counted():
     assert any("STALE" in p for p in check(too_few, exp))
 
 
-def test_quiet_window_needs_an_applied_frame_after_the_gap():
-    exp = dict(BASE, quiet_window_s=35)
-    woke = [_rx(0, "hello"), _tx(1, session_pct=50.0), _applied(1.1),
-            _tx(45, session_pct=60.0), _applied(45.1)]
-    never_slept = [_rx(0, "hello"), _tx(1, session_pct=50.0), _applied(1.1),
-                   _tx(5, session_pct=60.0), _applied(5.1)]
-    assert check(woke, exp) == []
-    problems = check(never_slept, exp)
-    assert any("35" in p for p in problems)
+def _woke(t):
+    """ui_sleep.c:100, printed only from inside the board's sleep loop."""
+    return {"dir": "console", "t": t, "line": "[sleep] host back; opening eyes"}
 
 
-def test_quiet_window_is_not_satisfied_by_a_gap_with_no_frame_after_it():
-    """A board that goes quiet and stays quiet has not proved a wake."""
-    exp = dict(BASE, quiet_window_s=35)
+def test_a_sleep_wake_needs_the_board_to_say_it_woke_and_then_apply():
+    """Spacing between frames proves nothing; this line proves it slept.
+
+    The board stamps last_host_ms on ANY host protocol line (proto.c:262) and
+    the daemon pongs every ping, so with a daemon alive the 30s host timeout
+    is unreachable at any poll interval -- a gap between applied frames is
+    just a gap. "[sleep] host back; opening eyes" is printed nowhere but
+    inside ui_sleep_run(), which runs only when the host was genuinely lost.
+    """
+    exp = dict(BASE, min_sleep_wakes=1)
+    slept = [_rx(0, "hello"), _tx(1, session_pct=50.0), _applied(1.1),
+             _woke(60), _tx(61, session_pct=60.0), _applied(61.1)]
+    assert check(slept, exp) == []
+
+
+def test_wide_spacing_alone_is_not_a_sleep():
+    exp = dict(BASE, min_sleep_wakes=1)
+    spaced = [_rx(0, "hello"), _tx(1, session_pct=50.0), _applied(1.1),
+              _tx(45, session_pct=60.0), _applied(45.1)]
+    problems = check(spaced, exp)
+    assert any("never slept" in p or "opening eyes" in p for p in problems)
+
+
+def test_a_wake_with_no_frame_after_it_does_not_count():
+    """Waking up and showing nothing is the half of the feature that fails."""
+    exp = dict(BASE, min_sleep_wakes=1)
     lines = [_rx(0, "hello"), _tx(1, session_pct=50.0), _applied(1.1),
-             _tx(2, session_pct=60.0), _applied(2.1), _rx(60)]
+             _tx(2, session_pct=60.0), _applied(2.1), _woke(60)]
     assert check(lines, exp) != []
 
 
-def test_quiet_window_zero_asks_for_nothing():
-    assert check(_happy(), dict(BASE, quiet_window_s=0)) == []
+def test_each_wake_is_counted_once():
+    exp = dict(BASE, min_sleep_wakes=2)
+    once = [_rx(0, "hello"), _tx(1, session_pct=50.0), _applied(1.1),
+            _woke(60), _tx(61, session_pct=60.0), _applied(61.1),
+            _applied(62)]
+    twice = once + [_woke(90), _applied(91)]
+    assert any("sleep and wake 2" in p for p in check(once, exp))
+    assert check(twice, exp) == []
+
+
+def test_zero_sleep_wakes_asks_for_nothing():
+    assert check(_happy(), dict(BASE, min_sleep_wakes=0)) == []
 
 
 def test_empty_tap_fails():
@@ -128,13 +155,28 @@ def test_empty_tap_fails():
 
 def test_expect_that_demands_nothing_is_itself_a_problem():
     weak = {"min_tx": 0, "min_board_usage": 0, "min_stale_lines": 0,
-            "quiet_window_s": 0}
+            "min_sleep_wakes": 0}
     assert any("expect" in p for p in check(_happy(), weak))
 
 
-def test_expect_missing_a_required_key_is_a_problem():
-    assert any("min_board_usage" in p
-               for p in check(_happy(), {"min_tx": 2}))
+def test_every_expect_key_is_required_not_just_the_counting_ones():
+    """A key that falls back to zero deletes its own assertion.
+
+    A stale_age-shaped run with no STALE lines at all passed when
+    min_stale_lines was merely absent. A scenario that means to assert
+    nothing on a dimension writes an explicit 0 and says so.
+    """
+    for missing in ("min_tx", "min_board_usage", "min_stale_lines",
+                    "min_sleep_wakes"):
+        expect = {k: v for k, v in BASE.items() if k != missing}
+        problems = check(_happy(), expect)
+        assert any(missing in p for p in problems), missing
+
+
+def test_a_key_that_is_there_but_not_a_number_says_so():
+    problems = check(_happy(), dict(BASE, min_tx="two"))
+    assert any("not a number" in p for p in problems)
+    assert not any("missing" in p for p in problems)
 
 
 def test_malformed_records_do_not_raise():
@@ -143,6 +185,14 @@ def test_malformed_records_do_not_raise():
              _tx(1, session_pct=50.0), _applied(1.1),
              _tx(2, session_pct=60.0), _applied(2.1)]
     assert check(lines, BASE) == []
+
+
+def test_counts_of_one_are_not_pluralised():
+    exp = dict(BASE, min_tx=1, min_board_usage=1)
+    problems = check([_rx(0, "hello")], exp)
+    assert any("1 usage frame," in p or "1 usage frame " in p
+               for p in problems)
+    assert not any("1 usage frames" in p for p in problems)
 
 
 def test_problems_name_the_scenario():
@@ -159,9 +209,19 @@ def test_shipped_scenarios_pass_against_an_ideal_tap():
     """
     for path in sorted(SCENARIOS.glob("*.json")):
         doc = json.loads(path.read_text(encoding="utf-8"))
-        lines = [_rx(0, "hello")]
-        for step in doc["steps"]:
-            at = float(step["at"]) + 1.0
-            lines.append(_tx(at, session_pct=step["session_pct"]))
-            lines.append(_applied(at + 0.1, stale=bool(step.get("stale"))))
+
+        def replay(t0):
+            out = []
+            for step in doc["steps"]:
+                at = t0 + float(step["at"])
+                out.append(_tx(at, session_pct=step["session_pct"]))
+                out.append(_applied(at + 0.1, stale=bool(step.get("stale"))))
+            return out
+
+        lines = [_rx(0, "hello")] + replay(1.0)
+        if doc.get("host_silence_s"):
+            # The daemon is stopped, the board loses the host and sleeps, the
+            # daemon comes back and the scenario replays from its own start.
+            woke_at = doc["duration_s"] + doc["host_silence_s"]
+            lines += [_woke(woke_at)] + replay(woke_at + 1)
         assert check(lines, doc["expect"], name=doc["name"]) == [], path.name

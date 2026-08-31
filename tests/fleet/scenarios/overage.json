@@ -7,5 +7,5 @@
     {"at": 16, "provider": "claude", "session_pct": 102.0, "weekly_pct": 45.0, "state": "failed"}
   ],
   "duration_s": 25,
-  "expect": {"min_tx": 3, "min_board_usage": 3, "min_stale_lines": 0, "quiet_window_s": 0}
+  "expect": {"min_tx": 3, "min_board_usage": 3, "min_stale_lines": 0, "min_sleep_wakes": 0}
 }

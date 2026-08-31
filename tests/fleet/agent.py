@@ -12,7 +12,15 @@ back -- from a finally, on every path including the ones that raise, because
 this brackets somebody's working day and the desk has to be exactly as it was
 found.
 
-Three decisions worth stating, because each of them is a bug that has already
+It also owns the daemon's LIFETIME, which is not a detail: a scenario with
+`host_silence_s` is run in two passes with the daemon stopped in between,
+because stopping the daemon is the only thing that makes this board sleep.
+The firmware stamps last_host_ms on any host protocol line (proto.c:262) and
+the daemon answers every ten-second ping with a pong, so no poll interval
+leaves the board 30 s silent while a daemon is alive. Quiet data is not a
+quiet host.
+
+Four decisions worth stating, because each of them is a bug that has already
 happened once somewhere in this repository:
 
   - BLINK_SKIP_SERVICE goes in the CHILD's environment and nowhere else. The
@@ -34,7 +42,15 @@ happened once somewhere in this repository:
   - launchctl bootout returns before the port is free. So the run does not
     take the first refusal as an answer: it retries a short handshake until
     the board speaks, and if it never does, the result says which of the two
-    it could not tell apart rather than picking one.
+    it could not tell apart rather than picking one. The same asynchrony sits
+    between two scenarios, where there is no handshake to hide behind: a
+    settle precedes each one, and a daemon whose first traffic came late is
+    reported as inconclusive rather than as a board that failed.
+
+  - A child that will not die is named. Nothing else here can mean anything
+    while a daemon this run started still holds the port, and the shape of
+    that failure is a desk that looks perfectly healthy with a dark board on
+    it, so _stop_daemon() reports rather than shrugs.
 
 Port selection is left to the daemon, which finds the board by USB VID:PID
 (claude_usage_bridge.py:41-48) -- that is how it picks COM15 out of the
@@ -67,7 +83,22 @@ POLL_INTERVAL_S = 3.0
 # after the last step differs per scenario.
 GRACE_BASE_S = 8.0
 GRACE_POLLS = 2
-QUIET_GRACE_FRACTION = 0.25
+GRACE_WAKE_S = 6.0
+
+# A stopped daemon does not hand the port back the instant it exits, and the
+# next scenario's daemon is spawned immediately after. Cheap insurance
+# against a shifted timeline; see CONNECT_TOLERANCE_S for the detection that
+# catches the times it is not enough.
+PORT_SETTLE_S = 2.0
+
+# ScriptedProvider stamps its t0 when the daemon is CONSTRUCTED, not when it
+# reaches the board (pc/providers/scripted.py:49-58). A daemon kept waiting
+# for a busy port therefore starts its timeline early: by the time it can
+# send anything, two steps may already be due, and one poll emits both as a
+# single merged frame. Scenario steps are pinned at least 4 s apart
+# (tests/pc/test_fleet_scenarios.py), so a first record later than that is
+# the point where the run stops being able to prove what it set out to.
+CONNECT_TOLERANCE_S = 4.0
 
 # The handshake that absorbs an asynchronous bootout.
 SETTLE_TIMEOUT_S = 15.0
@@ -83,7 +114,7 @@ REAL_ACCOUNT = "real_account"
 # frame applied. Percentages come from a live account, so no count of stale
 # lines and no sleep window can be asserted.
 REAL_ACCOUNT_EXPECT = {"min_tx": 1, "min_board_usage": 1,
-                       "min_stale_lines": 0, "quiet_window_s": 0}
+                       "min_stale_lines": 0, "min_sleep_wakes": 0}
 
 
 def _popen(cmd, env, cwd):
@@ -118,6 +149,10 @@ class Deps(NamedTuple):
     spawn: Callable = _popen
     sleep: Callable = time.sleep
     now: Callable = time.monotonic
+    # Wall clock, separate from `now`: tap records are stamped in epoch
+    # seconds by the daemon, so comparing one against a monotonic reading
+    # would subtract two different origins and produce nonsense.
+    wall: Callable = time.time
     runner: Callable = subprocess.run
     stop: Callable = stop_service
     start: Callable = start_service
@@ -194,19 +229,16 @@ def grace_s(doc, poll_interval=POLL_INTERVAL_S):
         be missed while the daemon is still opening the port, so two are
         allowed for -- which means a run told to poll slowly waits longer,
         rather than failing for having been told;
-      - a board that was asleep has to wake up first. Only a scenario with a
-        quiet window has that problem, and the longer the silence the deeper
-        the sleep, so the allowance is a fraction of the window itself.
+      - a board coming out of sleep plays its opening clip before it is back
+        on the dashboard, and only then can a frame be applied. Only a
+        scenario that stops the daemon has that to do.
 
-    A fixed grace made sleep_wake -- the one scenario that spends most of its
-    duration deliberately silent -- the first to lose its final frame on a
-    slow desk. A flaky scenario inside a release gate is worse than a slow
-    one: it teaches people to re-run until green, and that ends the gate.
+    A fixed grace made the longest scenario the first to lose its final frame
+    on a slow desk. A flaky scenario inside a release gate is worse than a
+    slow one: it teaches people to re-run until green, and that ends the gate.
     """
-    quiet = tap_asserts.as_number((doc.get("expect") or {})
-                                  .get("quiet_window_s")) or 0.0
-    return (GRACE_BASE_S + GRACE_POLLS * poll_interval
-            + QUIET_GRACE_FRACTION * max(quiet, 0.0))
+    waking = GRACE_WAKE_S if doc.get("host_silence_s") else 0.0
+    return GRACE_BASE_S + GRACE_POLLS * poll_interval + waking
 
 
 def sandbox_home(workroot):
@@ -271,10 +303,17 @@ def read_tap(path):
     return out
 
 
-def _stop_daemon(proc):
-    """End the child, and never raise doing it.
+def _stop_daemon(proc, what="the daemon"):
+    """End the child and say so; never raise, never lie about having done it.
 
-    Called on the way out of every pass, including the failing ones. An
+    Returns the problems, which is the whole point of returning anything.
+    Silently failing to kill this child is the worst outcome the agent has:
+    the service is restarted on top of a process that still holds the port,
+    so the desk looks healthy, the board stays dark, and the results file
+    says nothing at all. Every later verdict is then measured through a port
+    somebody else owns.
+
+    It still never raises. This is called from finally blocks, and an
     exception here would replace the problem the run was there to find with
     one about the cleanup.
     """
@@ -282,9 +321,14 @@ def _stop_daemon(proc):
         try:
             step()
             proc.wait(timeout=10)
-            return
+            return []
         except Exception:
             continue
+    return [f"Neither terminate nor kill would end {what}, so a daemon this"
+            f" run started may still be holding the serial port. Find it and"
+            f" end it before trusting anything below, and before the installed"
+            f" service is expected to work: the desk will look fine and the"
+            f" board will stay dark."]
 
 
 def _wait_for(tap, ready, timeout, deps):
@@ -338,7 +382,12 @@ def preflight(workroot, port, deps, poll_interval=POLL_INTERVAL_S):
         try:
             heard, _ = _wait_for(tap, _heard_from_board, SETTLE_TIMEOUT_S, deps)
         finally:
-            _stop_daemon(proc)
+            orphans = _stop_daemon(proc, "the preflight daemon")
+        if orphans:
+            # Nothing below can mean anything while another daemon holds the
+            # port, so this ends the run rather than joining a list of
+            # problems on the way past.
+            return False, orphans[0]
         if heard:
             return True, f"The board answered on attempt {attempt}."
     return False, (f"No board message arrived within"
@@ -349,9 +398,54 @@ def preflight(workroot, port, deps, poll_interval=POLL_INTERVAL_S):
                    f" no board is attached to this machine.")
 
 
+def _scenario_duration(doc):
+    duration = tap_asserts.as_number(doc.get("duration_s"))
+    if duration is None:
+        duration = max([tap_asserts.as_number(s.get("at")) or 0
+                        for s in doc.get("steps", [])] or [0]) + 10
+    return duration
+
+
+def _one_pass(name, env, tap, seconds, port, deps, label):
+    """Run the daemon for one stretch. Returns (problems, connect_delay).
+
+    connect_delay is how long after the spawn the first record of THIS pass
+    was written, which is the only view the agent gets of a daemon that had
+    to wait for the port. It is not a verdict; run_scenario decides what to
+    do with it.
+    """
+    problems = []
+    before = len(read_tap(tap))
+    started = deps.wall()
+    proc = deps.spawn(daemon_cmd(port), env, REPO_ROOT)
+    try:
+        deps.sleep(seconds)
+        if proc.poll() is not None:
+            problems.append(f"Scenario {name}: the daemon exited on its own"
+                            f" during the {label} pass (status {proc.poll()});"
+                            f" its output is beside the tap in {tap}.log.")
+    finally:
+        problems += _stop_daemon(proc, f"{name}'s {label} daemon")
+
+    fresh = read_tap(tap)[before:]
+    stamps = [t for t in (tap_asserts.as_number(r.get("t")) for r in fresh)
+              if t is not None]
+    return problems, (min(stamps) - started if stamps else None)
+
+
 def run_scenario(path, board, workroot, port, deps,
                  poll_interval=POLL_INTERVAL_S):
     """One scenario end to end: spawn, wait it out, stop, read, judge.
+
+    A scenario with `host_silence_s` runs in TWO passes with the daemon gone
+    in between, because that is the only way this board ever sleeps: the
+    firmware stamps last_host_ms on any host protocol line (proto.c:262) and
+    the daemon answers every ping with a pong, so no poll interval leaves the
+    board 30 s silent while a daemon is alive. Both passes append to one
+    transcript -- the wake has to be readable in the same file as the frames
+    that came before and after it -- and the second daemon replays the
+    scenario from its own start, since ScriptedProvider stamps t0 at
+    construction.
 
     The transcript and the rewritten scenario live in a directory of this
     scenario's own; the daemon's home is the run's shared one. Keeping the
@@ -367,24 +461,49 @@ def run_scenario(path, board, workroot, port, deps,
     scenario = prepare_scenario(path, board, work / "scenario")
     env = env_for_run(sandbox_home(workroot), scenario=scenario, tap=tap,
                       sandbox=True, poll_interval=poll_interval)
+    grace = grace_s(doc, poll_interval)
+    silence = tap_asserts.as_number(doc.get("host_silence_s")) or 0.0
 
-    problems = []
-    proc = deps.spawn(daemon_cmd(port), env, REPO_ROOT)
-    try:
-        duration = tap_asserts.as_number(doc.get("duration_s"))
-        if duration is None:
-            duration = max([tap_asserts.as_number(s.get("at")) or 0
-                            for s in doc.get("steps", [])] or [0]) + 10
-        deps.sleep(duration + grace_s(doc, poll_interval))
-        if proc.poll() is not None:
-            problems.append(f"Scenario {name}: the daemon exited on its own"
-                            f" before the scenario was over (status"
-                            f" {proc.poll()}); its output is beside the tap in"
-                            f" {tap}.log.")
-    finally:
-        _stop_daemon(proc)
+    # The port the previous scenario's daemon had does not come free the
+    # instant it exits, and this one is spawned immediately afterwards.
+    deps.sleep(PORT_SETTLE_S)
+    problems, delay = _one_pass(name, env, tap,
+                                _scenario_duration(doc) + grace, port, deps,
+                                "first" if silence else "only")
+
+    if silence:
+        if problems:
+            # The first pass could not be ended cleanly. Waiting out a
+            # silence that something is still talking through would produce a
+            # board that never slept and a scenario that blamed it.
+            problems.append(f"Scenario {name}: the silence was skipped,"
+                            f" because a daemon from the first pass may still"
+                            f" be running. Nothing here can prove a sleep.")
+        else:
+            deps.sleep(silence)
+            wake = tap_asserts.as_number(doc.get("wake_duration_s")) or \
+                _scenario_duration(doc)
+            more, _ = _one_pass(name, env, tap, wake + grace, port, deps,
+                                "wake")
+            problems += more
+
     problems += tap_asserts.check(read_tap(tap), doc.get("expect", {}), name)
-    return {"ok": not problems, "problems": problems}
+    outcome = {"ok": not problems, "problems": problems}
+
+    # Reported last and separately: a run whose timeline was shifted has not
+    # earned a verdict either way, and calling it a failure would send
+    # somebody looking at a board that did nothing wrong.
+    if delay is not None and delay > CONNECT_TOLERANCE_S:
+        outcome["inconclusive"] = True
+        outcome["ok"] = False
+        outcome["problems"] = [
+            f"Scenario {name}: the daemon's first traffic came {delay:.1f}s"
+            f" after it was started, past the {CONNECT_TOLERANCE_S:.0f}s the"
+            f" scenario's step spacing allows, so its timeline is shifted and"
+            f" steps may have merged into one frame. The port was probably"
+            f" still held. This run proves nothing either way -- run it again"
+            f" rather than reading anything into it."] + outcome["problems"]
+    return outcome
 
 
 def _real_usage_seen(records):
@@ -424,6 +543,7 @@ def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S,
                       poll_interval=poll_interval)
 
     problems = []
+    deps.sleep(PORT_SETTLE_S)
     proc = deps.spawn(daemon_cmd(port), env, REPO_ROOT)
     try:
         seen, _ = _wait_for(tap, _real_usage_seen, timeout, deps)
@@ -434,7 +554,7 @@ def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S,
                 f" running but this machine's tools are reporting nothing"
                 f" usable.")
     finally:
-        _stop_daemon(proc)
+        problems += _stop_daemon(proc, "the real-account daemon")
     problems += tap_asserts.check(read_tap(tap), REAL_ACCOUNT_EXPECT,
                                   REAL_ACCOUNT)
     problems += _check_status_wire(deps)

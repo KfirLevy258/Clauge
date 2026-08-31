@@ -24,8 +24,17 @@ is the board's own console line -- unconditional, one per applied frame:
     exceed min_tx -- the board cannot apply a frame that was never sent.
   - min_stale_lines: how many of those board lines must carry the STALE
     marker (only stale_age.json asks for more than zero).
-  - quiet_window_s: 0 for none; >0 asks the checker to require a board
-    [usage] line after a silent gap of at least that many seconds.
+  - min_sleep_wakes: how many times the board must wake from sleep and then
+    apply a frame -- a "[sleep] host back; opening eyes" line (ui_sleep.c:100)
+    followed by an applied one. Only sleep_wake.json asks for more than zero,
+    and it earns it by stopping the daemon, not by spacing its steps out.
+
+That last key replaced a `quiet_window_s` that could not fail. The board
+stamps last_host_ms on ANY host protocol line (proto.c:262) and the daemon
+answers every 10s ping with a pong (bridge.py:145-149), so HOST_TIMEOUT_MS
+(30s, proto.c:29) is unreachable while the daemon is alive, at any poll
+interval. Sleep is a daemon-lifecycle event: a scenario that wants one sets
+`host_silence_s` and the agent stops the daemon for that long.
 
 Step spacing (>=4s apart) matters because fleet runs set the daemon's usage
 poll interval to about 3s (BLINK_POLL_INTERVAL_S) -- steps closer together
@@ -39,7 +48,14 @@ import os
 from pc.providers.scripted import ScriptedProvider
 
 SCEN_DIR = os.path.join(os.path.dirname(__file__), "..", "fleet", "scenarios")
-EXPECT_KEYS = ("min_tx", "min_board_usage", "min_stale_lines", "quiet_window_s")
+EXPECT_KEYS = ("min_tx", "min_board_usage", "min_stale_lines",
+               "min_sleep_wakes")
+
+# firmware/src/proto.c:29. The daemon has to be gone for longer than this
+# before the board will admit the host is lost, and a scenario that asks for
+# a sleep without allowing for it would fail on a board doing its job.
+HOST_TIMEOUT_S = 30
+SILENCE_MARGIN_S = 10
 
 
 def _load(name):
@@ -117,10 +133,44 @@ def test_stale_age_steps_use_realistic_ages():
     assert doc["expect"]["min_stale_lines"] == len(stale_steps)
 
 
-def test_sleep_wake_has_a_real_quiet_window():
-    doc, _ = _load("sleep_wake.json")
+def test_a_scenario_that_expects_a_sleep_stops_the_daemon_long_enough():
+    """The two halves of a sleep scenario have to agree with each other.
+
+    Asking for a wake without stopping the daemon for longer than the host
+    timeout is an assertion that cannot pass; stopping the daemon without
+    asking for a wake is a minute of silence that proves nothing. Neither
+    half is visible from the other, so they are pinned together here.
+    """
+    for doc, path in _all_scenarios():
+        silence = doc.get("host_silence_s", 0)
+        wants_sleep = doc["expect"]["min_sleep_wakes"] > 0
+        if wants_sleep:
+            assert silence >= HOST_TIMEOUT_S + SILENCE_MARGIN_S, path
+            assert doc.get("wake_duration_s", 0) > 0, path
+        if silence:
+            assert wants_sleep, path
+
+
+def test_sleep_wake_is_a_lifecycle_scenario_not_a_spacing_one():
+    """Its evidence must come from the daemon stopping, not from step gaps.
+
+    The version this replaced asked for a board [usage] line after a 40s gap
+    between steps -- which the scenario produced by construction, since
+    ScriptedProvider emits each step once and there was nothing between
+    at:5 and at:45. It would have passed identically against firmware with
+    sleep deleted.
+    """
+    doc, path = _load("sleep_wake.json")
+    assert doc["expect"]["min_sleep_wakes"] >= 1
     ats = sorted(s["at"] for s in doc["steps"])
-    gaps = [b - a for a, b in zip(ats, ats[1:])]
-    biggest = max(gaps)
-    assert biggest >= doc["expect"]["quiet_window_s"]
-    assert biggest >= 35  # sleep threshold is 30s; leave margin
+    gaps = [b - a for a, b in zip(ats, ats[1:])] or [0]
+    assert max(gaps) < HOST_TIMEOUT_S, (
+        f"{path}: step spacing is not what makes this board sleep; a gap that"
+        f" big only disguises a lifecycle test as a data one")
+
+
+def test_a_scenario_that_restarts_the_daemon_expects_the_replay():
+    """ScriptedProvider stamps t0 at construction, so pass two replays it."""
+    for doc, path in _all_scenarios():
+        cap = len(doc["steps"]) * (2 if doc.get("host_silence_s") else 1)
+        assert doc["expect"]["min_tx"] <= cap, path
