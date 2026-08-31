@@ -8,6 +8,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import claude_usage_bridge as cub
 from pc import protocol
@@ -140,6 +142,39 @@ def test_no_scenario_env_keeps_the_real_providers(monkeypatch):
 
     ids = cub.build_bus().provider_ids()
     assert "claude" in ids
+
+
+def test_without_the_env_the_poll_interval_is_the_shipped_default(monkeypatch):
+    monkeypatch.delenv("BLINK_POLL_INTERVAL_S", raising=False)
+
+    # The customer path is the constant, untouched.
+    assert cub.POLL_INTERVAL_S == 60
+    assert cub.poll_interval() == 60
+
+
+def test_the_poll_interval_can_be_shortened_for_a_scenario_timeline(monkeypatch):
+    # A scenario is a timeline. At one poll a minute a thirty-second scenario
+    # emits a single usage frame, so the sequence under test never happens.
+    monkeypatch.setenv("BLINK_POLL_INTERVAL_S", "3")
+
+    assert cub.poll_interval() == 3
+
+
+def test_a_fractional_poll_interval_is_honoured(monkeypatch):
+    monkeypatch.setenv("BLINK_POLL_INTERVAL_S", "2.5")
+
+    assert cub.poll_interval() == 2.5
+
+
+@pytest.mark.parametrize("junk", ["abc", "0", "-5", "", "  "])
+def test_a_nonsense_poll_interval_falls_back_and_says_so(
+        junk, monkeypatch, capsys):
+    # Zero or negative would busy-poll a rate-limited endpoint as fast as the
+    # read loop turns, so it is refused rather than obeyed.
+    monkeypatch.setenv("BLINK_POLL_INTERVAL_S", junk)
+
+    assert cub.poll_interval() == 60
+    assert "BLINK_POLL_INTERVAL_S" in capsys.readouterr().err
 
 
 def test_without_blink_tap_nothing_is_wrapped_and_no_file_appears(

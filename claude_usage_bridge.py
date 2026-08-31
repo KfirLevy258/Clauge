@@ -196,6 +196,42 @@ def install_tap(write_msg, on_message):
     return tap, write2, rx2
 
 
+def poll_interval():
+    """Seconds between usage polls: the shipped 60, unless a test says less.
+
+    A fleet scenario is a timeline -- the percentage climbs, then goes past
+    100 -- and the daemon emits one usage message per poll. At a poll a
+    minute a thirty-second scenario produces exactly one frame, so the
+    sequence the test exists to observe never reaches the board at all. The
+    suite sets BLINK_POLL_INTERVAL_S to about 3 and gets its timeline.
+
+    Worth knowing before shortening it: poll_once() writes a `time` message
+    on EVERY poll, before and independently of the usage message, so this
+    also multiplies `time` traffic to the board. Anything counting frames in
+    the tap must count records whose msg["t"] == "usage" rather than counting
+    tx records.
+
+    Malformed or non-positive is refused rather than obeyed: 0 or a negative
+    makes the poll gate true on every turn of the read loop, which would
+    hammer a rate-limited usage endpoint as fast as the loop spins. It falls
+    back to the default and says so -- once, because main() resolves this at
+    startup and never asks again.
+    """
+    raw = os.environ.get("BLINK_POLL_INTERVAL_S")
+    if raw is None:
+        return POLL_INTERVAL_S
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        print(f"[bridge] BLINK_POLL_INTERVAL_S={raw!r} is not a positive"
+              f" number of seconds; polling every {POLL_INTERVAL_S} s.",
+              file=sys.stderr)
+        return POLL_INTERVAL_S
+    return seconds
+
+
 def build_bus():
     """The daemon's usage source: scripted when BLINK_SCENARIO says so.
 
@@ -655,6 +691,10 @@ def main(argv=None):
     # tool never reaches this loop.
     bus = build_bus()
     fetch = bus.poll
+    # Resolved once, here, rather than read inside the loop: the interval is
+    # a property of this run, and the read loop turns often enough that an
+    # environment lookup per pass would be a strange place to spend time.
+    poll_every = poll_interval()
 
     last_err = None
     explicit_port = bool(args.port)
@@ -987,7 +1027,7 @@ def main(argv=None):
                     # still pushes immediately on (re)connect.
                     if bridge.board_alive():
                         bridge.poll_once()
-                    next_poll = time.monotonic() + POLL_INTERVAL_S
+                    next_poll = time.monotonic() + poll_every
                 # Not gated on board_alive(): drift is a fact about this
                 # machine, not about the cable. The same _upkeep runs from
                 # inside wait_for_port, so an unplugged machine repairs a
