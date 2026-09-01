@@ -154,6 +154,119 @@ def test_launchd_start_bootstraps_the_installed_plist(home, monkeypatch):
     assert r.ran("launchctl", "bootstrap", "gui/501", cli.plist_path())
 
 
+def test_launchd_start_kickstarts_the_job_it_just_bootstrapped(home, monkeypatch):
+    """bootstrap registers the job; kickstart is what actually runs it.
+
+    Measured on a live machine, with the shipped plist (RunAtLoad is set):
+
+        launchctl bootout   gui/501/com.blink.bridge          -> rc 0
+        launchctl bootstrap gui/501 <plist>                   -> rc 0
+        launchctl print     gui/501/com.blink.bridge          -> not running,
+                                                                 runs = 0
+                                (still not running six seconds later)
+        launchctl kickstart gui/501/com.blink.bridge          -> running,
+                                                                 runs = 1, pid
+
+    So a bootstrap that exits 0 has not started anything. This is the fleet
+    suite's restore path: it runs in a finally block on a desk the user
+    works at, and answering "started" for a registered-but-idle job leaves
+    that desk dark while the run reports success.
+    """
+    _platform(monkeypatch, "darwin")
+    _write(cli.plist_path())
+    r = _Runs()
+    assert cli._LaunchdBackend().start(r) == "started"
+    assert r.calls[0][:2] == ["launchctl", "bootstrap"]
+    assert r.calls[1][:2] == ["launchctl", "kickstart"]
+    assert r.ran("launchctl", "kickstart", "gui/501/com.blink.bridge")
+
+
+def test_launchd_start_does_not_kickstart_a_bootstrap_that_failed(home, monkeypatch):
+    """Nothing to kick: the job was never registered.
+
+    kickstart against an unregistered label fails too, so this is about the
+    answer rather than the machine -- a second failing command would bury
+    the bootstrap command the operator actually needs to paste.
+    """
+    _platform(monkeypatch, "darwin")
+    _write(cli.plist_path())
+    r = _Runs(codes=[1])
+    out = cli._LaunchdBackend().start(r)
+    assert not r.ran("kickstart"), r.joined
+    assert "could not start it" in out and "launchctl bootstrap" in out
+
+
+def test_launchd_start_that_registers_but_cannot_run_is_a_failure(home, monkeypatch):
+    """A registered job holds no serial port, so this is not a start.
+
+    service_ctl reads these sentences to set Outcome.ok, and the fleet agent
+    reads that to decide whether the desk was handed back. "started" here
+    would be the exact false success the kickstart was added to prevent.
+    """
+    _platform(monkeypatch, "darwin")
+    _write(cli.plist_path())
+    r = _Runs(codes=[0, 1])
+    out = cli._LaunchdBackend().start(r)
+    assert out != "started"
+    assert "could not start it" in out and "launchctl kickstart" in out
+
+
+def test_launchd_install_kickstarts_and_only_then_claims_it_is_running(
+        home, monkeypatch):
+    """The same gap in shipped customer code, and the same measurement.
+
+    install() is what `blink install` and every self-update path print as
+    "Background service ... running (launchd)". By the measurement above
+    that sentence was false whenever bootstrap succeeded: the job was
+    registered and idle, and would not have run until the next login.
+    """
+    _platform(monkeypatch, "darwin")
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(cli.update.ota, "NO_WINDOW", {"creationflags": 0x08000000})
+    r = _Runs()
+    monkeypatch.setattr(cli.subprocess, "run", r)
+
+    assert cli._LaunchdBackend().install() == "running (launchd)"
+
+    assert [c[1] for c in r.calls] == ["bootout", "bootstrap", "kickstart"]
+    assert r.ran("launchctl", "kickstart", "gui/501/com.blink.bridge")
+    # The v1.2.1 rule reaches the new call site too: nothing Blink starts may
+    # flash a console window. NO_WINDOW is empty off Windows, so a sentinel is
+    # what actually pins a call site that dropped the spread.
+    for kw in r.kwargs:
+        assert kw.get("creationflags") == 0x08000000, kw
+
+
+def test_launchd_install_does_not_claim_running_when_the_kickstart_fails(
+        home, monkeypatch):
+    """Registered but not running is exactly "installed, but could not be
+    started" -- the sentence install() already has for a bootstrap that never
+    took. The plist is on disk and the job is loaded, so the customer's next
+    login does start it; what is untrue is only "running".
+    """
+    _platform(monkeypatch, "darwin")
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    r = _Runs(codes=[0, 0, 1])                 # bootout, bootstrap, kickstart
+    monkeypatch.setattr(cli.subprocess, "run", r)
+
+    msg = cli._LaunchdBackend().install()
+    assert "running (launchd)" not in msg
+    assert msg.startswith("installed, but could not be started:")
+    assert "launchctl kickstart gui/501/com.blink.bridge" in msg
+
+
+def test_launchd_install_does_not_kickstart_a_bootstrap_that_never_took(
+        home, monkeypatch):
+    _platform(monkeypatch, "darwin")
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    r = _Runs(codes=[0, 1, 1, 1, 1])           # bootout, then four bootstraps
+    monkeypatch.setattr(cli.subprocess, "run", r)
+
+    msg = cli._LaunchdBackend().install()
+    assert not r.ran("kickstart"), r.joined
+    assert "launchctl bootstrap gui/501" in msg
+
+
 def test_launchd_stop_reports_a_failure_with_the_command_to_run(home, monkeypatch):
     _platform(monkeypatch, "darwin")
     _write(cli.plist_path())

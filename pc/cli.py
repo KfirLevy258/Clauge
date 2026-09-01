@@ -541,15 +541,40 @@ class _LaunchdBackend(_Backend):
         # immediately after it can fail while launchd is still tearing the old
         # job down, which left a reinstall with no service running at all --
         # observed on the second install of the day, silently.
+        #
+        # That retry is still worth having, but it was only ever half of this
+        # story: it guards a bootstrap that FAILS. A bootstrap that succeeds
+        # also starts nothing. Measured on a live machine, with this very
+        # plist (RunAtLoad is set in _PLIST_TEMPLATE):
+        #
+        #   launchctl bootout   gui/501/com.blink.bridge   -> rc 0
+        #   launchctl bootstrap gui/501 <plist>            -> rc 0
+        #   launchctl print     gui/501/com.blink.bridge   -> "not running",
+        #                                                     runs = 0
+        #                          (still not running six seconds later)
+        #   launchctl kickstart gui/501/com.blink.bridge   -> running, runs = 1
+        #
+        # So bootstrap registers the job and kickstart is what runs it. Until
+        # this line existed the customer was told "running (launchd)" about a
+        # job that was registered and idle, and that would not have actually
+        # started before their next login.
         for attempt in range(4):
             r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist_path()],
                                capture_output=True, **update.ota.NO_WINDOW)
             if r.returncode == 0:
                 break
             time.sleep(0.5 * (attempt + 1))
-        if r.returncode == 0:
+        if r.returncode != 0:
+            return f"installed, but could not be started: launchctl bootstrap gui/{uid} {plist_path()}"
+        k = subprocess.run(["launchctl", "kickstart", f"gui/{uid}/{LABEL}"],
+                           capture_output=True, **update.ota.NO_WINDOW)
+        if k.returncode == 0:
             return "running (launchd)"
-        return f"installed, but could not be started: launchctl bootstrap gui/{uid} {plist_path()}"
+        # Registered but not running. Not the same failure as a bootstrap that
+        # never took -- the plist is on disk, launchd has the job, and the next
+        # login does start it -- so it gets the same honest sentence rather
+        # than a harder one: everything except the word "running" is true.
+        return f"installed, but could not be started: launchctl kickstart gui/{uid}/{LABEL}"
 
     def restart(self) -> str:
         r = subprocess.run(["launchctl", "kickstart", "-k",
@@ -586,15 +611,38 @@ class _LaunchdBackend(_Backend):
         return f"could not stop it: launchctl bootout gui/{uid}/{LABEL}"
 
     def start(self, runner=None) -> str:
+        """bootstrap, and then kickstart, because bootstrap starts nothing.
+
+        `launchctl bootstrap` registers the job with launchd and exits 0
+        without running it, RunAtLoad in the plist notwithstanding. Measured
+        on a live machine -- see the block in install(), which had the same
+        gap -- a bootstrapped job sits at "not running / runs = 0" for as
+        long as you care to watch it, and one kickstart turns it into
+        "running / runs = 1" with a pid.
+
+        This is the fleet suite's restore path, called from a finally block
+        on a machine someone works at. Answering "started" for a registered
+        but idle job is the worst answer available here: the run reports
+        success, the daemon never retakes the serial port, and the desk goes
+        dark with nothing pointing at the cause. So a kickstart that fails
+        is a failed start, even though the job is registered -- what the
+        caller asked for is a process holding the port again.
+        """
         if not os.path.exists(plist_path()):
             return "not installed"
         uid = os.getuid()
-        r = (runner or subprocess.run)(
-            ["launchctl", "bootstrap", f"gui/{uid}", plist_path()],
-            capture_output=True, **update.ota.NO_WINDOW)
-        if r.returncode == 0:
+        run = runner or subprocess.run
+        r = run(["launchctl", "bootstrap", f"gui/{uid}", plist_path()],
+                capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode != 0:
+            # No job to kick, and a second failing command would only bury the
+            # one line the operator needs to paste.
+            return f"could not start it: launchctl bootstrap gui/{uid} {plist_path()}"
+        k = run(["launchctl", "kickstart", f"gui/{uid}/{LABEL}"],
+                capture_output=True, **update.ota.NO_WINDOW)
+        if k.returncode == 0:
             return "started"
-        return f"could not start it: launchctl bootstrap gui/{uid} {plist_path()}"
+        return f"could not start it: launchctl kickstart gui/{uid}/{LABEL}"
 
     def remove(self) -> str:
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
