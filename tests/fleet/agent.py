@@ -102,9 +102,11 @@ PORT_SETTLE_S = 2.0
 
 # ScriptedProvider stamps its t0 when the daemon is CONSTRUCTED, not when it
 # reaches the board (pc/providers/scripted.py:49-58). A daemon kept waiting
-# for a busy port therefore starts its timeline early: by the time it can
-# send anything, two steps may already be due, and one poll emits both as a
-# single merged frame. Scenario steps are pinned at least 4 s apart
+# for a busy port therefore starts its timeline early: steps come due while
+# there is nothing to send them over, and the replay -- one step per poll --
+# hands the whole timeline over that much later than the file describes,
+# pushing its last steps towards the end of duration_s + grace and past it if
+# the wait was long enough. Scenario steps are pinned at least 4 s apart
 # (tests/pc/test_fleet_scenarios.py), so a first record later than that is
 # the point where the run stops being able to prove what it set out to.
 CONNECT_TOLERANCE_S = 4.0
@@ -134,7 +136,27 @@ UPDATE_PATH = "update_path"
 # update that downloads, unpacks and self-tests again. The self-test alone is
 # allowed 300 s (pc/update.py:244), measured at 97 s on a machine under load
 # average 89 -- a laptop mid-build, which is exactly when somebody runs this.
-BUNDLE_TIMEOUT_S = 900.0
+# So this has to sit outside 300 s comfortably, or the outer cap fires first
+# and replaces the update's own message with "could not be run at all".
+#
+# It is a cap per COMMAND, and the customer path makes BUNDLE_CALLS of them,
+# so the number that matters is the product: at the 900 s this used to be,
+# the two bundle scenarios alone could spend the orchestrator's whole per-desk
+# budget (tools/fleet/run.py AGENT_TIMEOUT_S) and the four board scenarios
+# would never run -- reported as a timed-out desk rather than as a result.
+# The two are pinned against each other by a test.
+BUNDLE_TIMEOUT_S = 420.0
+
+# fresh_install: unpack, --version, install, --version. update_path: unpack,
+# --version, install, --version, update, --version.
+BUNDLE_CALLS = 10
+
+# Directories the run makes for itself under the work root. A scenario of the
+# same name would have its working directory emptied from under it -- or, for
+# "home", would take the run's shared sandbox home with it. See
+# select_scenarios(), which refuses one before anything is stopped.
+RESERVED_WORK_NAMES = frozenset({"home", "preflight", REAL_ACCOUNT,
+                                 FRESH_INSTALL, UPDATE_PATH})
 
 
 def _popen(cmd, env, cwd):
@@ -330,9 +352,21 @@ def select_scenarios(directory, only=None):
     A name that matches nothing is refused rather than skipped. A typo in
     --only would otherwise produce a green results file that proves less than
     the operator believes it does.
+
+    So is a name this run already uses for a directory of its own. Every pass
+    empties its working directory before it starts (_fresh_work), so a
+    scenario named after the run's shared home would delete that home in the
+    middle of the run, and one named after another pass would delete its
+    transcript. Refused before the service is stopped, where it costs nothing.
     """
     directory = Path(directory)
     found = {p.stem: p for p in sorted(directory.glob("*.json"))}
+    taken = sorted(set(found) & RESERVED_WORK_NAMES)
+    if taken:
+        raise ValueError(
+            f"{directory} holds a scenario named {taken[0]!r}, which is a"
+            f" directory this run makes for itself. Rename it: the reserved"
+            f" names are {', '.join(sorted(RESERVED_WORK_NAMES))}.")
     if not only:
         return list(found.values())
     missing = [n for n in only if n not in found]
@@ -364,6 +398,32 @@ def read_tap(path):
         if isinstance(record, dict):
             out.append(record)
     return out
+
+
+def _fresh_work(work):
+    """A pass's working directory, with nothing from an earlier run left in it.
+
+    The work root is a fixed path beside --out, `git archive | tar -x` never
+    touches it because it is not in the snapshot, and Tap opens the transcript
+    with "a". So without this a second run in the same workdir appends to the
+    first one's records and then judges the union of both, which is not a
+    small error: a daemon that writes nothing at all -- a board unplugged, a
+    port still held, a daemon wedged -- reads as a PASS from the second run
+    onward, and preflight, whose entire job is catching "no board attached",
+    answers from a transcript written last week.
+
+    Per scenario RUN, not per daemon pass: sleep_wake's two passes share one
+    transcript on purpose, because the wake has to be readable in the same
+    file as the frames either side of it.
+
+    The daemon's own log beside the tap goes with it. A transcript from this
+    run next to output from the last one is worse than either alone -- those
+    two files side by side are the whole story of a red desk.
+    """
+    work = Path(work)
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    return work
 
 
 def _stop_daemon(proc, what="the daemon"):
@@ -430,8 +490,7 @@ def preflight(workroot, port, deps, poll_interval=POLL_INTERVAL_S):
     would send someone at 2am to the wrong end of the desk.
     """
     home = sandbox_home(workroot)
-    taps = Path(workroot) / "preflight"
-    taps.mkdir(parents=True, exist_ok=True)
+    taps = _fresh_work(Path(workroot) / "preflight")
     for attempt in range(1, SETTLE_ATTEMPTS + 1):
         tap = taps / f"tap-{attempt}.jsonl"
         env = env_for_run(home, scenario=None, tap=tap, sandbox=True,
@@ -524,12 +583,19 @@ def run_scenario(path, board, workroot, port, deps,
     tap out of that home matters twice over: five passes appending to one
     file could not be told apart, and a scenario's own artefacts have no
     business in a directory the daemon treats as somebody's account.
+
+    That directory is emptied first -- see _fresh_work(). The verdict is a
+    count over the transcript, and a transcript that survived the last run
+    would let this one pass on records its own daemon never wrote.
     """
     doc = json.loads(Path(path).read_text(encoding="utf-8"))
     name = doc.get("name", Path(path).stem)
-    work = Path(workroot) / name
-    work.mkdir(parents=True, exist_ok=True)
+    work = _fresh_work(Path(workroot) / name)
     tap = work / "tap.jsonl"
+    # Zero after the clear above, and read anyway: the verdict below is taken
+    # from this run's records alone, so a caller that ever hands this function
+    # a work directory it did not clear cannot resurrect a transcript.
+    before = len(read_tap(tap))
     scenario = prepare_scenario(path, board, work / "scenario")
     env = env_for_run(sandbox_home(workroot), scenario=scenario, tap=tap,
                       sandbox=True, poll_interval=poll_interval)
@@ -560,12 +626,14 @@ def run_scenario(path, board, workroot, port, deps,
             problems += more
             # The wake pass needs the same protection as the first one, and
             # needs it more: min_tx counts on the second daemon replaying
-            # every step, so a slow connect there merges two of them and
-            # comes up short -- which is the board being blamed for the port.
+            # every step, so a slow connect there pushes the last of them past
+            # the end of a pass that is shorter than the first one, and comes
+            # up short -- which is the board being blamed for the port.
             delay = max([d for d in (delay, wake_delay) if d is not None],
                         default=None)
 
-    problems += tap_asserts.check(read_tap(tap), doc.get("expect", {}), name)
+    problems += tap_asserts.check(read_tap(tap)[before:], doc.get("expect", {}),
+                                  name)
     outcome = {"ok": not problems, "problems": problems}
 
     # Reported last and separately: a run whose timeline was shifted has not
@@ -577,10 +645,11 @@ def run_scenario(path, board, workroot, port, deps,
         outcome["problems"] = [
             f"Scenario {name}: the daemon's first traffic came {delay:.1f}s"
             f" after it was started, past the {CONNECT_TOLERANCE_S:.0f}s the"
-            f" scenario's step spacing allows, so its timeline is shifted and"
-            f" steps may have merged into one frame. The port was probably"
-            f" still held. This run proves nothing either way -- run it again"
-            f" rather than reading anything into it."] + outcome["problems"]
+            f" scenario's step spacing allows, so its timeline is shifted by"
+            f" that much and its last steps may not have been reached before"
+            f" the daemon was stopped. The port was probably still held. This"
+            f" run proves nothing either way -- run it again rather than"
+            f" reading anything into it."] + outcome["problems"]
     return outcome
 
 
@@ -614,8 +683,7 @@ def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S,
     because it is the command a support conversation starts with and it must
     not be competing with the daemon for the port while it answers.
     """
-    work = Path(workroot) / REAL_ACCOUNT
-    work.mkdir(parents=True, exist_ok=True)
+    work = _fresh_work(Path(workroot) / REAL_ACCOUNT)
     tap = work / "tap.jsonl"
     env = env_for_run(work, scenario=None, tap=tap, sandbox=False,
                       poll_interval=poll_interval)
@@ -646,9 +714,16 @@ def _check_status_wire(deps):
     a non-ASCII profile name, the wire message carries a transcript path, and
     that path through cp1255 is the UnicodeDecodeError that once left a whole
     machine with no figure on its board.
+
+    Its environment is built the same way as every other child's, through
+    _clean_env(). `blink status` reads only BLINK_SKIP_SERVICE today, so an
+    inherited variable would change nothing -- but _clean_env()'s own reason
+    for existing is that there is no child anywhere in this file that is the
+    exception, because the exception is what the next person copies. The home
+    is deliberately NOT redirected: this pass is about the account this
+    machine actually has, and status must answer for the same one.
     """
-    env = dict(os.environ)
-    env["PYTHONIOENCODING"] = "utf-8"
+    env = _clean_env()
     env["BLINK_SKIP_SERVICE"] = "1"
     cmd = [sys.executable, str(REPO_ROOT / "blink_main.py"), "status", "--wire"]
     try:
@@ -1176,7 +1251,7 @@ def run(args, deps=None):
         result["problems"].append(
             f"The installed service would not stop, so the serial port is"
             f" probably still held: {stopped}. Nothing was run.")
-        deps.start()
+        _restart_service(result, deps)
         return _finish(result)
 
     try:
@@ -1210,18 +1285,38 @@ def run(args, deps=None):
                                            args.real_timeout,
                                            args.poll_interval)
                 result["scenarios"][REAL_ACCOUNT] = outcome
+                # Printed like every other pass. It is the only one that says
+                # whether this desk can read its own tools, and it was the
+                # only one whose verdict never reached the operator watching
+                # the run go by.
+                print(f"[fleet] {REAL_ACCOUNT}:"
+                      f" {'ok' if outcome['ok'] else 'FAILED'}")
+                for problem in outcome["problems"]:
+                    print(f"        {problem}")
     except Exception as e:
         result["problems"].append(
             f"The run stopped early on an unexpected error: {e!r}. The"
             f" transcripts it did write are under {workroot}.")
     finally:
-        started = deps.start()
-        print(f"[fleet] start service: {started}")
-        if not started.ok:
-            result["problems"].append(
-                f"The installed service was not started again: {started}."
-                f" This machine's board will stay dark until it is.")
+        _restart_service(result, deps)
     return _finish(result)
+
+
+def _restart_service(result, deps):
+    """Give the port back, and say so in the result when that did not work.
+
+    One function because there are two paths that restart, and the one that
+    used to throw its Outcome away -- the early return after a stop that
+    failed -- is the path most likely to be looking at a machine whose
+    service is in a state nobody asked for. A desk left with no daemon and no
+    sentence saying so is the failure this whole file is arranged to avoid.
+    """
+    started = deps.start()
+    print(f"[fleet] start service: {started}")
+    if not started.ok:
+        result["problems"].append(
+            f"The installed service was not started again: {started}."
+            f" This machine's board will stay dark until it is.")
 
 
 def _finish(result):

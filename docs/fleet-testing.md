@@ -60,9 +60,12 @@ in parallel, so that is roughly the length of the whole run. Bundles add a few
 minutes more per desk -- unpacking 50 MB and an installer that self-tests the
 copy it made.
 
-The orchestrator allows 90 minutes per desk (`--timeout`) before it gives up on
-one. That is generous on purpose: a timeout is reported as a failed release,
-and slow is not broken.
+The orchestrator allows two hours per desk (`--timeout`) before it gives up on
+one. That is generous on purpose, and it is also arithmetic rather than a round
+number: the customer-path scenarios run first and allow seven minutes per
+program call, so the whole of that phase has to fit inside the desk's budget
+with the four board scenarios still to come. A per-desk timeout is reported as
+a failed release, and slow is not broken.
 
 ### Seeing the commands without running anything
 
@@ -119,9 +122,28 @@ When a desk goes red and its sentence is not enough, those two files beside
 each other are the whole story: what crossed the wire, and what the daemon
 thought it was doing at the time.
 
+**Everything under `fleet-work/` is from the run you are looking at.** The
+workdir survives between runs, but each pass empties its own directory before
+its daemon starts -- transcript, daemon log and all -- so what is on the disk
+is what this run's daemon wrote and nothing else. The verdict is a count over
+those records, and a transcript that accumulated across runs would let a desk
+whose board was unplugged pass on last week's evidence: a daemon that writes
+nothing at all is exactly what an unplugged board, a held port and a wedged
+daemon all look like from here. Copy a transcript elsewhere if you want to
+keep it; the next run will not.
+
+The one thing that spans two daemons is `sleep_wake`, which is one directory
+and one transcript for both of its passes -- the wake has to be readable in
+the same file as the frames either side of it.
+
 ## The inventory
 
-`tools/fleet/fleet.toml` is one `[hosts.<name>]` table per desk. Every field is
+`tools/fleet/fleet.toml` is one `[hosts.<name>]` table per desk, and **one
+entry per machine**: two entries sharing an `ssh` line, or two with none
+(which both mean this machine), are refused, because the desks run in
+parallel and two agents on one machine would stop and start the same login
+service, unpack into the same workdir and compete for the one serial port --
+with the loser's failures reading as a dead board. Every field is
 required, and a malformed inventory is refused before anything is touched --
 the alternative is stopping two desks' services, discovering the third has no
 `python` line, and leaving somebody's board dark over a typo.
@@ -132,7 +154,7 @@ the alternative is stopping two desks' services, discovering the third has no
 | `os` | `darwin`, `linux` or `windows`. Windows means the remote shell is `cmd.exe`, which changes how every command line is built. |
 | `board` | `claude` or `codex` -- which edition of the board is on that desk. |
 | `python` | An interpreter on that machine **that has pyserial**. |
-| `workdir` | Where the snapshot is unpacked and the agent runs. Created if absent; it survives between runs. |
+| `workdir` | Where the snapshot is unpacked and the agent runs. Created if absent; it survives between runs, though the transcripts under it do not -- see [Where the evidence lands](#where-the-evidence-lands). |
 | `has_claude_desktop` | Recorded in that desk's result for the reader. The orchestrator does not act on it. |
 
 There is deliberately **no port** in this file. The daemon finds the board by
@@ -196,7 +218,7 @@ Here is `stale_age.json`, with its `note` shortened:
 | Key | Means |
 |---|---|
 | `name`, `note` | For the reader. `note` is where the reason this file exists goes. |
-| `steps[].at` | Seconds since the provider was constructed. A step fires **once**, when elapsed time reaches it: a step is an event, not a level. |
+| `steps[].at` | Seconds since the provider was constructed. A step fires **once**, when elapsed time reaches it: a step is an event, not a level. One step per poll, oldest first -- a poll becomes a single usage message however many steps have come due, so the replay delays a late timeline rather than collapsing it. |
 | `steps[].age_s` | How old the reading claims to be (`observed_at = now - age_s`), so a step can be four hours old the instant it fires. Defaults to 0. |
 | Other `steps[]` fields | A usage frame as plain JSON -- `provider`, `session_pct`, `weekly_pct`, `state`, `stale`. A field name that does not exist on the frame drops that step, with a line on stderr, rather than taking the daemon down on three machines. |
 | `duration_s` | How long the daemon runs. The agent adds its own grace on top for the last frame to be polled, sent and applied. |
@@ -242,12 +264,17 @@ from its own start.
 
 ### Adding one
 
-1. Write the file, named after what it proves.
-2. Keep steps **at least 4 seconds apart**. A daemon kept waiting for a busy
-   port starts its timeline early, and two steps closer than that can merge
-   into one frame; the agent reports a run whose first traffic came more than
-   4 seconds late as *inconclusive* rather than failed, and that tolerance is
-   what the spacing has to survive.
+1. Write the file, named after what it proves -- but not `home`, `preflight`,
+   `real_account`, `fresh_install` or `update_path`, which are directories the
+   run makes for itself and are refused as scenario names.
+2. Keep steps **at least 4 seconds apart**, which is longer than a fleet run's
+   3-second poll. The provider hands the daemon **one step per poll**, so
+   steps closer together than a poll cycle still all reach the board but
+   later than the file says, and `duration_s` stops describing what actually
+   happens. A daemon kept waiting for a busy port starts its timeline early
+   for the same reason; the agent reports a run whose first traffic came more
+   than 4 seconds late as *inconclusive* rather than failed, and that
+   tolerance is what the spacing has to survive.
 3. Set `duration_s` past the last `at`. The daemon polls every 3 seconds during
    a fleet run (the shipped interval is 60, at which a thirty-second scenario
    would produce one frame and never reach the sequence under test).
@@ -446,7 +473,7 @@ the last thing between a bad build and all of them.
 | `PermissionError(13, 'Access is denied.')` on COM15 | On Windows this normally means the installed daemon still holds the port -- which is why the agent stops the service first. Seeing it means the stop did not take. | Check the Scheduled Task is really stopped, and that no daemon from an earlier run survived. Do not add a port to `fleet.toml`: that desk has twelve COM ports, eleven of them Bluetooth, and the daemon finds the right one by USB vendor and product ID, not by name. |
 | The run aborts naming `BLINK_SKIP_SERVICE` | That variable is set in the operator's shell, which would make the service stop a silent no-op -- the real daemon keeps the port, ours is refused it, and a healthy board is reported as a hardware fault. | `unset BLINK_SKIP_SERVICE` and start again. Nothing was run and the service was left alone. |
 | "No board message arrived within 15s on any of 3 attempts" | Either the port is still held by the service that was just stopped, or no board is attached. The message deliberately does not guess: those two look identical from here. | Look at the desk. |
-| "the daemon's first traffic came 7.2s after it was started" | The timeline was shifted and steps may have merged, so the run is reported as *inconclusive*, not as a failed board. | Run it again rather than reading anything into it. |
+| "the daemon's first traffic came 7.2s after it was started" | The timeline was shifted by that much, so its last steps may not have been reached before the daemon was stopped. The run is reported as *inconclusive*, not as a failed board. | Run it again rather than reading anything into it. |
 | "Nothing was collected from `<desk>`" | The run was cut off from this end, which says nothing about what it left behind on that end. | Check that desk by hand before trusting it: a run cut off mid-scenario can leave the installed service stopped and that board dark. |
 | The agent exited `9009` | `cmd.exe` saying it found no `python`. | Fix the `python` line for that desk in `fleet.toml`. |
 | ssh fails at once instead of hanging | `BatchMode=yes` turns a passphrase prompt into an immediate error, on purpose -- a desk sitting at a prompt would hold the release open forever. | Load the key into an agent, or use one without a passphrase. |

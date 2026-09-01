@@ -176,6 +176,18 @@ def test_only_selects_named_scenarios(tmp_path):
     assert [p.stem for p in agent.select_scenarios(d, None)] == ["one", "two"]
 
 
+def test_a_scenario_named_after_the_runs_own_directories_is_refused(tmp_path):
+    """Every pass empties its working directory before its daemon starts.
+
+    A scenario called `home` would therefore delete the run's shared sandbox
+    home halfway through it, and one called `preflight` would delete the
+    settle attempts. Refused up front, before the service is stopped.
+    """
+    d = _scenario(tmp_path, "home")
+    with pytest.raises(ValueError, match="home"):
+        agent.select_scenarios(d)
+
+
 def test_unknown_scenario_name_is_refused(tmp_path):
     d = _scenario(tmp_path, "one")
     with pytest.raises(ValueError, match="nope"):
@@ -256,6 +268,23 @@ def test_a_failed_stop_is_reported_but_does_not_skip_the_restart(tmp_path):
     assert result["ok"] is False
     assert any("could not stop" in p for p in result["problems"])
     assert started == [True]
+
+
+def test_a_restart_that_fails_after_a_failed_stop_is_reported_too(tmp_path):
+    """The one path that can leave a desk with no daemon used to not look.
+
+    The early return after a stop that failed restarted the service and threw
+    the Outcome away, while the finally on every other path checked it. So the
+    run most likely to have left the service in a state nobody asked for was
+    the run that said nothing about it.
+    """
+    args = agent.parse_args(["--scenarios", str(_scenario(tmp_path)),
+                             "--out", str(tmp_path / "r.json")])
+    result = agent.run(args, _deps(
+        stop=lambda: Outcome(False, False, "could not stop the service: boom"),
+        start=lambda: Outcome(False, False, "could not start it: launchctl")))
+    assert result["ok"] is False
+    assert any("stay dark" in p for p in result["problems"]), result["problems"]
 
 
 # --- the port settling after an asynchronous bootout ------------------
@@ -488,12 +517,14 @@ def test_a_settle_precedes_every_scenario(tmp_path):
 
 
 def test_a_late_connect_is_inconclusive_rather_than_a_board_fault(tmp_path):
-    """A shifted timeline can merge two steps into one frame.
+    """A shifted timeline can run out of pass before it runs out of steps.
 
     ScriptedProvider stamps its t0 when the daemon is CONSTRUCTED, not when
-    it reaches the board, so a daemon kept waiting for the port emits its
-    first two steps on one poll and comes up short on min_tx. That is not the
-    board's fault and must not be reported as though it were.
+    it reaches the board, and hands over one step per poll -- so a daemon kept
+    waiting for the port replays the whole timeline that much later and can
+    have its last steps cut off by the end of the pass, coming up short on
+    min_tx. That is not the board's fault and must not be reported as though
+    it were.
     """
     def late(env, attempt):
         return [dict(r, t=r["t"] + 30) for r in _tap_lines()]
@@ -510,9 +541,9 @@ def test_a_late_connect_is_inconclusive_rather_than_a_board_fault(tmp_path):
 def test_a_late_connect_on_the_WAKE_pass_is_inconclusive_too(tmp_path):
     """min_tx counts on the second daemon replaying every step.
 
-    So the pass most likely to merge two steps into one frame is the one
-    after the silence, and it was the pass whose connect delay was thrown
-    away.
+    So the pass most likely to lose the end of its timeline is the one after
+    the silence -- it is the shorter of the two -- and it was the pass whose
+    connect delay was thrown away.
     """
     def late_second(env, attempt):
         out = _tap_lines({"steps": [{"at": 0}, {"at": 5}]})
@@ -571,6 +602,30 @@ def test_real_account_pass_wants_a_percentage_and_a_parseable_wire(tmp_path):
     assert result["scenarios"]["real_account"]["ok"] is True
 
 
+def test_the_real_account_verdict_is_printed_like_every_other(tmp_path, capsys):
+    """It is the one pass that says whether this desk can read its own tools.
+
+    Every other scenario prints its name and its problems as the run goes by,
+    which is what the person at the desk is reading. This one was stored in
+    the results file and never said out loud.
+    """
+    def no_percentage(env, attempt):
+        out = _tap_lines()
+        if "BLINK_SCENARIO" not in env:
+            for rec in out:
+                if rec["dir"] == "tx":
+                    rec["msg"] = {"t": "usage", "v": 1, "session_pct": -1}
+        return out
+
+    args = agent.parse_args(["--scenarios", str(_scenario(tmp_path)),
+                             "--out", str(tmp_path / "r.json"),
+                             "--real-account"])
+    agent.run(args, _deps(spawn=_spawner(no_percentage)))
+    printed = capsys.readouterr().out
+    assert "real_account: FAILED" in printed
+    assert "percentage" in printed
+
+
 def test_real_account_pass_fails_when_no_percentage_goes_out(tmp_path):
     def lines(env, attempt):
         out = _tap_lines()
@@ -612,6 +667,59 @@ def test_read_tap_survives_a_torn_final_line(tmp_path):
 
 def test_read_tap_of_a_daemon_that_never_started_is_empty(tmp_path):
     assert agent.read_tap(tmp_path / "missing.jsonl") == []
+
+
+# --- one run's transcript is never another run's evidence -------------
+
+def _silent():
+    """A daemon that writes nothing at all: no board, or a port still held."""
+    return _spawner(lambda env, attempt: [])
+
+
+def test_a_second_run_in_one_workdir_cannot_pass_on_the_first_ones_tap(
+        tmp_path):
+    """The work root survives between runs and Tap opens the file with "a".
+
+    So without a clear, the second run judges the union of both transcripts:
+    a desk whose board was unplugged after a green run reports green forever
+    after, from records the daemon under test never wrote.
+    """
+    d = _scenario(tmp_path, "x")
+    work = tmp_path / "work"
+    assert agent.run_scenario(d / "x.json", "claude", work, "auto",
+                              _deps())["ok"] is True
+    second = agent.run_scenario(d / "x.json", "claude", work, "auto",
+                                _deps(spawn=_silent()))
+    assert second["ok"] is False, (
+        "a silent daemon judged against last run's transcript reads as a pass")
+
+
+def test_preflight_does_not_answer_from_an_earlier_runs_tap(tmp_path):
+    """Preflight's whole job is catching "no board attached".
+
+    A leftover tap-1.jsonl answers it before this run's daemon has written a
+    byte, which is the one check that cannot be allowed to pass on credit.
+    """
+    work = tmp_path / "work"
+    assert agent.preflight(work, "auto", _deps())[0] is True
+    ready, detail = agent.preflight(work, "auto", _deps(spawn=_silent()))
+    assert ready is False, f"a leftover transcript answered for the board: {detail}"
+
+
+def test_a_scenario_judges_only_the_records_of_its_own_run(tmp_path):
+    """Belt and braces for a caller that hands run_scenario a used tap.
+
+    The clear above is the fix; this is the second lock on it, so that a
+    future caller reusing a work directory cannot resurrect the same bug.
+    """
+    d = _scenario(tmp_path, "x")
+    work = tmp_path / "work" / "x"
+    work.mkdir(parents=True)
+    (work / "tap.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in _tap_lines()), encoding="utf-8")
+    outcome = agent.run_scenario(d / "x.json", "claude", tmp_path / "work",
+                                 "auto", _deps(spawn=_silent()))
+    assert outcome["ok"] is False
 
 
 # --- the results file -------------------------------------------------
