@@ -1,0 +1,49 @@
+# The three desks a release is proved on, as they were measured -- not as
+# they are assumed. Each holds one board and answers for one platform.
+#
+# There is deliberately NO port in this file. The daemon finds the board by
+# USB VID:PID (claude_usage_bridge.py:41-48, CH340 0x1A86:0x7523), which is
+# how it picks COM15 out of the Windows desk's twelve mostly-Bluetooth COM
+# ports. A port written down here would work until somebody moved the cable
+# to the next socket, and would then fail as a dead board.
+#
+# `python` must be an interpreter WITH PYSERIAL on that machine: the agent
+# spawns blink_main.py, which imports serial at module scope. Checking that
+# is a one-liner per desk and is worth doing before blaming the hardware:
+#
+#     <python> -c "import serial; print(serial.__version__)"
+
+[hosts.local-mac]
+ssh = ""                    # empty = run here, with no ssh at all
+os = "darwin"
+board = "claude"            # VERIFY before the run: which board is here
+# Relative paths are resolved against this checkout, not the workdir. The
+# fleet venv is the only interpreter on this Mac that has pyserial, and it is
+# gitignored, so it is not inside the snapshot that gets pushed.
+python = ".venv-test/bin/python"
+workdir = "~/blink-fleet"
+has_claude_desktop = true
+
+[hosts.kfir-ubuntu]
+ssh = "kfir@kfir-macbook"   # Apple hardware, Ubuntu 26 on it
+os = "linux"
+board = "claude"            # VERIFY before the run: this desk may hold codex
+# System python 3.14.4, which already has pyserial 3.5 and pytest 9.0.3.
+python = "/usr/bin/python3"
+workdir = "~/blink-fleet"
+has_claude_desktop = false
+# Known: this desk's user is not in the `dialout` group, so /dev/ttyUSB0
+# (crw-rw---- root dialout) is refused with PermissionError 13 and every
+# scenario fails on a healthy board. Fix on that machine, once:
+#     sudo usermod -aG dialout kfir   # then log out and back in
+
+[hosts.galit-win10]
+ssh = "galit@lenovo-r90r7u44.lan"
+os = "windows"              # ssh lands in cmd.exe, not a POSIX shell
+board = "codex"             # VERIFY before the run: this desk may hold claude
+python = "python"           # 3.11.2, pyserial 3.5
+# %USERPROFILE% on this machine is non-ASCII, so the workdir stays relative
+# to it and cmd.exe does the expanding. Nothing here sends that name over the
+# wire. $USERPROFILE is accepted here too and rewritten to cmd's spelling.
+workdir = "%USERPROFILE%\\blink-fleet"
+has_claude_desktop = false
