@@ -489,6 +489,12 @@ def test_a_scenario_that_waits_gets_time_to_finish_waiting(tmp_path):
 
 
 def test_the_poll_interval_reaches_both_the_child_and_the_grace(tmp_path):
+    """Every child, the real-account daemon included.
+
+    That pass is reached through the longest argument list in the file, and a
+    parameter added in the middle of it would quietly hand this interval to
+    something else -- a mistake no verdict would ever show.
+    """
     spawn = _spawner()
     doc = {"duration_s": 10, "expect": {"min_tx": 1, "min_board_usage": 1,
                                         "min_stale_lines": 0,
@@ -497,7 +503,7 @@ def test_the_poll_interval_reaches_both_the_child_and_the_grace(tmp_path):
     sleeps = []
     args = agent.parse_args(["--scenarios", str(d),
                              "--out", str(tmp_path / "r.json"),
-                             "--poll-interval", "7"])
+                             "--real-account", "--poll-interval", "7"])
     agent.run(args, _deps(sleeps=sleeps, spawn=spawn))
     assert all(c["env"]["BLINK_POLL_INTERVAL_S"] == "7.0" for c in spawn.calls)
     assert max(sleeps) == 10 + agent.grace_s(doc, 7.0)
@@ -642,6 +648,115 @@ def test_real_account_pass_fails_when_no_percentage_goes_out(tmp_path):
     result = agent.run(args, _deps(spawn=_spawner(lines)))
     problems = result["scenarios"]["real_account"]["problems"]
     assert any("percentage" in p for p in problems)
+
+
+# The shape of a real desk, measured on the Mac on 2026-08-31: the daemon's
+# probe window puts the board's own greeting into the transcript as raw
+# console bytes before the read loop is running, the usage frame leaves the
+# host at once, and the board's apply line and its next ping land seconds
+# later. The pass used to stop the daemon at the frame and then blame the
+# board for the two records that had not arrived yet.
+_PROBE_CONSOLE = [
+    {"dir": "console", "t": 0.0, "line": "[proto] host connected"},
+    {"dir": "console", "t": 0.1, "line": '{"t": "pref", "v": 1}'},
+    {"dir": "console", "t": 0.2, "line": '{"t": "ota_query", "v": 1}'},
+]
+_REAL_FRAME = {"dir": "tx", "t": 0.3, "sent": True,
+               "msg": {"t": "usage", "v": 2, "session_pct": 9.0,
+                       "weekly_pct": 88.0}}
+_BOARD_APPLIED = {"dir": "console", "t": 4.0,
+                  "line": "[usage] session 9% (1s)  weekly 88% (2s)"}
+_BOARD_PING = {"dir": "rx", "t": 10.0, "msg": {"t": "ping", "v": 1}}
+
+
+def _real_account_tap(work):
+    return work / agent.REAL_ACCOUNT / "tap.jsonl"
+
+
+def _board_answers_late(tap, events, late):
+    """A `deps.sleep` that lets the board's own records land mid-wait.
+
+    Nothing else in this file can express "after the frame went out": the
+    spawner writes its whole transcript at spawn time, which is the one thing
+    a real board never does. Releasing on the second sleep puts these records
+    inside the settle wait -- the first sleep is PORT_SETTLE_S, and the wait
+    for the usage frame finds it already written and never sleeps at all.
+    """
+    def sleep(_seconds):
+        events.append("sleep")
+        if late and events.count("sleep") >= 2:
+            with open(tap, "a", encoding="utf-8") as f:
+                for rec in late:
+                    f.write(json.dumps(rec) + "\n")
+            events.append("board")
+            del late[:]
+    return sleep
+
+
+def test_real_account_pass_waits_for_the_board_before_stopping_the_daemon(
+        tmp_path):
+    """The frame leaving the host is not the end of the pass.
+
+    The board still has to apply it and print, and its next ping still has to
+    be read. Stopping the daemon at the tx ends the pass before either can
+    happen and reports a healthy desk as a board that never spoke.
+    """
+    work = tmp_path / "w"
+    events = []
+    late = [_BOARD_APPLIED, _BOARD_PING]
+    spawn = _spawner(lambda env, attempt: _PROBE_CONSOLE + [_REAL_FRAME],
+                     events=events)
+    result = agent.run_real_account(work, "auto", _deps(
+        spawn=spawn,
+        sleep=_board_answers_late(_real_account_tap(work), events, late)))
+    assert "board" in events, (
+        "the daemon was stopped before the board could answer at all")
+    assert events.index("board") < events.index("stop")
+    assert result["ok"] is True, result["problems"]
+
+
+def test_real_account_pass_needs_an_rx_not_just_the_boards_printout(tmp_path):
+    """Both halves of the evidence, and neither standing in for the other.
+
+    The board's greeting reaches the transcript twice on a real desk -- once
+    as raw console bytes during the port probe, once as `rx` when the daemon's
+    read loop parses it -- so a transcript with the apply line and console
+    chatter but no `rx` proves bytes are moving and not that this daemon is
+    listening. The settle wait has to keep waiting, and the pass has to fail.
+    """
+    work = tmp_path / "w"
+    events = []
+    late = [_BOARD_APPLIED]
+    spawn = _spawner(lambda env, attempt: _PROBE_CONSOLE + [_REAL_FRAME],
+                     events=events)
+    result = agent.run_real_account(work, "auto", _deps(
+        spawn=spawn,
+        sleep=_board_answers_late(_real_account_tap(work), events, late)))
+    lines = agent.read_tap(_real_account_tap(work))
+    assert _BOARD_APPLIED in lines, (
+        "the apply line arrived while the daemon was up, so the settle wait"
+        " must have been waiting for the missing rx rather than for this")
+    assert result["ok"] is False
+    assert any("rx" in p for p in result["problems"])
+
+
+def test_a_settle_that_expires_is_reported_once(tmp_path):
+    """The expiry is check()'s sentence to say, and it says it already.
+
+    A problem added here for the timeout would print beside check()'s "no rx
+    records" line and describe the same missing record twice, which reads as
+    two faults on a desk that has one.
+    """
+    work = tmp_path / "w"
+    events = []
+    late = [_BOARD_APPLIED]
+    spawn = _spawner(lambda env, attempt: _PROBE_CONSOLE + [_REAL_FRAME],
+                     events=events)
+    result = agent.run_real_account(work, "auto", _deps(
+        spawn=spawn,
+        sleep=_board_answers_late(_real_account_tap(work), events, late)))
+    assert result["problems"] == [p for p in result["problems"] if "rx" in p]
+    assert len(result["problems"]) == 1, result["problems"]
 
 
 def test_real_account_pass_fails_when_status_wire_prints_no_json(tmp_path):

@@ -120,6 +120,18 @@ SETTLE_ATTEMPTS = 3
 REAL_ACCOUNT_TIMEOUT_S = 120.0
 REAL_ACCOUNT = "real_account"
 
+# How long the real-account pass keeps its daemon alive AFTER the usage frame
+# has left the host, waiting for the board's own two records. Sized off the
+# board's ping, which is every 10 s (PING_INTERVAL_MS, firmware/src/proto.c):
+# an `rx` record can only appear when a board message meets a running read
+# loop, and on a quiet link the ping is the only message that comes. A window
+# shorter than one ping interval could therefore expire between two pings on a
+# perfectly healthy desk -- the same race in a smaller frame. One interval
+# plus half of it again leaves room for the apply-and-print and for a settle
+# that begins just after a ping went by, and costs nothing against the
+# orchestrator's per-desk budget (tools/fleet/run.py AGENT_TIMEOUT_S).
+REAL_ACCOUNT_SETTLE_S = 15.0
+
 # What the real-account pass demands: the same shape as a scenario's block,
 # reduced to the only two things true of every desk -- one frame out, one
 # frame applied. Percentages come from a live account, so no count of stale
@@ -707,7 +719,26 @@ def _real_usage_seen(records):
     return False
 
 
+def _real_board_evidence(records):
+    """Both halves of the board's answer: it applied a frame, and it is heard.
+
+    Neither half stands in for the other. The '[usage] session ' line is the
+    board saying it applied what the host sent; an `rx` record is the daemon's
+    read loop parsing a message the board sent back. A board message reaches
+    the transcript TWICE on a real desk -- once as raw console bytes while the
+    daemon is still probing ports, and again as `rx` once the read loop is
+    running -- so a transcript with console chatter and no `rx` proves only
+    that bytes are moving on the wire, which is what the probe already proved.
+    """
+    applied = any(r.get("dir") == "console"
+                  and isinstance(r.get("line"), str)
+                  and tap_asserts.APPLIED_MARKER in r["line"]
+                  for r in records)
+    return applied and _heard_from_board(records)
+
+
 def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S,
+                     settle=REAL_ACCOUNT_SETTLE_S,
                      poll_interval=POLL_INTERVAL_S):
     """The pass no scenario can stand in for: this machine's own account.
 
@@ -720,6 +751,10 @@ def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S,
     `blink status --wire` is checked afterwards rather than alongside,
     because it is the command a support conversation starts with and it must
     not be competing with the daemon for the port while it answers.
+
+    The frame going out is the start of the evidence, not the end of it, so
+    the daemon is kept alive until the board has answered -- see the settle
+    wait below.
     """
     work = _fresh_work(Path(workroot) / REAL_ACCOUNT)
     tap = work / "tap.jsonl"
@@ -737,6 +772,22 @@ def run_real_account(workroot, port, deps, timeout=REAL_ACCOUNT_TIMEOUT_S,
                 f" percentage went out within {timeout:.0f}s. The daemon is"
                 f" running but this machine's tools are reporting nothing"
                 f" usable.")
+        else:
+            # The frame has left the host; the two records this pass is judged
+            # on have not arrived. The board still has to apply the frame and
+            # print its '[usage] session ' line, and its next ping -- every
+            # 10 s -- still has to be read. Stopping the daemon at the tx,
+            # which this did, ended the pass before either could happen:
+            # measured on the Mac 2026-08-31, the daemon's log ended with a
+            # genuine usage frame while the transcript held tx: 3, rx: 0,
+            # console: 3, and the run reported a healthy desk as a board that
+            # never sent a message and printed no usage lines.
+            #
+            # An expiry adds no problem here on purpose. check() below reads
+            # the same transcript and names the half that is missing, in the
+            # same words it uses for every other scenario; a second sentence
+            # about the timeout would describe one missing record twice.
+            _wait_for(tap, _real_board_evidence, settle, deps)
     finally:
         problems += _stop_daemon(proc, "the real-account daemon")
     problems += tap_asserts.check(read_tap(tap), REAL_ACCOUNT_EXPECT,
@@ -1319,9 +1370,12 @@ def run(args, deps=None):
                 for problem in outcome["problems"]:
                     print(f"        {problem}")
             if args.real_account:
+                # By name: this call grew a settle timeout between the two it
+                # already passed, and positionally that handed the poll
+                # interval to the wrong parameter without changing a result.
                 outcome = run_real_account(workroot, args.port, deps,
-                                           args.real_timeout,
-                                           args.poll_interval)
+                                           timeout=args.real_timeout,
+                                           poll_interval=args.poll_interval)
                 result["scenarios"][REAL_ACCOUNT] = outcome
                 # Printed like every other pass. It is the only one that says
                 # whether this desk can read its own tools, and it was the
