@@ -25,7 +25,10 @@ that are not part of the frame itself:
   - `at`: seconds since the provider was constructed. poll() emits a step
     once elapsed real time (per the `now` clock) reaches it, and only once --
     a scenario step is an event, not a level, so replaying it on every poll
-    would misrepresent a single reading as a continuous one.
+    would misrepresent a single reading as a continuous one. One step per
+    poll, oldest first: a poll turns into a single usage message however many
+    frames it carries, so a late first poll has to delay the timeline rather
+    than collapse the steps that came due while it waited. See poll().
 
   - `age_s` (default 0): how old the reading should claim to be, i.e.
     `observed_at = now - age_s`. This exists because staleness and "how old
@@ -77,22 +80,44 @@ class ScriptedProvider(ProviderParser):
         return "scripted"
 
     def poll(self, now_epoch):
-        """Every step whose `at` has been reached and not yet emitted.
+        """The OLDEST step that has come due and not yet been emitted. One.
 
-        Freshest first, matching the ProviderParser contract, even though
-        this provider only ever has one source describing itself.
+        Not every due step, which is what this used to return, because the
+        daemon collapses one poll into one usage message: IngestionBus.poll
+        hands its frames to normalizer.select_pair(), which picks a primary
+        and a secondary and sends exactly one frame to the board. Two steps
+        emitted together are therefore one frame on the wire, not two.
+
+        And two steps do come due together on a healthy desk. The daemon's
+        first poll is gated on board_alive() (claude_usage_bridge.py:1076-1084),
+        false until the board's first ping; a scenario pass connects to a board
+        that is already running, so there is no boot hello and the first ping
+        lands up to PING_INTERVAL_MS (10 s) later -- and a poll skipped by that
+        gate is lost rather than deferred, since next_poll advances either way.
+        Meanwhile this provider stamps t0 at construction. Every fleet scenario
+        writes min_tx as its own step count, so merging two steps into one
+        frame fails a perfectly healthy board -- and a flaky release gate
+        teaches people to re-run until green, which ends the gate.
+
+        One per call turns a late start into a delayed timeline instead of a
+        lost frame: each step gets its own poll, its own message, and its own
+        [usage] line off the board. The scenarios have the headroom for it --
+        the six-step usage_climb, polled every 3 s, delivers its last step
+        around 27 s into a 44 s pass even if the first poll only fires at 12 s.
+
+        A step whose frame cannot be built does not consume the call: it is a
+        typo in a hand-written scenario, not a reading, and dropping the poll
+        with it would cost the run a frame it was owed.
         """
         elapsed = self._now() - self._t0
-        out = []
         for i, step in enumerate(self._steps):
             if i in self._emitted or step["at"] > elapsed:
                 continue
             self._emitted.add(i)
             frame = self._build_frame(step)
             if frame is not None:
-                out.append(frame)
-        out.reverse()  # freshest first
-        return out
+                return [frame]
+        return []
 
     def _build_frame(self, step):
         """One step as a frame, or None when the step doesn't fit.

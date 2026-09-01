@@ -26,6 +26,29 @@ def test_steps_emit_when_due_and_only_once(tmp_path):
     assert second[0].state == "failed"
 
 
+def test_two_steps_due_at_once_are_still_two_frames(tmp_path):
+    """One step per poll, oldest first -- a late start delays, never merges.
+
+    The daemon's first poll can land ten seconds after the provider was
+    constructed: the poll gate only fires once the board has pinged, and a
+    skipped poll is lost rather than deferred (claude_usage_bridge.py:1076).
+    Every due step emitted in that one call would be collapsed by
+    IngestionBus.poll into a single usage message, so a scenario whose min_tx
+    is its step count -- which is how they are all written -- would come up
+    short on a perfectly healthy board.
+    """
+    clock = [1000.0]
+    p = _write(tmp_path, [
+        {"at": 0, "provider": "claude", "session_pct": 10.0},
+        {"at": 5, "provider": "claude", "session_pct": 25.0},
+    ])
+    sp = ScriptedProvider(p, now=lambda: clock[0])
+    clock[0] += 12                      # both steps came due before any poll
+    assert [f.session_pct for f in sp.poll(clock[0])] == [10.0]
+    assert [f.session_pct for f in sp.poll(clock[0])] == [25.0]
+    assert sp.poll(clock[0]) == []
+
+
 def test_age_s_backdates_observed_at(tmp_path):
     clock = [5000.0]
     p = _write(tmp_path, [

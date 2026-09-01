@@ -37,9 +37,13 @@ interval. Sleep is a daemon-lifecycle event: a scenario that wants one sets
 `host_silence_s` and the agent stops the daemon for that long.
 
 Step spacing (>=4s apart) matters because fleet runs set the daemon's usage
-poll interval to about 3s (BLINK_POLL_INTERVAL_S) -- steps closer together
-than one poll cycle risk landing on the same poll and collapsing into a
-single sent frame, which would make min_tx a lie.
+poll interval to about 3s (BLINK_POLL_INTERVAL_S) and the scripted provider
+hands over one step per poll. Steps closer together than one poll cycle are
+steps the replay cannot keep up with: they still all reach the board, but
+later than the file says, so `duration_s` stops describing what the daemon
+actually does. It is also the spacing the agent's CONNECT_TOLERANCE_S is
+written against -- a first record more than 4s late means a timeline shifted
+by that much, which is a run that cannot prove what it set out to.
 """
 import glob
 import json
@@ -75,12 +79,24 @@ def test_at_least_four_scenarios_present():
 
 
 def test_every_scenario_loads_and_plays_to_completion():
+    """Every step becomes a frame, one per poll, in the order written.
+
+    One per poll is the provider's contract (pc/providers/scripted.py): a
+    poll carries one usage message to the board however many frames it was
+    given, so a scenario whose min_tx is its step count -- which is all of
+    them -- needs one poll per step. A daemon that starts polling late
+    therefore replays the timeline late rather than losing the middle of it.
+    """
     for doc, path in _all_scenarios():
         clock = [0.0]
         sp = ScriptedProvider(path, now=lambda: clock[0])
-        clock[0] = doc["duration_s"] + 1
-        frames = sp.poll(clock[0])
-        assert len(frames) == len(doc["steps"]), path
+        clock[0] = doc["duration_s"] + 1          # every step is due at once
+        played = []
+        for _ in range(len(doc["steps"]) + 1):
+            played += sp.poll(clock[0])
+        assert len(played) == len(doc["steps"]), path
+        assert [f.session_pct for f in played] == \
+            [s["session_pct"] for s in doc["steps"]], f"{path}: oldest first"
 
 
 def test_every_scenario_has_a_well_formed_expect_block():
@@ -122,7 +138,7 @@ def test_overage_goes_past_100():
 
 
 def test_stale_age_steps_use_realistic_ages():
-    """AGE_CAPTION_MIN_S is 600s (usage_view.c:1455), not the 120s an older
+    """AGE_CAPTION_MIN_S is 600s (usage_view.c:1474), not the 120s an older
     comment mentions -- a scenario claiming staleness under that threshold
     would never trip the caption it's supposed to exercise."""
     doc, _ = _load("stale_age.json")
