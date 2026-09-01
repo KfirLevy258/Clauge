@@ -266,7 +266,11 @@ from its own start.
 
 1. Write the file, named after what it proves -- but not `home`, `preflight`,
    `real_account`, `fresh_install` or `update_path`, which are directories the
-   run makes for itself and are refused as scenario names.
+   run makes for itself and are refused as scenario file names. The **file
+   name** is what the scenario's working directory is called, and that
+   directory is emptied before the pass starts; the `name` inside the JSON is
+   what the run calls the scenario in its sentences. Keep the two the same --
+   a test pins it for the shipped files.
 2. Keep steps **at least 4 seconds apart**, which is longer than a fleet run's
    3-second poll. The provider hands the daemon **one step per poll**, so
    steps closer together than a poll cycle still all reach the board but

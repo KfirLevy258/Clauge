@@ -722,6 +722,76 @@ def test_a_scenario_judges_only_the_records_of_its_own_run(tmp_path):
     assert outcome["ok"] is False
 
 
+# --- what the run is allowed to delete --------------------------------
+#
+# Every pass empties its own working directory before its daemon starts, so
+# the name that directory is built from decides what rmtree touches. It has to
+# come from the vetted filename and nowhere else: the JSON `name` is a field
+# in a hand-edited file, and --scenarios takes any directory.
+
+def _scenario_file(tmp_path, filename, json_name):
+    """A scenario file whose JSON `name` disagrees with its filename."""
+    d = tmp_path / "scenarios"
+    d.mkdir(exist_ok=True)
+    path = d / filename
+    path.write_text(json.dumps(
+        {"name": json_name, "duration_s": 1,
+         "steps": [{"at": 0, "provider": "claude", "session_pct": 50.0}],
+         "expect": {"min_tx": 1, "min_board_usage": 1, "min_stale_lines": 0,
+                    "min_sleep_wakes": 0}}), encoding="utf-8")
+    return path
+
+
+def test_a_json_name_of_home_cannot_empty_the_runs_shared_home(tmp_path):
+    """select_scenarios vets the filename; the delete must use the same value.
+
+    A file called anything at all can carry "name": "home" in its body, and
+    the shared sandbox home is a directory of this run's own -- emptied
+    mid-run, it takes the cached release manifest and everything else with it.
+    """
+    path = _scenario_file(tmp_path, "mine.json", "home")
+    work = tmp_path / "fleet-work"
+    keep = agent.sandbox_home(work) / "keep.txt"
+    keep.write_text("the run's own home", encoding="utf-8")
+
+    agent.run_scenario(path, "claude", work, "auto", _deps())
+
+    assert keep.exists(), "the scenario emptied the run's shared home"
+    assert (work / "mine" / "tap.jsonl").exists(), (
+        "the transcript belongs in a directory named after the vetted file")
+
+
+def test_a_json_name_that_climbs_out_of_the_work_root_deletes_nothing(
+        tmp_path):
+    """`..` in a scenario's name is a path traversal into an rmtree."""
+    path = _scenario_file(tmp_path, "climber.json", "../results-from-last-week")
+    root = tmp_path / "run"
+    work = root / "fleet-work"
+    work.mkdir(parents=True)                 # run() makes the work root first
+    sibling = root / "results-from-last-week"
+    sibling.mkdir(parents=True)
+    (sibling / "keep.txt").write_text("last week's evidence", encoding="utf-8")
+
+    agent.run_scenario(path, "claude", work, "auto", _deps())
+
+    assert (sibling / "keep.txt").exists(), (
+        "a scenario reached outside the work root and deleted a sibling")
+
+
+def test_a_filename_that_is_not_a_usable_directory_name_is_refused(tmp_path):
+    """`...json` has the stem `..`, so even the filename needs vetting.
+
+    Refused where the other unusable names are, before the service is
+    stopped -- and refused again at the delete itself, for a caller that
+    never went through select_scenarios.
+    """
+    path = _scenario_file(tmp_path, "...json", "climber")
+    with pytest.raises(ValueError, match=r"\.\."):
+        agent.select_scenarios(path.parent)
+    with pytest.raises(ValueError):
+        agent.run_scenario(path, "claude", tmp_path / "w", "auto", _deps())
+
+
 # --- the results file -------------------------------------------------
 
 def test_main_writes_the_result_and_exits_by_ok(tmp_path):

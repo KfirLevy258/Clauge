@@ -353,20 +353,18 @@ def select_scenarios(directory, only=None):
     --only would otherwise produce a green results file that proves less than
     the operator believes it does.
 
-    So is a name this run already uses for a directory of its own. Every pass
-    empties its working directory before it starts (_fresh_work), so a
-    scenario named after the run's shared home would delete that home in the
-    middle of the run, and one named after another pass would delete its
-    transcript. Refused before the service is stopped, where it costs nothing.
+    So is a name this run already uses for a directory of its own, or one that
+    is not a plain directory name at all. Every pass empties its working
+    directory before it starts (_fresh_work), so a scenario named after the
+    run's shared home would delete that home in the middle of the run, and one
+    named after another pass would delete its transcript. Refused here, before
+    the service is stopped, where it costs nothing -- and by work_name() again
+    at the delete itself.
     """
     directory = Path(directory)
     found = {p.stem: p for p in sorted(directory.glob("*.json"))}
-    taken = sorted(set(found) & RESERVED_WORK_NAMES)
-    if taken:
-        raise ValueError(
-            f"{directory} holds a scenario named {taken[0]!r}, which is a"
-            f" directory this run makes for itself. Rename it: the reserved"
-            f" names are {', '.join(sorted(RESERVED_WORK_NAMES))}.")
+    for candidate in found.values():
+        work_name(candidate)
     if not only:
         return list(found.values())
     missing = [n for n in only if n not in found]
@@ -398,6 +396,40 @@ def read_tap(path):
         if isinstance(record, dict):
             out.append(record)
     return out
+
+
+def work_name(path):
+    """The name of the directory a scenario's pass owns, from its FILE name.
+
+    Never from the JSON `name`. The pass empties this directory before its
+    daemon starts, so whatever builds it decides what shutil.rmtree is handed
+    -- and the JSON body is a hand-edited field in a file that --scenarios can
+    point at from anywhere. A file of any name carrying "name": "home" would
+    empty the run's shared sandbox home in the middle of the run, and
+    "name": "../.." would walk out of the work root and delete something that
+    has nothing to do with the fleet at all.
+
+    The file's own stem is the value select_scenarios has already vetted, so
+    keying the directory off it leaves one source of truth instead of two
+    guards that can drift apart -- which is exactly how the JSON name got past
+    the first one. It is checked again here rather than assumed, because the
+    delete is the thing being protected and run_scenario has callers that
+    never went through select_scenarios, and because a file called `...json`
+    has the stem `..`: a traversal wearing a filename.
+
+    The JSON `name` keeps its own job. It names the scenario in every sentence
+    this run prints, which is what it was always for.
+    """
+    stem = Path(path).stem
+    if (not stem or stem in (".", "..") or any(c in stem for c in "/\\")
+            or stem in RESERVED_WORK_NAMES):
+        raise ValueError(
+            f"{Path(path).name} cannot be a scenario: {stem!r} is not a name"
+            f" this run can give a working directory of its own. It has to be"
+            f" a plain file name, and not one of the directories the run makes"
+            f" for itself ({', '.join(sorted(RESERVED_WORK_NAMES))}) -- each"
+            f" of those is emptied before its own pass starts.")
+    return stem
 
 
 def _fresh_work(work):
@@ -586,11 +618,17 @@ def run_scenario(path, board, workroot, port, deps,
 
     That directory is emptied first -- see _fresh_work(). The verdict is a
     count over the transcript, and a transcript that survived the last run
-    would let this one pass on records its own daemon never wrote.
+    would let this one pass on records its own daemon never wrote. It is named
+    after the scenario FILE, never after the `name` inside it: the emptying is
+    an rmtree, and the file name is the one of the two that has been vetted
+    (work_name()).
     """
     doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    # The JSON name is what this scenario is CALLED, in every sentence below.
+    # The directory it owns is named after the file, which is the value
+    # select_scenarios vetted -- see work_name(), and the rmtree it guards.
     name = doc.get("name", Path(path).stem)
-    work = _fresh_work(Path(workroot) / name)
+    work = _fresh_work(Path(workroot) / work_name(path))
     tap = work / "tap.jsonl"
     # Zero after the clear above, and read anyway: the verdict below is taken
     # from this run's records alone, so a caller that ever hands this function
