@@ -21,9 +21,12 @@ green and honest and still not a licence to ship:
     completeness. The desks are read from tools/fleet/fleet.toml instead, and
     every one of them has to be present with ok exactly True.
 
-  - `ok: 1` is not `ok: True`. Nothing this repository writes produces it, so
-    a truthy stand-in means something else wrote the file, and a gate that
-    guesses for that is not a gate.
+  - `ok: 1` is not `ok: True`, and a `finished_at` of `NaN` is not a time.
+    Nothing this repository writes produces either, so a stand-in that merely
+    passes a type check means something else wrote the file, and a gate that
+    guesses on its behalf is not a gate. The NaN is the sharper of the two:
+    it is a float, it survives json.loads, and it compares False against
+    every bound, so it does not fail the freshness check -- it deletes it.
 
 Failing closed is the whole design. A missing file, an unreadable one, a
 damaged one, a missing inventory, or an interpreter with no tomllib are all
@@ -37,6 +40,7 @@ interpreter a release shell happens to have, which is not the one the daemon's
 dependencies were installed for.
 """
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -86,7 +90,10 @@ def _inventory_names(inventory_path):
     path = Path(inventory_path)
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # Including the decode error, which is a ValueError and would
+        # otherwise be returned to the operator as the codec's own words --
+        # naming no file, mentioning no fleet, starting in lower case.
         raise ValueError(
             f"The fleet inventory at {path} could not be read: {e}. The gate"
             f" checks the run against the desks that file names, so without"
@@ -127,7 +134,11 @@ def gate(path, head_sha, inventory_path, now=time.time, max_age_s=MAX_AGE_S):
     except FileNotFoundError:
         return (f"There is no fleet run recorded at {path}. Prove this commit"
                 f" on the fleet first: python3 tools/fleet/run.py")
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError is a ValueError, not an OSError, so it needs
+        # naming: a mis-encoded or partly overwritten file is ordinary
+        # corruption, and the contract of this function is that every way out
+        # of it is a sentence somebody can act on.
         return (f"The fleet run at {path} could not be read: {e}. The gate"
                 f" refuses on anything it cannot read, so fix the file or"
                 f" run the fleet again.")
@@ -155,6 +166,17 @@ def gate(path, head_sha, inventory_path, now=time.time, max_age_s=MAX_AGE_S):
         who = f" Desks that did not pass: {', '.join(bad)}." if bad else ""
         return (f"{lead}{who} Fix what it reported and run"
                 f" tools/fleet/run.py again.")
+    # A pass that also lists problems is not a pass this file could have been
+    # written by: run.py computes ok as `summary and not problems and sha is
+    # known` (run.py:794-795), so the two cannot both be there. Same ground as
+    # refusing ok: 1 -- only run.py writes this file, and a document that
+    # contradicts run.py's own arithmetic is not evidence of anything.
+    problems = doc.get("problems")
+    if problems:
+        return (f"The fleet run at {path} claims to have passed while also"
+                f" reporting {_names(problems)}. tools/fleet/run.py cannot"
+                f" produce both, so this file did not come from a run that"
+                f" finished cleanly. Run the fleet again.")
 
     # 2. The run has to be about the code being released.
     head = head_sha.strip() if isinstance(head_sha, str) else ""
@@ -175,12 +197,26 @@ def gate(path, head_sha, inventory_path, now=time.time, max_age_s=MAX_AGE_S):
 
     # 3. And recent enough that the desks have not drifted underneath it.
     finished = doc.get("finished_at")
-    if isinstance(finished, bool) or not isinstance(finished, (int, float)):
+    # math.isfinite, not just isinstance. json.loads accepts the non-standard
+    # NaN, Infinity and -Infinity tokens by default, and a NaN is a perfectly
+    # ordinary float that clears every type check -- and then compares False
+    # against everything, so `age < 0` and `age > max_age_s` are BOTH false
+    # and the freshness check silently evaporates. Three characters in the
+    # file would otherwise let a months-old green run vouch for today's
+    # desks. (The same shape of bug already cost this project a run of
+    # polling, via BLINK_POLL_INTERVAL_S=nan walking past a `<= 0` guard.)
+    if (isinstance(finished, bool)
+            or not isinstance(finished, (int, float))
+            or not math.isfinite(finished)):
         return (f"The fleet run at {path} never finished"
-                f" (finished_at = {finished!r}). A run that died mid-way"
-                f" decided nothing, whatever else the file says. Run the"
-                f" fleet again.")
+                f" (finished_at = {finished!r}). A run that died mid-way, or"
+                f" a timestamp that is not a real moment, decided nothing --"
+                f" whatever else the file says. Run the fleet again.")
     age = float(now()) - float(finished)
+    if not math.isfinite(age):
+        return (f"The age of the fleet run at {path} does not come out as a"
+                f" number, so this machine's clock cannot be trusted to judge"
+                f" it. Nothing is released on a time nobody can read.")
     if age < 0:
         return (f"The fleet run at {path} claims to have finished"
                 f" {abs(age) / 3600:.1f} h in the future. Either its"
@@ -233,7 +269,12 @@ def gate(path, head_sha, inventory_path, now=time.time, max_age_s=MAX_AGE_S):
 
 
 def main(argv=None):
-    """Exit 0 to release, 1 with the reason on stdout to refuse.
+    """Exit 0 to release, 1 with the reason on stderr to refuse.
+
+    Refusals go to stderr because release.sh prints its own FATAL block --
+    "the fleet gate refused $TAG for the reason above" -- to stderr straight
+    after. On one stream they read as one message; split across two, the
+    FATAL line points at a reason that is not above it.
 
     The catch-all is the point of the wrapper: release.sh reads an exit
     status, and a traceback would already fail closed there, but the operator
@@ -250,10 +291,10 @@ def main(argv=None):
         reason = gate(state, head_sha, inventory)
     except Exception as e:  # noqa: BLE001 - a refusal, not a crash
         print(f"The fleet gate could not complete its check ({e!r}), so it"
-              f" refuses. Nothing has been released.")
+              f" refuses. Nothing has been released.", file=sys.stderr)
         return 1
     if reason is not None:
-        print(reason)
+        print(reason, file=sys.stderr)
         return 1
     print(f"Fleet gate: {head_sha.strip()[:12]} passed on every desk in"
           f" {inventory}.")

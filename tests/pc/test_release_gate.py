@@ -116,6 +116,18 @@ def test_empty_file_refuses(tmp_path):
     assert gate(p, SHA, _inventory(tmp_path), now=lambda: 2000.0)
 
 
+def test_state_file_that_is_not_utf8_refuses_in_prose(tmp_path):
+    # A mis-encoded or partly overwritten file is ordinary corruption, not
+    # forgery. UnicodeDecodeError is a ValueError, not an OSError, so it used
+    # to leave gate() by the exception path instead of the refusal path --
+    # safe, because main() catches everything, but the operator deserves a
+    # sentence about the fleet rather than a stack.
+    p = tmp_path / "last_run.json"
+    p.write_bytes(b"\xff\xfe{\x00o\x00k\x00")
+    reason = gate(p, SHA, _inventory(tmp_path), now=lambda: 2000.0)
+    assert reason and reason[0].isupper() and str(p) in reason
+
+
 @pytest.mark.parametrize("blob", ["[]", "null", '"ok"', "true"])
 def test_json_that_is_not_an_object_refuses(tmp_path, blob):
     p = _state(tmp_path)
@@ -134,6 +146,15 @@ def test_ok_that_is_merely_truthy_refuses(tmp_path, value):
     # `is True`, not truthiness: a 1 here means something wrote this file
     # that was not tools/fleet/run.py, and the gate does not guess for it.
     assert "failed" in _refuse(tmp_path, ok=value)
+
+
+@pytest.mark.parametrize("value", [["The board was dead"], "git failed", 2])
+def test_a_pass_that_also_carries_problems_refuses(tmp_path, value):
+    # run.py computes ok as `summary and not problems and sha != unknown`
+    # (run.py:794-795), so a genuine file cannot say both. One that does was
+    # written by something else, which is the same ground the gate refuses
+    # ok: 1 on.
+    assert _refuse(tmp_path, problems=value)
 
 
 def test_missing_ok_refuses(tmp_path):
@@ -203,6 +224,30 @@ def test_run_that_never_finished_refuses(tmp_path):
 @pytest.mark.parametrize("value", ["1000.0", True, [1000.0], {}])
 def test_finished_at_that_is_not_a_time_refuses(tmp_path, value):
     assert _refuse(tmp_path, finished_at=value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_finished_at_that_is_not_a_finite_time_refuses(tmp_path, value):
+    # json.dumps writes these as the bare tokens NaN, Infinity, -Infinity and
+    # json.loads reads them straight back, so they arrive here as ordinary
+    # floats and clear an isinstance check. NaN then compares False against
+    # everything: `age < 0` and `age > max_age_s` are BOTH false, and the one
+    # check that stops a months-old green run from vouching for today's desks
+    # is nullified by three characters.
+    #
+    # The same shape of bug reached this project once already, in the
+    # daemon's poll interval, where BLINK_POLL_INTERVAL_S=nan walked past a
+    # `<= 0` guard and stopped polling for a whole run.
+    assert _refuse(tmp_path, finished_at=value)
+
+
+def test_a_clock_that_gives_no_usable_time_refuses(tmp_path):
+    # The other half of the NaN case: the timestamp is fine and the clock is
+    # not. The subtraction is still NaN and still compares False against both
+    # bounds, so it is guarded on the result as well as on the input.
+    reason = gate(_state(tmp_path), SHA, _inventory(tmp_path),
+                  now=lambda: float("nan"))
+    assert reason and reason[0].isupper()
 
 
 def test_finish_in_the_future_refuses(tmp_path):
@@ -285,6 +330,16 @@ def test_malformed_inventory_refuses(tmp_path):
     assert gate(_state(tmp_path), SHA, inv, now=lambda: 2000.0)
 
 
+def test_inventory_that_is_not_utf8_refuses_in_prose(tmp_path):
+    # It refused before this test existed, but with the codec's own words --
+    # "'utf-8' codec can't decode byte 0xff in position 0" -- which names no
+    # file, mentions no fleet, and does not start with a capital.
+    inv = tmp_path / "fleet.toml"
+    inv.write_bytes(b"\xff\xfe[\x00h\x00")
+    reason = gate(_state(tmp_path), SHA, inv, now=lambda: 2000.0)
+    assert reason and reason[0].isupper() and str(inv) in reason
+
+
 def test_inventory_naming_no_desks_refuses(tmp_path):
     # An emptied inventory would otherwise make check 6 vacuously true, and
     # a fleet of nobody would ship every release.
@@ -334,11 +389,17 @@ def test_the_gate_imports_nothing_else_from_pc():
 
 # --- the command release.sh runs ------------------------------------------
 
-def test_main_prints_the_reason_and_exits_one(tmp_path, capsys):
+def test_main_prints_the_reason_on_stderr_and_exits_one(tmp_path, capsys):
+    # stderr, not stdout: release.sh writes its own "refused $TAG for the
+    # reason above" to stderr, and under a redirection that separates the two
+    # streams that FATAL line would otherwise point at a reason which is not
+    # above it.
     code = fleet_gate.main([str(_state(tmp_path, ok=False)), SHA,
                             str(_inventory(tmp_path))])
     assert code == 1
-    assert "failed" in capsys.readouterr().out
+    out = capsys.readouterr()
+    assert "failed" in out.err
+    assert out.out == ""
 
 
 def test_main_exits_zero_on_a_good_run(tmp_path, capsys):
@@ -355,10 +416,10 @@ def test_main_refuses_the_wrong_number_of_arguments(tmp_path):
 
 def test_run_as_a_module_refuses_with_status_one(tmp_path):
     # The whole path release.sh takes: `python3 -m pc.fleet_gate`, non-zero
-    # status, reason on stdout.
+    # status, reason on stderr beside the FATAL block that follows it.
     done = subprocess.run(
         [sys.executable, "-m", "pc.fleet_gate",
          str(_state(tmp_path, sha="b" * 40)), SHA, str(_inventory(tmp_path))],
         cwd=str(ROOT), capture_output=True, text=True)
     assert done.returncode == 1
-    assert "commit" in done.stdout
+    assert "commit" in done.stderr
