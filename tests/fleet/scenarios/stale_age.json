@@ -1,6 +1,6 @@
 {
   "name": "stale_age",
-  "note": "Percentages hold constant across all three steps -- the subject is age, not movement. AGE_CAPTION_MIN_S is 600s (firmware/src/usage_view.c:1455), so the two aged steps sit well past it (30 min, 4 hours). This path has shipped twice and never been confirmed on real hardware; it matters more than the other three files.",
+  "note": "Percentages hold constant across all three steps -- the subject is age, not movement. AGE_CAPTION_MIN_S is 600s (firmware/src/usage_view.c:1474), so the two aged steps sit well past it (30 min, 4 hours). This path has shipped twice and never been confirmed on real hardware; it matters more than the other three files.",
   "steps": [
     {"at": 0,  "provider": "claude", "session_pct": 55.0, "weekly_pct": 30.0, "state": "running", "age_s": 0,     "stale": false},
     {"at": 6,  "provider": "claude", "session_pct": 55.0, "weekly_pct": 30.0, "state": "running", "age_s": 1800,  "stale": true},

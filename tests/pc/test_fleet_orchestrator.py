@@ -675,3 +675,77 @@ def test_a_host_missing_a_key_is_refused_with_the_key_named(tmp_path):
     with pytest.raises(ValueError) as e:
         fleet_run.load_inventory(path)
     assert "board" in str(e.value) and "a" in str(e.value)
+
+
+def _two_desk_inventory(tmp_path, second_ssh, second_workdir="~/other"):
+    path = tmp_path / "dupe.toml"
+    path.write_text(
+        '[hosts.desk-one]\n'
+        'ssh = "kfir@kfir-macbook"\nos = "linux"\nboard = "claude"\n'
+        'python = "python3"\nworkdir = "~/blink-fleet"\n'
+        'has_claude_desktop = false\n\n'
+        '[hosts.desk-two]\n'
+        f'ssh = "{second_ssh}"\nos = "linux"\nboard = "claude"\n'
+        f'python = "python3"\nworkdir = "{second_workdir}"\n'
+        'has_claude_desktop = false\n', encoding="utf-8")
+    return path
+
+
+def test_two_entries_for_one_machine_are_refused_naming_both(tmp_path):
+    """One desk written down twice is two agents fighting over one board.
+
+    main() submits every host to the thread pool at once, so the second entry
+    is not a slower version of the first: both stop and start the same login
+    service, both unpack into the same workdir, and both ask the daemon for
+    the one serial port. Whichever loses reports a healthy board as dead.
+    """
+    with pytest.raises(ValueError) as e:
+        fleet_run.load_inventory(
+            _two_desk_inventory(tmp_path, "kfir@kfir-macbook"))
+    assert "desk-one" in str(e.value) and "desk-two" in str(e.value)
+
+
+def test_two_local_desks_are_refused_too(tmp_path):
+    """An empty ssh means THIS machine, so two of them are the same machine."""
+    path = tmp_path / "local.toml"
+    path.write_text(
+        '[hosts.mine]\n'
+        'ssh = ""\nos = "darwin"\nboard = "claude"\n'
+        'python = "python3"\nworkdir = "~/a"\nhas_claude_desktop = true\n\n'
+        '[hosts.also-mine]\n'
+        'ssh = ""\nos = "darwin"\nboard = "codex"\n'
+        'python = "python3"\nworkdir = "~/b"\nhas_claude_desktop = false\n',
+        encoding="utf-8")
+    with pytest.raises(ValueError) as e:
+        fleet_run.load_inventory(path)
+    assert "mine" in str(e.value) and "also-mine" in str(e.value)
+
+
+def test_the_shipped_inventory_still_loads(tmp_path):
+    """The rule above has to be one the fleet as it stands satisfies."""
+    assert fleet_run.load_inventory(fleet_run.DEFAULT_INVENTORY)
+
+
+# --------------------------------------------------------------------------
+# The two timeouts, against each other
+# --------------------------------------------------------------------------
+
+def test_a_slow_customer_path_cannot_eat_the_whole_desk_budget():
+    """The agent's own worst case has to fit INSIDE the orchestrator's wait.
+
+    The customer-path scenarios run first and allow BUNDLE_TIMEOUT_S per
+    program call, BUNDLE_CALLS of them. When that product equalled
+    AGENT_TIMEOUT_S -- which it exactly did -- a slow update_path could spend
+    the entire per-desk budget before the board was asked for anything, and
+    this end would report a timed-out desk instead of four board verdicts.
+    """
+    from tests.fleet import agent
+
+    worst_customer_path = agent.BUNDLE_TIMEOUT_S * agent.BUNDLE_CALLS
+    assert fleet_run.AGENT_TIMEOUT_S >= worst_customer_path * 1.5, (
+        "the orchestrator has to outlive the bundle scenarios by enough for"
+        " the board scenarios to run afterwards")
+    # And the per-command cap has to stay outside the update's own self-test
+    # allowance (pc/update.py), or it fires first and replaces that command's
+    # message with "could not be run at all".
+    assert agent.BUNDLE_TIMEOUT_S >= 400

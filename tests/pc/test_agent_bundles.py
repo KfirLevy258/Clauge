@@ -358,6 +358,30 @@ def test_nothing_leaky_reaches_any_child_of_either_scenario(
                 f"{name} reached `{call['cmd'][-1]}`"
 
 
+def test_the_status_wire_child_is_swept_like_every_other_child(
+        tmp_path, monkeypatch):
+    """`blink status --wire` is a child of this file too, so it is swept too.
+
+    It reads only BLINK_SKIP_SERVICE today, so an inherited variable would
+    change nothing it does -- which is exactly why it was the one child built
+    from a raw copy of os.environ. The rule _clean_env() states is that there
+    is no exception anywhere in the file, because the exception is what the
+    next person copies into a child where it does matter.
+    """
+    for name in LEAKY:
+        monkeypatch.setenv(name, "leaked")
+    seen = []
+
+    def runner(cmd, **kw):
+        seen.append(kw["env"])
+        return types.SimpleNamespace(returncode=0, stdout='{"ok": true}\n',
+                                     stderr="")
+
+    assert agent._check_status_wire(agent.Deps(runner=runner)) == []
+    assert seen and {k: v for k, v in seen[0].items()
+                     if k.startswith("BLINK_")} == {"BLINK_SKIP_SERVICE": "1"}
+
+
 # --- the update path --------------------------------------------------
 
 def test_update_check_takes_the_candidate_off_the_feed(tmp_path):

@@ -263,6 +263,23 @@ def test_systemd_without_a_unit_file_is_not_an_error(home, monkeypatch):
 
 # ------------------------------------------------------------------- base --
 
+def test_a_launchd_job_that_was_not_loaded_counts_as_stopped(home, monkeypatch):
+    """The port is free, which is the only thing the caller asked about.
+
+    `launchctl bootout` answers ESRCH -- exit 3, "No such process" -- for a
+    plist on disk whose agent is not currently loaded, which happens whenever
+    a previous run or the operator booted it out by hand. Read as a failure,
+    it aborts the fleet agent before any scenario with "the serial port is
+    probably still held", about a port nothing is holding.
+    """
+    monkeypatch.delenv("BLINK_SKIP_SERVICE")
+    _platform(monkeypatch, "darwin")
+    _write(cli.plist_path())
+    out = service_ctl.stop_service(runner=_Runs(codes=[3]))
+    assert out.ok is True and "not loaded" in str(out)
+    assert not service_ctl.stop_service(runner=_Runs(codes=[1])).ok
+
+
 def test_an_unknown_platform_says_what_it_cannot_do(home, monkeypatch):
     _platform(monkeypatch, "freebsd14")
     r = _Runs()
@@ -420,6 +437,32 @@ def test_a_failing_command_is_reported_not_raised(home, monkeypatch):
     _pretend_installed(monkeypatch)
     out = service_ctl.stop_service(runner=_Runs(codes=[1, 1, 1]))
     assert out.ok is False and "not" in str(out).lower()
+
+
+def test_a_backend_that_does_not_answer_in_prose_is_reported_not_raised(
+        home, monkeypatch):
+    """Nothing in this module may raise, including the part reading the answer.
+
+    start_service() is called from the fleet agent's finally block. A backend
+    that returned anything but a string -- a future one answering with a
+    status object, say -- used to raise AttributeError from OUTSIDE the try,
+    which is an exception out of a finally: it replaces the failure the run
+    was there to find with one about the cleanup, and leaves the desk with no
+    service and no explanation.
+    """
+    monkeypatch.delenv("BLINK_SKIP_SERVICE")
+
+    class _Terse:
+        def stop(self, runner=None):
+            return None
+
+        def start(self, runner=None):
+            return 0
+
+    monkeypatch.setattr(cli, "backend", _Terse)
+    for out in (service_ctl.stop_service(runner=_Runs()),
+                service_ctl.start_service(runner=_Runs())):
+        assert out.ok is False and isinstance(out.detail, str)
 
 
 def test_a_missing_tool_is_reported_not_raised(home, monkeypatch):

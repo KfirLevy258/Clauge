@@ -515,6 +515,12 @@ class _Backend:
         return f"unknown on {sys.platform}"
 
 
+# launchctl exits with an errno. ESRCH is what booting out a job launchd is
+# not running gives back ("Boot-out failed: 3: No such process"), which is an
+# answer rather than a failure -- see _LaunchdBackend.stop.
+_ESRCH = 3
+
+
 class _LaunchdBackend(_Backend):
     def creates(self):
         return plist_path()
@@ -558,6 +564,14 @@ class _LaunchdBackend(_Backend):
         the serial port would be held again before anything else could take
         it. bootout unloads the job; the plist stays exactly where it is, and
         start() below bootstraps that same file back in.
+
+        A job that is not loaded is stopped, not a failure. launchctl exits
+        with an errno, and booting out something launchd has never heard of
+        gives ESRCH -- "Boot-out failed: 3: No such process". That is an
+        ordinary state: a plist on disk whose agent was already booted out,
+        by a previous run or by hand. Reported as a failure it aborts the
+        fleet agent with "the serial port is probably still held", about a
+        port that is in fact free.
         """
         if not os.path.exists(plist_path()):
             return "not installed"
@@ -567,6 +581,8 @@ class _LaunchdBackend(_Backend):
             capture_output=True, **update.ota.NO_WINDOW)
         if r.returncode == 0:
             return "stopped"
+        if r.returncode == _ESRCH:
+            return "stopped (it was not loaded)"
         return f"could not stop it: launchctl bootout gui/{uid}/{LABEL}"
 
     def start(self, runner=None) -> str:

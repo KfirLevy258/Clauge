@@ -84,6 +84,11 @@ def _safely(verb: str, runner) -> Outcome:
         return Outcome(False, True, "skipped (BLINK_SKIP_SERVICE=1)")
     try:
         detail = getattr(cli.backend(), verb)(runner or cli.subprocess.run)
+        # Inside the try, not after it: the backends answer in prose today,
+        # and a future one that answered with anything else would raise
+        # AttributeError here -- out of a finally block, past the promise at
+        # the top of this file that nothing here raises.
+        worked = detail.startswith(_WORKED)
     except Exception as e:                       # never out of a finally block
         return Outcome(False, False, f"could not {verb} the service: {e}")
-    return Outcome(detail.startswith(_WORKED), False, detail)
+    return Outcome(worked, False, detail)

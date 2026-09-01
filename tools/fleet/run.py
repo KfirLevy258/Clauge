@@ -86,10 +86,18 @@ PUSH_TIMEOUT_S = 600.0
 PULL_TIMEOUT_S = 300.0
 GIT_TIMEOUT_S = 60.0
 # Five scenarios with their silences, plus two customer-path scenarios that
-# unpack 50 MB and run an installer that self-tests the copy it made
-# (agent.py allows 900 s for each of those alone). Generous, because a
-# timeout here is reported as a failed release, and slow is not broken.
-AGENT_TIMEOUT_S = 5400.0
+# unpack 50 MB and run an installer that self-tests the copy it made.
+#
+# It has to sit OUTSIDE the agent's own worst case, not on top of it. The
+# customer path runs first and allows BUNDLE_TIMEOUT_S per program call for
+# BUNDLE_CALLS calls (tests/fleet/agent.py) -- 4200 s -- which used to be
+# exactly this constant: a slow update_path could then eat the entire desk
+# budget, the four board scenarios would never run, and this end would report
+# a timeout instead of a result. The two are pinned against each other by a
+# test. What is left over here is ~50 minutes for the board passes, which
+# take five to eight. Generous on purpose: a timeout is reported as a failed
+# release, and slow is not broken.
+AGENT_TIMEOUT_S = 7200.0
 
 # How much of a failing command's own output is worth repeating. Enough for
 # the sentence that names the cause, short enough that the table stays a
@@ -107,6 +115,14 @@ def load_inventory(path=DEFAULT_INVENTORY):
     A malformed inventory is refused here rather than halfway through a run:
     the alternative is stopping two desks' services, discovering the third
     has no `python` line, and leaving somebody's board dark over a typo.
+
+    Two entries naming the same machine are refused for the same reason and
+    then some. main() submits every desk to the thread pool at once, so a
+    duplicated `ssh` -- or two entries with none, which both mean THIS machine
+    -- puts two agents on one desk: both stopping and starting the same login
+    service, both unpacking into the same workdir, and both asking the daemon
+    for the one serial port. The second one's failures then read as a board
+    fault on a board that was busy answering the first.
     """
     path = Path(path)
     try:
@@ -123,6 +139,7 @@ def load_inventory(path=DEFAULT_INVENTORY):
     if not hosts:
         raise ValueError(f"The fleet inventory at {path} names no hosts."
                          f" It needs a [hosts.<name>] table per desk.")
+    machines = {}
     for name, cfg in hosts.items():
         if not isinstance(cfg, dict):
             raise ValueError(f"Host {name} in {path} is not a table.")
@@ -137,6 +154,19 @@ def load_inventory(path=DEFAULT_INVENTORY):
                 f"Host {name} in {path} has os = {cfg['os']!r}, which this"
                 f" orchestrator has no shell for. Use one of"
                 f" {', '.join(KNOWN_OS)}.")
+        where = str(cfg["ssh"]).strip()
+        if where in machines:
+            first = machines[where]
+            which = (f"ssh = {where!r}" if where else
+                     "no ssh line, which means this machine")
+            raise ValueError(
+                f"Hosts {first} and {name} in {path} both have {which}, so"
+                f" they are one desk written down twice. Both would be run at"
+                f" the same time: two agents stopping and starting the same"
+                f" login service, unpacking into the same workdir and"
+                f" competing for one serial port, with the loser's failures"
+                f" reading as a dead board. Give each desk one entry.")
+        machines[where] = name
     return hosts
 
 
