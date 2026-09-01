@@ -31,9 +31,12 @@ did not actually prove anything? -- and the four answers it has to keep shut:
     today's commit. It is deleted on the remote, in the same command that
     unpacks the snapshot, before the agent is started.
 
-  - .fleet/last_run.json is removed before the run and written atomically at
-    the end, from a finally. A run that dies halfway leaves no file rather
-    than the previous green one, and the gate cannot read a half-written one.
+  - .fleet/last_run.json is removed before the inventory is even read, and
+    written atomically at the end from a finally. A run that dies halfway --
+    or that gives up on a typo in --only -- leaves no file rather than the
+    previous green one, and the gate cannot read a half-written one. The
+    report is printed from a try of its own, because a fault in the table
+    must not be the last word over a verdict already on disk.
 
   - An ssh that hangs -- a desk asleep, a key that needs a passphrase, a
     machine mid-reboot -- would otherwise hold the gate open forever. Every
@@ -492,6 +495,19 @@ def run_host(name, cfg, runner=subprocess.run, scenarios=None, bundle=None,
             result["problems"].append("The agent's scenario list came back"
                                       " in a shape nothing can read.")
             result["scenarios"] = {}
+        # A scenario entry that is not a verdict is turned into one HERE, at
+        # the edge, rather than being carried into the report: format_report
+        # asks every entry whether it passed, and an AttributeError there
+        # would arrive after the state file had already been written -- a
+        # traceback instead of a table, over a file claiming the fleet
+        # passed. Unreadable is counted as failed, like everything else this
+        # module cannot make sense of.
+        for scenario, outcome in list(result["scenarios"].items()):
+            if not isinstance(outcome, dict) or "ok" not in outcome:
+                result["scenarios"][scenario] = {"ok": False, "problems": [
+                    f"The verdict for {scenario} came back as {outcome!r},"
+                    f" which is not a verdict. Nothing here can read it, so"
+                    f" it counts as a failure."]}
         result["desk"] = name
         result["os"] = cfg.get("os")
         result["has_claude_desktop"] = cfg.get("has_claude_desktop")
@@ -520,6 +536,20 @@ def run_host(name, cfg, runner=subprocess.run, scenarios=None, bundle=None,
                 f"{name} reported success without running a single scenario,"
                 f" which is not a pass. Check the scenario filter and the"
                 f" agent's own output.")
+            result["ok"] = False
+        # The third contradiction, and the one that would read worst: a
+        # PASSED sitting on the same line as "overage FAILED". The agent in
+        # this snapshot cannot write it -- its _finish() ands the scenarios
+        # together -- but the whole premise here is refusing contradictions
+        # rather than picking the half that ships.
+        lost = sorted(scenario for scenario, outcome
+                      in result["scenarios"].items()
+                      if outcome.get("ok") is not True)
+        if result.get("ok") is True and lost:
+            result["problems"].append(
+                f"{name} reported success while {', '.join(lost)} failed on"
+                f" it. Those two cannot both be true, so it is counted as"
+                f" failed.")
             result["ok"] = False
         result["ok"] = result.get("ok") is True
         return result
@@ -676,6 +706,16 @@ def parse_args(argv=None):
 
 def main(argv=None, runner=subprocess.run):
     args = parse_args(argv)
+    state = Path(args.state)
+    if not args.dry_run:
+        # Before the inventory is even read, so that the paths which give up
+        # early take the old verdict with them. A typo in --only that left
+        # last week's green file behind would hand the release gate a file
+        # the operator believes they just refreshed. A dry run is the one
+        # exception: it decides nothing, so it disturbs nothing.
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.unlink(missing_ok=True)
+
     try:
         inventory = load_inventory(args.inventory)
     except ValueError as e:
@@ -714,12 +754,6 @@ def main(argv=None, runner=subprocess.run):
                 print(f"  pull: {pull_cmd(cfg, '<temporary file>')}")
         print("\nNothing was run and no desk was contacted.")
         return 0
-
-    state = Path(args.state)
-    # Before anything else: last week's verdict must not survive this run,
-    # green, to be read as this one's.
-    state.parent.mkdir(parents=True, exist_ok=True)
-    state.unlink(missing_ok=True)
 
     sha, problems = _head_sha(runner)
     doc = {"sha": sha, "started_at": time.time(), "finished_at": None,
@@ -762,8 +796,22 @@ def main(argv=None, runner=subprocess.run):
                      and doc["sha"] != "unknown")
         _write_state(state, doc)
 
-    for line in format_report(doc):
-        print(line)
+    # The verdict is already on disk by here. Whatever the table does, it
+    # must not be the last thing that happens: a traceback in place of the
+    # report, over a .fleet/last_run.json the gate will read as green, is the
+    # worst pairing this program has. So the fallback says the two things
+    # that cannot be lost -- what was decided, and where it was written.
+    try:
+        for line in format_report(doc):
+            print(line)
+    except Exception as e:  # noqa: BLE001
+        print(f"\nThe result table could not be printed ({e!r}), so here is"
+              f" the verdict without it.", file=sys.stderr)
+        print(f"Fleet run {_short(doc['sha'])}:"
+              f" {'PASSED' if doc['ok'] else 'did NOT pass'}.")
+        for host, result in sorted(doc["hosts"].items()):
+            state_word = "PASSED" if result.get("ok") is True else "FAILED"
+            print(f"  {host}: {state_word}")
     print(f"Written to {state}")
     return 0 if doc["ok"] else 1
 

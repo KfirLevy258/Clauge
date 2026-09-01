@@ -348,6 +348,45 @@ def test_a_green_result_with_no_scenarios_is_refused():
     assert "without running a single scenario" in " ".join(res["problems"])
 
 
+def test_a_green_result_over_a_failing_scenario_is_refused():
+    """PASSED on the same line as "overage FAILED" is worse than either.
+
+    The agent shipped in this snapshot cannot write that -- its own _finish()
+    ands the scenarios together -- but this module's premise is refusing
+    contradictions rather than resolving them, and this is the same class as
+    the two already refused above it.
+    """
+    runner = FakeRunner(result={
+        "host": "x", "board": "claude", "ok": True, "problems": [],
+        "scenarios": {"overage": {"ok": False,
+                                  "problems": ["Nothing reached the board."]},
+                      "sleep_wake": {"ok": True, "problems": []}}})
+    res = fleet_run.run_host("kfir-ubuntu", UBUNTU, runner=runner)
+    assert res["ok"] is False
+    assert "overage" in " ".join(res["problems"])
+    assert "sleep_wake" not in " ".join(res["problems"])
+
+
+def test_a_scenario_verdict_that_is_not_a_verdict_becomes_a_failure():
+    """A scenario entry nothing can read must not sail through as a pass.
+
+    It also must not reach the table: format_report calls .get() on every
+    scenario value, and an AttributeError there would arrive AFTER the state
+    file had already been written green.
+    """
+    runner = FakeRunner(result={
+        "host": "x", "board": "claude", "ok": True, "problems": [],
+        "scenarios": {"overage": "yes"}})
+    res = fleet_run.run_host("kfir-ubuntu", UBUNTU, runner=runner)
+    assert res["ok"] is False
+    assert res["scenarios"]["overage"]["ok"] is False
+    assert "yes" in " ".join(res["scenarios"]["overage"]["problems"])
+    # And the table survives it, which is the half that matters to a person.
+    fleet_run.format_report({"sha": "abc1234", "ok": False,
+                             "started_at": 0.0, "finished_at": 1.0,
+                             "hosts": {"kfir-ubuntu": res}})
+
+
 def test_a_green_result_from_a_failing_agent_is_refused():
     """Exit code and verdict disagreeing means neither can be trusted."""
     runner = FakeRunner(agent_code=1)
@@ -476,13 +515,58 @@ def test_a_dry_run_contacts_nothing(tmp_path, capsys):
     assert "%USERPROFILE%" in out and "$HOME" in out
 
 
-def test_an_unknown_host_is_refused_before_anything_is_touched(tmp_path):
+def test_an_unknown_host_takes_the_old_verdict_with_it(tmp_path):
+    """Exit 2 is still a run that happened, so the old verdict cannot stay.
+
+    A typo in --only that left last week's green file sitting there would
+    hand the gate a file the operator believes they just refreshed.
+    """
     state = tmp_path / "last_run.json"
+    state.write_text('{"sha": "old", "ok": true, "hosts": {}}',
+                     encoding="utf-8")
     code = fleet_run.main(["--inventory", str(_inventory(tmp_path)),
                            "--state", str(state), "--only", "nosuchdesk"],
                           runner=FakeRunner())
     assert code == 2
     assert not state.exists()
+
+
+def test_a_bad_inventory_also_takes_the_old_verdict_with_it(tmp_path):
+    state = tmp_path / "last_run.json"
+    state.write_text('{"sha": "old", "ok": true, "hosts": {}}',
+                     encoding="utf-8")
+    bad = tmp_path / "bad.toml"
+    bad.write_text('[hosts.a]\nssh = ""\n', encoding="utf-8")
+    code = fleet_run.main(["--inventory", str(bad), "--state", str(state)],
+                          runner=FakeRunner())
+    assert code == 2
+    assert not state.exists()
+
+
+def test_a_table_that_cannot_be_printed_is_not_the_last_word(tmp_path):
+    """The verdict is on disk by then; a formatting fault must not hide it.
+
+    Losing the table to a traceback while .fleet/last_run.json sits there
+    green is the worst pairing there is for a release gate, so the fallback
+    says what was decided and where it was written.
+    """
+    state = tmp_path / "last_run.json"
+    runner = FakeRunner()
+    runner.cwd_of_local_agent = str(tmp_path / "wd")
+
+    def boom(doc):
+        raise AttributeError("'str' object has no attribute 'get'")
+
+    original = fleet_run.format_report
+    fleet_run.format_report = boom
+    try:
+        code = fleet_run.main(["--inventory", str(_inventory(tmp_path)),
+                               "--state", str(state), "--only", "local-mac"],
+                              runner=runner)
+    finally:
+        fleet_run.format_report = original
+    doc = json.loads(state.read_text(encoding="utf-8"))
+    assert doc["ok"] is True and code == 0
 
 
 def test_hosts_run_at_the_same_time(tmp_path):
