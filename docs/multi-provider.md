@@ -213,12 +213,32 @@ opened; the pair below exists for the machine that has no such source:
 3. **Claude Desktop's IndexedDB** (`pc/desktop_idb.py`), tried last and only
    when the cheaper two have produced nothing. This is the only source in
    the project that reads a store holding the customer's conversations.
+   **It has never successfully seeded an anchor, and should be treated as
+   unproven.** Measured against the reference machine's live store on
+   2026-09-05, with one Cowork and one Chat session deliberately open: the
+   six qualifying records were found, `_wanted_key` matched every one, none
+   was blob-wrapped -- and `v8_clone.parse` returned `None` for all six. The
+   parser was written from format documentation and its fixture was written
+   from the same reading, so it passes its own tests and refuses real
+   records; the one bug already found in it (dense arrays) came from exactly
+   that. Any tag it does not implement -- `Date` among them, which a 45 KB
+   record from an Electron app is unlikely to avoid -- refuses the whole
+   record. The failure is safe: `None` means no anchor, never a wrong
+   boundary. But nothing downstream should assume this seeder contributes,
+   and a machine relying on it gets no weekly countdown at all. Fixing it
+   means decoding a real record end to end first, not reading the format
+   documentation more carefully.
 
 **The IndexedDB seeder is Cowork-only, in practice, and the discriminator is
 the key, never the value.** `rate_limit_event` records carrying
 `unifiedWindows` sat under IndexedDB keys prefixed `cowork:cse_...` on the
 reference machine; plain chat conversations in the same store carried none.
-Two values in the entire store had a usage record, and both were Cowork. An
+Re-tested on 2026-09-05 with one Cowork and one Chat session deliberately
+opened for the purpose: of eighteen conversation-sized values, all six under
+a `cowork:` key carried `unifiedWindows` and none of the twelve chat values
+did. (A first pass reported the opposite; it collapsed the UTF-16 keys at
+the wrong alignment and labelled Cowork keys as chat. Classify on the key's
+printable text, which is alignment-independent.) An
 earlier investigation concluded these came from plain Chat and was **wrong**
 -- the discriminator it used (no local session folder, no `audit.jsonl`)
 proves nothing, because these managed sessions write neither. Provenance is
