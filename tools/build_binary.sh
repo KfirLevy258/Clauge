@@ -22,9 +22,33 @@ ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 OUT="${1:-$ROOT/dist}"
 BUILD="${TMPDIR:-/tmp}/blink-build"
 
-command -v python3 >/dev/null 2>&1 || { echo "need python3 to build" >&2; exit 1; }
+# Find an interpreter that RUNS, not merely one that is on PATH.
+#
+# On a Windows box without the Store's Python, `python3` is a stub in
+# %LOCALAPPDATA%\Microsoft\WindowsApps that exists, satisfies `command -v`,
+# and then exits "Permission denied" -- it is there to open the Store, not to
+# run code. The real interpreter on such a machine is `python`. Measured on
+# the Windows release desk, 2026-09-06: `command -v python3` succeeded, the
+# build then died on line 27, and `python` was 3.11.2 and healthy.
+#
+# So each candidate is executed, not just located, and the first that answers
+# with a 3.x version wins. `py -3` is the Windows launcher, worth trying last
+# because it is absent everywhere else.
+PY=""
+for cand in python3 python py; do
+	command -v "$cand" >/dev/null 2>&1 || continue
+	"$cand" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' \
+		>/dev/null 2>&1 || continue
+	PY="$cand"
+	break
+done
+[ -n "$PY" ] || {
+	echo "need a working python3 to build" >&2
+	echo "  tried: python3, python, py -- none ran and reported 3.x" >&2
+	exit 1
+}
 
-python3 -m venv "$BUILD" >/dev/null
+"$PY" -m venv "$BUILD" >/dev/null
 # A Windows venv puts its executables in Scripts/, not bin/. This script runs
 # under Git Bash there, so the path style is the only difference that matters.
 VBIN="$BUILD/bin"
