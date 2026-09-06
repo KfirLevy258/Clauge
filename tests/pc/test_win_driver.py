@@ -19,9 +19,14 @@ from pc import win_driver                                       # noqa: E402
 from pc.cli import board_lines                                  # noqa: E402
 
 
-def undriven(problem=win_driver.CM_PROB_FAILED_INSTALL,
+def undriven(problem=win_driver.NO_DRIVER_BOUND,
              instance_id="USB\\VID_1A86&PID_7523\\5&1D2B3C4&0&2"):
-    """One Undriven the way undriven_boards() would have built it."""
+    """One Undriven the way undriven_boards() would have built it.
+
+    The default is NO_DRIVER_BOUND rather than problem 28, because that is
+    the case a real customer is in: measured on the release desk, a CH340 on
+    a machine with no driver carries no problem code at all.
+    """
     return win_driver.Undriven(instance_id, 0x1A86, 0x7523, problem,
                                win_driver.problem_note(problem))
 
@@ -56,9 +61,29 @@ class TestProblemNotes:
     def test_the_missing_driver_case_reads_as_a_missing_driver(self):
         assert win_driver.problem_note(28) == "Windows has no driver for it"
 
+    def test_no_problem_code_still_reads_as_a_missing_driver(self):
+        # Code 0 reaches this only for a device with no driver bound, which
+        # is what an undriven board on Windows 10 actually reports -- no
+        # problem flag whatsoever. It must not read as "everything is fine"
+        # to somebody staring at a board that does nothing.
+        assert (win_driver.problem_note(win_driver.NO_DRIVER_BOUND)
+                == "Windows has no driver for it")
+
     def test_a_code_with_no_wording_still_says_something_usable(self):
         # Support can act on a number. It cannot act on a KeyError.
         assert "97" in win_driver.problem_note(97)
+
+
+class TestWhichStatesAreWorthOfferingADriverFor:
+    def test_no_driver_bound_and_a_failed_install_both_are(self):
+        assert win_driver.NO_DRIVER_BOUND in win_driver.DRIVER_FIXES
+        assert win_driver.CM_PROB_FAILED_INSTALL in win_driver.DRIVER_FIXES
+
+    def test_a_disabled_or_damaged_device_is_not(self):
+        # Installing a driver does not re-enable a device somebody turned
+        # off, repair a registry entry, or perform a pending restart.
+        for code in (22, 19, 14, 10, 43):
+            assert code not in win_driver.DRIVER_FIXES
 
 
 class TestReadingTheDriverStore:
@@ -156,6 +181,10 @@ class TestSummaryAndAdvice:
 
     def test_a_missing_driver_is_pointed_at_the_command_that_fixes_it(self):
         assert win_driver.advice([undriven()], "blink") == [
+            "run `blink driver` to install it"]
+
+    def test_a_failed_install_is_pointed_there_too(self):
+        assert win_driver.advice([undriven(problem=28)], "blink") == [
             "run `blink driver` to install it"]
 
     def test_the_command_is_the_path_the_customer_actually_has(self):

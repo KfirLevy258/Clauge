@@ -84,13 +84,47 @@ PROBLEM_NOTES = {
     37: "its driver failed to start",
     43: "Windows stopped it after a fault",
 }
-# The plain missing-driver case, and the only one that installing a driver
-# fixes on its own. The others are reported, but not treated as an invitation
-# to raise a permission prompt: nothing here repairs a damaged registry entry
-# or re-enables a device somebody disabled on purpose.
+# The plain missing-driver case.
 CM_PROB_FAILED_INSTALL = 28
 
+# No problem code at all -- which, measured on the Windows 10 release desk
+# (19045, 2026-09-06), is what a CH340 with no driver actually looks like.
+#
+# This overturned the first version of this module. The assumption was that
+# an undriven board carries CM_PROB_FAILED_INSTALL, because Device Manager
+# draws a yellow triangle on it. It does not. With the driver package deleted
+# and the machine rebooted so the board enumerated fresh, Windows reported
+# problem 0 on the device, and `pnputil /enum-devices /problem` reported "No
+# devices were found on the system" -- while there was no COM port and no way
+# to reach the board. Windows does not consider a device with no function
+# driver to be in a problem state. It is simply a device that does nothing.
+#
+# So the problem code is not the signal. The signal is that no driver is
+# BOUND: the devnode has no Service. The problem codes below still matter --
+# a device really can be disabled, or fail its install -- but they are the
+# rarer half, and keying on them alone meant the detector reported a healthy
+# desk while the board sat there unreachable.
+NO_DRIVER_BOUND = 0
+
+# The states that installing a driver can actually fix, and therefore the
+# ones `blink driver` is offered for. A disabled device (22), a damaged
+# registry entry (19) or a pending restart (14) are none of this program's
+# business, and sending somebody round that loop wastes a support pass.
+DRIVER_FIXES = frozenset({
+    NO_DRIVER_BOUND,
+    CM_PROB_FAILED_INSTALL,
+    18,     # its driver needs reinstalling
+    31,     # Windows could not load its driver
+    37,     # its driver failed to start
+})
+
 _DN_HAS_PROBLEM = 0x00000400
+# CM_DRP_* from cfgmgr32.h. SERVICE is the name of the kernel service driving
+# the device -- "CH341SER_A64" once WCH's driver is bound, and absent
+# entirely when nothing is.
+_CM_DRP_SERVICE = 0x00000005
+_CM_DRP_DEVICEDESC = 0x00000001
+_CR_BUFFER_SMALL = 0x0000001A
 _CM_GETIDLIST_FILTER_ENUMERATOR = 0x00000001
 _CM_GETIDLIST_FILTER_PRESENT = 0x00000100
 _CR_SUCCESS = 0
@@ -143,7 +177,15 @@ def wants_wch_driver(instance_id):
 
 
 def problem_note(code):
-    """A customer-facing reason for a CM_PROB_* code."""
+    """A customer-facing reason for a CM_PROB_* code.
+
+    Code 0 is not "fine" here. It is only ever passed in for a device that
+    has no driver bound -- see NO_DRIVER_BOUND -- and to the person looking
+    at the board that is indistinguishable from Windows having no driver,
+    because it is.
+    """
+    if code == NO_DRIVER_BOUND:
+        return PROBLEM_NOTES[CM_PROB_FAILED_INSTALL]
     return PROBLEM_NOTES.get(code, f"Windows reported problem code {code}")
 
 
@@ -217,7 +259,7 @@ def advice(undriven, blink_cmd="blink"):
     """
     if not undriven:
         return []
-    if undriven[0].problem == CM_PROB_FAILED_INSTALL:
+    if undriven[0].problem in DRIVER_FIXES:
         return [f"run `{blink_cmd} driver` to install it"]
     return ["open Device Manager to see what it says about that device"]
 
@@ -261,12 +303,11 @@ def _present_usb_ids(cm):
     return [s for s in buf[:size.value].split("\0") if s]
 
 
-def _problem_code(cm, instance_id):
-    """0 if Windows is happy with this device, its CM_PROB_* code if not.
+def _locate(cm, instance_id):
+    """The devnode handle for an instance id, or None.
 
-    None when the device could not be located at all, which is a race -- it
-    was unplugged between the listing and this call -- and not worth saying
-    anything about.
+    None is a race -- the device was unplugged between the listing and this
+    call -- and not worth saying anything about.
     """
     import ctypes
     from ctypes import wintypes
@@ -275,6 +316,16 @@ def _problem_code(cm, instance_id):
     if cm.CM_Locate_DevNodeW(ctypes.byref(devinst),
                              ctypes.c_wchar_p(instance_id), 0) != _CR_SUCCESS:
         return None
+    return devinst
+
+
+def _problem_code(cm, devinst):
+    """0 if Windows flags no problem on this device, its CM_PROB_* code if it
+    does. Remember that 0 does NOT mean the device works -- see
+    NO_DRIVER_BOUND."""
+    import ctypes
+    from ctypes import wintypes
+
     status = wintypes.ULONG(0)
     problem = wintypes.ULONG(0)
     if cm.CM_Get_DevNode_Status(ctypes.byref(status), ctypes.byref(problem),
@@ -285,12 +336,44 @@ def _problem_code(cm, instance_id):
     return problem.value
 
 
+def _devnode_string(cm, devinst, prop):
+    """One string registry property of a devnode, or "" if it has none.
+
+    "" is the answer that matters: a device with no function driver has no
+    CM_DRP_SERVICE at all, and that -- not a problem code -- is how an
+    undriven board is actually recognised.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    size = wintypes.ULONG(0)
+    rc = cm.CM_Get_DevNode_Registry_PropertyW(
+        devinst, prop, None, None, ctypes.byref(size), 0)
+    if rc != _CR_BUFFER_SMALL or size.value == 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(size.value // 2 + 1)
+    if cm.CM_Get_DevNode_Registry_PropertyW(
+            devinst, prop, None, buf, ctypes.byref(size), 0) != _CR_SUCCESS:
+        return ""
+    return buf.value or ""
+
+
 def undriven_boards():
-    """Present WCH bridges Windows cannot use: the yellow triangle, listed.
+    """Present WCH bridges Windows cannot use, listed.
+
+    A board counts as undriven when either is true:
+
+      - Windows flags a problem on it (disabled, failed install, and the rest
+        of PROBLEM_NOTES), or
+      - no driver is BOUND to it -- it has no Service -- which is the state a
+        board is in on a machine that has never had the driver, and the state
+        that carries no problem code at all. See NO_DRIVER_BOUND for what was
+        measured on the release desk, and for why the first version of this
+        function reported that machine as healthy.
 
     Empty everywhere but Windows, and empty on a Windows machine whose driver
-    is installed -- a working CH340 carries no problem flag, and its COM port
-    shows up through pyserial like any other.
+    is installed: a bound CH340 has a Service, no problem flag, and a COM
+    port that shows up through pyserial like any other.
 
     Never raises. This runs on every `blink status`, and a status command that
     dies because a system library moved is worse than one that omits a line.
@@ -303,9 +386,14 @@ def undriven_boards():
         for instance_id in _present_usb_ids(cm):
             if not wants_wch_driver(instance_id):
                 continue
-            code = _problem_code(cm, instance_id)
-            if not code:
+            devinst = _locate(cm, instance_id)
+            if devinst is None:
                 continue
+            code = _problem_code(cm, devinst)
+            if code is None:
+                continue
+            if not code and _devnode_string(cm, devinst, _CM_DRP_SERVICE):
+                continue        # bound to a driver and Windows is happy: fine
             vid, pid = ids_from(instance_id)
             found.append(Undriven(instance_id, vid, pid, code,
                                   problem_note(code)))
