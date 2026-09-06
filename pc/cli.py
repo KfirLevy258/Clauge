@@ -814,11 +814,98 @@ class _LaunchdBackend(_Backend):
         return "registered with launchd"
 
 
+# The autostart Windows never refuses: the user's own Run key.
+#
+# HKCU is the account's own hive, so writing here needs no administrator by
+# definition. That is the whole reason it is the fallback -- see
+# _SchtasksBackend._install_without_a_task for what it is a fallback FROM.
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = TASK_NAME
+
+
+def _winreg():
+    """The winreg module, or None where there is no registry.
+
+    None rather than an ImportError because the backends are selected by
+    platform at run time but exercised on every platform by the tests: a bare
+    `import winreg` at the top of a Windows-only helper takes the whole suite
+    down on macOS.
+    """
+    try:
+        import winreg
+        return winreg
+    except ImportError:
+        return None
+
+
+def _autostart_command() -> str:
+    """The same hidden-window launcher the Scheduled Task would have run."""
+    return f'wscript.exe //B //Nologo "{launcher_path()}"'
+
+
+def _autostart_set() -> str:
+    """Start the bridge at logon from the user's Run key. "" when it worked."""
+    winreg = _winreg()
+    if winreg is None:
+        return "no registry on this system"
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ,
+                              _autostart_command())
+        return ""
+    except OSError as e:
+        return str(e)[:120]
+
+
+def _autostart_clear() -> None:
+    """Remove it. Absent is the ordinary case -- most installs use the task."""
+    winreg = _winreg()
+    if winreg is None:
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, RUN_VALUE)
+    except OSError:
+        pass
+
+
+def _autostart_present() -> bool:
+    winreg = _winreg()
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, RUN_VALUE)
+        return bool(value)
+    except OSError:
+        return False
+
+
+def _start_launcher() -> None:
+    """Start the bridge now, with no Scheduled Task to trigger.
+
+    Detached and window-less, the same way _schedule_windows_cleanup starts
+    its own child: this must outlive the installer that spawned it, and it
+    must not put a console window on the customer's desktop.
+    """
+    DETACHED_NO_WINDOW = 0x00000008 | 0x08000000
+    try:
+        subprocess.Popen(["wscript.exe", "//B", "//Nologo", launcher_path()],
+                         creationflags=DETACHED_NO_WINDOW, close_fds=True)
+    except OSError:
+        pass
+
+
 class _SchtasksBackend(_Backend):
     def creates(self):
         return (f'a Scheduled Task named "{TASK_NAME}", and {launcher_path()}\n'
                 "             the one-line script it runs, so the bridge starts\n"
-                "             with no window")
+                "             with no window. If Windows will not register the\n"
+                "             task without administrator, an entry named\n"
+                f'             "{RUN_VALUE}" under your own account\'s Run key\n'
+                "             is used instead, which starts it the same way")
 
     def install(self) -> str:
         # The task runs the launcher, not the program: see launcher_path().
@@ -831,13 +918,17 @@ class _SchtasksBackend(_Backend):
         except OSError as e:
             return f"could not write {launcher_path()}: {e}"
         # /f overwrites a task from an earlier install rather than failing.
-        # /sc onlogon needs no admin rights; a Windows service would.
+        #
+        # This is tried FIRST because a Scheduled Task is the better of the
+        # two: it can be ended and re-run by name, which is what `blink
+        # update` restarts through. But it is not always allowed -- see
+        # _install_without_a_task, which is where a refusal goes.
         r = subprocess.run(
             ["schtasks", "/create", "/f", "/tn", TASK_NAME, "/sc", "onlogon",
              "/tr", f'wscript.exe //B //Nologo "{launcher_path()}"'],
             capture_output=True, text=True, **update.ota.NO_WINDOW)
         if r.returncode != 0:
-            return f"could not register a Scheduled Task: {r.stderr.strip()[:120]}"
+            return self._install_without_a_task(r)
         # A daemon from an earlier install is still running, holding the
         # serial port and the single-instance lock, and /create does nothing
         # to it: on the first reinstall over a live 1.0.2 the new task's
@@ -858,6 +949,49 @@ class _SchtasksBackend(_Backend):
             return "running (Scheduled Task)"
         return ("registered as a Scheduled Task, but it is not running -- "
                 f'start it with: schtasks /run /tn "{TASK_NAME}"')
+
+    def _install_without_a_task(self, refused) -> str:
+        """Windows would not register the task. Start at logon the other way.
+
+        A logon TRIGGER needs administrator. Measured on the Windows 10
+        release desk (19045), 2026-09-06, from a genuinely non-elevated
+        process, on a machine with stock Task Scheduler ACLs
+        (`Authenticated Users:(CI)(W,Rc)`) and no policy set:
+
+            schtasks /create /sc once     ... SUCCESS
+            schtasks /create /sc onlogon  ... ERROR: Access is denied.
+            schtasks /create /sc onlogon /ru <user> ... Access is denied.
+
+        The comment that used to sit above the /create call said "/sc onlogon
+        needs no admin rights; a Windows service would". The first half was
+        wrong, and believing it was expensive because the failure was silent
+        and complete: install printed one line about a task it had not
+        registered, `blink status` said "Bridge not installed", no daemon
+        ever ran, and the panel sat on its standalone setup screen -- with
+        the board plugged in, driver installed and working. A customer
+        reported exactly that.
+
+        HKCU\\...\\Run is the account's own key, so no administrator is
+        involved, and it is what user-level programs have always started
+        from. It is the poorer mechanism -- there is no name to /end or /run,
+        so restart() has to start the launcher itself -- which is why it is
+        second rather than first.
+        """
+        _autostart_clear()
+        err = _autostart_set()
+        if err:
+            why = (refused.stderr or "").strip()[:60]
+            return (f"could not register a Scheduled Task ({why}), and could"
+                    f" not set it to start at logon either: {err}")
+        # Same reasoning as the task path: a daemon from an earlier install
+        # still holds the serial port and the single-instance lock, and
+        # nothing above has stopped it.
+        _kill_recorded_daemon()
+        _start_launcher()
+        if _confirm_running(self._is_running, tries=6):
+            return "running (starts when you log in)"
+        return ("set to start when you log in, but it is not running yet -- "
+                f"see {log_path()}")
 
     def _is_running(self) -> bool:
         """Is the bridge daemon alive? Asked of Windows, by pid.
@@ -909,7 +1043,14 @@ class _SchtasksBackend(_Backend):
         r = subprocess.run(["schtasks", "/run", "/tn", TASK_NAME],
                            capture_output=True, **update.ota.NO_WINDOW)
         if r.returncode != 0:
-            return "could not restart it"
+            # No task to trigger. If this install starts from the Run key
+            # instead, there is nothing wrong -- start the launcher directly,
+            # which is what that key would have done at the next logon.
+            # Without this, `blink update` on such an install replaces the
+            # binary and then leaves nothing running.
+            if not _autostart_present():
+                return "could not restart it"
+            _start_launcher()
         if _confirm_running(self._is_running, tries=6):
             return "restarted"
         # This is the `blink update` path: the .exe under the task was just
@@ -924,6 +1065,11 @@ class _SchtasksBackend(_Backend):
         subprocess.run(["schtasks", "/end", "/tn", TASK_NAME], capture_output=True, **update.ota.NO_WINDOW)
         subprocess.run(["schtasks", "/delete", "/f", "/tn", TASK_NAME],
                        capture_output=True, **update.ota.NO_WINDOW)
+        # Unconditionally, and without asking first: an install may have used
+        # either mechanism, uninstall does not know which, and a leftover Run
+        # entry would try to start a program that is about to be deleted on
+        # every logon for the rest of the machine's life.
+        _autostart_clear()
         _kill_recorded_daemon()
         _kill_by_path()
         return "removed"
@@ -931,8 +1077,14 @@ class _SchtasksBackend(_Backend):
     def status(self) -> str:
         r = subprocess.run(["schtasks", "/query", "/tn", TASK_NAME],
                            capture_output=True, **update.ota.NO_WINDOW)
-        return ("registered as a Scheduled Task" if r.returncode == 0
-                else "not installed")
+        if r.returncode == 0:
+            return "registered as a Scheduled Task"
+        # Not "not installed" until BOTH have been asked. Reporting the
+        # absence of the task as the absence of the bridge is what made this
+        # failure look like a missing install rather than a working one.
+        if _autostart_present():
+            return "registered to start when you log in"
+        return "not installed"
 
 
 class _SystemdBackend(_Backend):
