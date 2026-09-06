@@ -629,6 +629,75 @@ def test_a_living_pid_takes_the_suspension_back(state_dir, dead):
 
 
 @posix_only
+@pytest.mark.parametrize("order", [
+    ["closed.state", "open.state"],
+    ["open.state", "closed.state"],
+])
+def test_one_poll_gives_one_answer_whatever_order_the_directory_comes_back_in(
+        state_dir, dead, monkeypatch, order):
+    """The Linux failure, pinned so it cannot come back on either platform.
+
+    A fresh slot with a dead pid suspends trust; a slot with a live pid
+    restores it. Both were applied file by file in os.listdir order, so
+    whichever the kernel handed back LAST decided -- and it differs by
+    platform. On the Ubuntu desk listdir returned open.state then
+    closed.state and this came back False; macOS returns the other order and
+    the same code passed. Three tests here failed on Linux and nowhere else
+    for exactly this reason.
+
+    A live pid was present in this poll either way, so trust holds either
+    way.
+    """
+    write_session(state_dir, "closed", "PreToolUse", NOW - 3, pid=dead())
+    write_session(state_dir, "open", "PreToolUse", NOW - 300, pid=os.getpid())
+
+    real = os.listdir
+
+    def fixed(path):
+        entries = real(path)
+        if set(order) <= set(entries):
+            return order + [e for e in entries if e not in order]
+        return entries
+
+    monkeypatch.setattr(claude_state.os, "listdir", fixed)
+    provider(state_dir).poll(NOW)
+    assert claude_state.pid_liveness_trusted() is True
+
+
+@posix_only
+@pytest.mark.parametrize("order", [
+    ["fresh.state", "gone.state"],
+    ["gone.state", "fresh.state"],
+])
+def test_a_suspending_poll_keeps_every_session_whatever_the_order(
+        state_dir, dead, monkeypatch, order):
+    """The other half of the same bug, and the one that showed on the desk.
+
+    `fresh` suspends the feature; `gone` is what the feature would have
+    dropped. Read fresh-then-gone, the suspension is already in force and gone
+    is kept -- which is the documented fail-safe. Read the other way, gone was
+    judged while trust still held and vanished off the panel.
+
+    One poll cannot both trust pids and not trust them. It settles the
+    question first, so both sessions survive either way.
+    """
+    write_session(state_dir, "fresh", "PreToolUse", NOW - 3, pid=dead())
+    write_session(state_dir, "gone", "PreToolUse", NOW - 300, pid=dead())
+
+    real = os.listdir
+
+    def fixed(path):
+        entries = real(path)
+        if set(order) <= set(entries):
+            return order + [e for e in entries if e not in order]
+        return entries
+
+    monkeypatch.setattr(claude_state.os, "listdir", fixed)
+    assert provider(state_dir).poll(NOW)[0].n_sessions() == 2
+    assert claude_state.pid_liveness_trusted() is False
+
+
+@posix_only
 def test_the_explanation_is_printed_once_even_across_a_recovery(state_dir,
                                                                 dead, capsys):
     """A suspension that can come back can also happen again, and the poll is
@@ -639,10 +708,35 @@ def test_the_explanation_is_printed_once_even_across_a_recovery(state_dir,
     write_session(state_dir, "open", "PreToolUse", NOW - 300, pid=os.getpid())
     provider(state_dir).poll(NOW)
     assert claude_state.pid_liveness_trusted() is True
+
+    # That terminal closes -- its slot goes with it. Without this the
+    # directory would still hold a pid that resolves, and a poll that can
+    # SEE one is not allowed to doubt that pids resolve; the suspension
+    # below would never fire, and this test would be checking nothing.
+    (state_dir / "open.state").unlink()
+
     write_session(state_dir, "closed2", "PreToolUse", NOW - 3, pid=dead())
     provider(state_dir).poll(NOW)
     assert claude_state.pid_liveness_trusted() is False
     assert capsys.readouterr().err.count("pid liveness is DISABLED") == 1
+
+
+@posix_only
+def test_a_poll_that_can_see_a_living_pid_does_not_doubt_that_pids_resolve(
+        state_dir, dead):
+    """The rule that makes the order stop mattering, stated on its own.
+
+    The suspension doubts one thing: whether the pid a hook records names the
+    session's process on this machine. A slot in the same directory whose pid
+    resolves in this process table answers that in the strong direction, in
+    the same poll -- and a living pid was already documented to outrank a
+    suspension. All that changes is that it no longer has to be read second
+    to win.
+    """
+    write_session(state_dir, "open", "PreToolUse", NOW - 300, pid=os.getpid())
+    write_session(state_dir, "closed", "PreToolUse", NOW - 3, pid=dead())
+    provider(state_dir).poll(NOW)
+    assert claude_state.pid_liveness_trusted() is True
 
 
 @posix_only

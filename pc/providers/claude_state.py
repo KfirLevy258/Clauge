@@ -305,66 +305,135 @@ def _process_is_gone(pid):
     return False
 
 
+def _slot_age(payload, now_epoch):
+    """How long ago this slot was written, or None when it does not say.
+
+    The same validity gate _read_state applies, so the pass that settles trust
+    considers exactly the slots the pass that judges them will look at.
+    """
+    event = payload.get("event")
+    if not isinstance(event, str) or not event:
+        return None
+    try:
+        t = float(payload["t"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (T_EPOCH_MIN <= t <= T_EPOCH_MAX):
+        return None
+    return now_epoch - t
+
+
+def settle_pid_trust(slots, now_epoch):
+    """Decide ONCE PER POLL whether a pid still means anything.
+
+    This used to happen slot by slot, inside _pid_says_ended, which both read
+    the trust flag and wrote it: a slot whose pid resolves restored trust, and
+    a fresh slot whose pid is gone suspended it. Applied one file at a time in
+    os.listdir order, the answer came down to which file the kernel happened to
+    hand back last -- and it came down that way twice over, because a slot read
+    while trust still held was dropped and the same slot read a moment later
+    was kept.
+
+    It really does differ by platform. On the Ubuntu desk listdir returned
+    open.state then closed.state and pid_liveness_trusted() came back False
+    after a poll in which a live pid was present; macOS returns the other order
+    and the same code passed. That is the whole reason three tests in
+    tests/pc/test_state_machine.py failed on Linux and nowhere else. On a real
+    machine it is not only a test problem: a directory that lists the other way
+    round silently disables pid liveness, and sessions that end without
+    SessionEnd then linger the full ABANDONED_AFTER_S instead of dropping.
+
+    So the evidence is weighed across every slot first, and _pid_says_ended
+    only reads the result. Two kinds of evidence, and they are not equal:
+
+      - a pid out of this directory that resolves in this process table is the
+        premise holding, demonstrated. Nothing outranks it, and it already did
+        not (test_a_living_pid_takes_the_suspension_back) -- it merely had to
+        be read second to win;
+      - a slot written seconds ago whose pid is already gone is the premise in
+        doubt. It suspends, but only in a poll that saw no living pid at all.
+    """
+    global _pid_trusted, _pid_suspension_announced
+    if not _PID_LIVENESS_AVAILABLE:
+        return
+    doubt = None
+    for path, payload in slots:
+        pid = _slot_pid(payload)
+        if pid is None:
+            continue
+        if not _process_is_gone(pid):
+            _pid_trusted = True
+            return
+        if doubt is not None:
+            continue
+        age = _slot_age(payload, now_epoch)
+        # A stamp further into the future than any ordinary skew is not a
+        # measurement, so it is evidence of nothing -- see the note in
+        # _pid_says_ended. Ordinary skew still counts as fresh: a slot stamped
+        # three seconds ahead was written three seconds ago by a fast clock.
+        if age is not None and -FRESH_SLOT_S <= age <= FRESH_SLOT_S:
+            doubt = (pid, age, path)
+
+    if doubt is None or not _pid_trusted:
+        return
+    pid, age, path = doubt
+    _pid_trusted = False
+    if not _pid_suspension_announced:
+        _pid_suspension_announced = True
+        print(f"[claude] {path or 'a state slot'} was written"
+              f" {age:.0f}s ago but its pid {pid} is already gone:"
+              " that pid may not name the session's own process on this"
+              " machine, so pid liveness is DISABLED until one proves"
+              " live -- until then, sessions that end without SessionEnd"
+              f" drop out after {ABANDONED_AFTER_S:.0f}s as before",
+              file=sys.stderr)
+
+
 def _pid_says_ended(pid, age_s, slot_path=""):
-    """Whether the pid proves this session is over. Suspends on the absurd.
+    """Whether the pid proves this session is over.
+
+    Reads the trust flag and never writes it: whether a pid means anything is
+    settled once per poll, across every slot, by settle_pid_trust(). Deciding
+    it here made the answer depend on which file os.listdir handed back last.
 
     Returns False for every uncertain case, so the caller keeps whatever
     today's rules already decided.
     """
-    global _pid_trusted, _pid_suspension_announced
     if pid is None or not _PID_LIVENESS_AVAILABLE:
         return False
-    if not _process_is_gone(pid):
-        # A pid from this directory that resolves in this process table. That
-        # is the premise holding, demonstrated, so it also ends any earlier
-        # suspension -- the check is asked BEFORE the trust flag rather than
-        # after it precisely so this evidence can still be collected while
-        # suspended. One extra syscall per slot per poll, which is the same
-        # cost the trusted path already pays.
-        _pid_trusted = True
-        return False
     if not _pid_trusted:
+        return False
+    if not _process_is_gone(pid):
         return False
     if age_s < -FRESH_SLOT_S:
         # A stamp further into the future than any ordinary skew. derive_state
         # meets the same number and clamps it, because "how long since the
         # last event" has a sane answer for a session that is on screen; here
-        # it does not, and the two decisions below both need one. So neither
-        # is taken from it: no drop, because the session may well be alive,
-        # and no suspension, because a clock this wrong is not evidence about
-        # what a pid means. A slot with a broken clock takes today's rules,
-        # which is where every uncertain case in this function goes.
+        # it does not. So nothing is taken from it: no drop, because the
+        # session may well be alive. A slot with a broken clock takes today's
+        # rules, which is where every uncertain case in this function goes.
         #
         # It used to sail straight into the test below -- a negative number is
         # less than ten -- and one NTP step could disable pid liveness for the
         # life of a daemon that runs for weeks.
         return False
     if age_s <= FRESH_SLOT_S:
-        # Written seconds ago BY A PROCESS THAT DOES NOT EXIST -- and
-        # ordinary skew lands here on purpose, because a slot stamped three
-        # seconds ahead was still written three seconds ago, by a clock that
-        # is ahead. Refusing to call that fresh would send it to the drop
-        # below, which is the one thing this feature must never do to a live
-        # session.
+        # Written seconds ago BY A PROCESS THAT DOES NOT EXIST -- and ordinary
+        # skew lands here on purpose, because a slot stamped three seconds
+        # ahead was still written three seconds ago, by a clock that is ahead.
+        # Refusing to call that fresh would send it to the drop below, which
+        # is the one thing this feature must never do to a live session.
         #
-        # Three things look like this and only one of them is ordinary, so
-        # the message no longer picks one: the hook's pid may be a wrapper
-        # the session outlives, the pid may belong to another namespace (a
-        # bind-mounted ~/.blink), or the session may simply have been closed
-        # inside FRESH_SLOT_S of its last event, which fires no SessionEnd.
-        # Suspend, keep the session, and let a living pid settle it later.
-        _pid_trusted = False
-        if not _pid_suspension_announced:
-            _pid_suspension_announced = True
-            print(f"[claude] {slot_path or 'a state slot'} was written"
-                  f" {age_s:.0f}s ago but its pid {pid} is already gone:"
-                  " that pid may not name the session's own process on this"
-                  " machine, so pid liveness is DISABLED until one proves"
-                  " live -- until then, sessions that end without SessionEnd"
-                  f" drop out after {ABANDONED_AFTER_S:.0f}s as before",
-                  file=sys.stderr)
+        # Three things look like this and only one of them is ordinary: the
+        # hook's pid may be a wrapper the session outlives, the pid may belong
+        # to another namespace (a bind-mounted ~/.blink), or the session may
+        # simply have been closed inside FRESH_SLOT_S of its last event, which
+        # fires no SessionEnd. Keep the session either way. Whether this also
+        # suspends the feature is settle_pid_trust's call, not this one's --
+        # it is the only caller that can see the whole directory at once.
         return False
     return True
+
 
 _RUNNING_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse",
                    "SubagentStop", "PreCompact", "PostCompact")
@@ -468,14 +537,29 @@ class ClaudeStateProvider(base.ProviderParser):
 
     # --- one session ------------------------------------------------------
 
-    def _read_state(self, path, now_epoch):
-        """(state, age, name) for one session's slot, or (None, None, "")."""
+    @staticmethod
+    def _load_slot(path):
+        """One slot's payload, or None when there is nothing usable in it.
+
+        Split out of _read_state so session_states can read the directory once
+        and then walk it twice -- see settle_pid_trust.
+        """
         try:
             with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
         except (OSError, ValueError):
-            return None, None, ""
-        if not isinstance(payload, dict):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _read_state(self, path, now_epoch, payload=None):
+        """(state, age, name) for one session's slot, or (None, None, "").
+
+        Whether a pid means anything has already been settled for this poll,
+        across every slot, by settle_pid_trust -- see the note there.
+        """
+        if payload is None:
+            payload = self._load_slot(path)
+        if payload is None:
             return None, None, ""
         event = payload.get("event")
         if not isinstance(event, str) or not event:
@@ -617,15 +701,26 @@ class ClaudeStateProvider(base.ProviderParser):
         # one hook firing anyway.
         self.ended_sessions(now_epoch)
 
-        states = {}
-        agents = 0
+        # Read every slot first, settle the pid question across all of them,
+        # and only then judge each one. Deciding it slot by slot made the
+        # answer depend on the order os.listdir returns, which differs between
+        # macOS and Linux -- see settle_pid_trust.
+        slots = []
         for name in entries:
             if not name.endswith(".state"):
                 continue
+            path = os.path.join(self._dir, name)
+            slots.append((name, path, self._load_slot(path)))
+        settle_pid_trust([(p, pl) for _, p, pl in slots if pl is not None],
+                         now_epoch)
+
+        states = {}
+        agents = 0
+        for name, state_path, payload in slots:
             sid = name[: -len(".state")]
-            state_path = os.path.join(self._dir, name)
             marker_path = os.path.join(self._dir, sid + WAITING_MARKER_SUFFIX)
-            state, age, sess_name = self._read_state(state_path, now_epoch)
+            state, age, sess_name = self._read_state(state_path, now_epoch,
+                                                     payload)
 
             if state is None or state == base.STATE_UNKNOWN:
                 # Unreadable, or so old the session is certainly gone. Collect
