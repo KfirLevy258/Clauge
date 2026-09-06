@@ -115,20 +115,26 @@ fi
 # read the comment at the top of it before wondering why this is not
 # downloaded here. A build without it is supported and is what every machine
 # produces by default: pc/win_driver.py finds no package and says so.
-# A RELATIVE path, unlike every other --add-data here, and it has to be.
+# A native C:\... path and a ";" separator, unlike every other --add-data
+# here. Both were arrived at the hard way on the release desk (2026-09-06):
 #
-# Git Bash rewrites arguments that look like paths on their way to a native
-# program, and an absolute one here came out as \c\Users\...\vendor\ch341ser
-# -- slashes flipped, drive letter never mapped -- so PyInstaller reported
-# "Unable to find" and the build died (measured on the release desk,
-# 2026-09-06). A path with no leading slash and no drive in it has nothing to
-# rewrite. The pyinstaller call below runs from $ROOT, which is what makes it
-# resolve.
+#   - Handing Git Bash the /c/Users/... form produced
+#     \c\Users\...\vendor\ch341ser -- slashes flipped, drive letter never
+#     mapped. It rewrites arguments that look like paths on their way to a
+#     native program, and gets this one wrong. A path already beginning
+#     "C:\" is left alone, which is what cygpath is for.
+#   - Making it relative instead did not help: PyInstaller resolves a
+#     relative source against the SPEC directory, which --specpath puts in
+#     $BUILD, not against the working directory.
+#
+# The lines above survive on ":" only because their destination is "." --
+# enough for Git Bash to recognise a path list and map the drive properly.
 case "$(uname -s)" in
 MINGW* | MSYS* | CYGWIN*)
 	if [ -f "$ROOT/vendor/ch341ser/ch341ser.inf" ]; then
-		set -- "$@" --add-data "vendor/ch341ser:drivers/ch341ser"
-		echo "bundling the CH340 driver from $ROOT/vendor/ch341ser"
+		DRIVER_WIN=$(cygpath -w "$ROOT/vendor/ch341ser")
+		set -- "$@" --add-data "${DRIVER_WIN};drivers/ch341ser"
+		echo "bundling the CH340 driver from $DRIVER_WIN"
 	else
 		echo "no CH340 driver staged; this build will tell customers to"
 		echo "  install it by hand (tools/fetch_ch340_driver.sh)"
