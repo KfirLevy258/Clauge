@@ -27,14 +27,16 @@ has_claude_desktop = true
 [hosts.kfir-ubuntu]
 ssh = "kfir@kfir-macbook"   # Apple hardware, Ubuntu 26 on it
 os = "linux"
-board = "claude"            # VERIFY before the run: this desk may hold codex
+# Confirmed by a passing four-scenario run on 2026-09-07.
+board = "claude"
 # System python 3.14.4, which already has pyserial 3.5 and pytest 9.0.3.
 python = "/usr/bin/python3"
 workdir = "~/blink-fleet"
 has_claude_desktop = false
-# Known: this desk's user is not in the `dialout` group, so /dev/ttyUSB0
-# (crw-rw---- root dialout) is refused with PermissionError 13 and every
-# scenario fails on a healthy board. Fix on that machine, once:
+# The dialout problem this file used to warn about is FIXED: `id -nG` on that
+# desk lists dialout, and a full four-scenario run passed there on 2026-09-07.
+# If it ever comes back, /dev/ttyUSB0 (crw-rw---- root dialout) is refused with
+# PermissionError 13 and every scenario fails on a healthy board:
 #     sudo usermod -aG dialout kfir   # then log out and back in
 
 [hosts.galit-win10]
