@@ -165,9 +165,27 @@ else
 fi
 
 MCUBOOT="$BUILD/mcuboot/zephyr/zephyr.bin"
-APP="$BUILD/firmware/zephyr/zephyr.signed.bin"
+SIGNED="$BUILD/firmware/zephyr/zephyr.signed.bin"
 [ -f "$MCUBOOT" ] || die "no bootloader at $MCUBOOT"
-[ -f "$APP" ]     || die "no signed app at $APP"
+[ -f "$SIGNED" ]  || die "no signed app at $SIGNED"
+
+# ------------------------------------------- 2a. a CONFIRMED image to flash
+# zephyr.signed.bin is signed but not confirmed: its trailer says "boot this
+# once". Right for OTA -- it lands in slot 1 and main.c confirms it once the
+# image proves itself. Wrong here: a board on the bench has no daemon and no
+# network, never becomes healthy, and reverts at 90 s.
+#
+# On a blank unit that is invisible, because there is nothing to revert TO.
+# On a re-burn it silently undoes the flash minutes after this script printed
+# PASS, and the board looks like it is crash-looping. Measured 2026-09-06:
+# the burn said "booted: fw 1.3.0" and the board served 1.2.5 shortly after.
+say "Signing a confirmed image for direct flashing"
+APP="$BUILD/firmware/zephyr/zephyr.confirmed.bin"
+rm -f "$APP"
+"$PY" "$ROOT/tools/sign_confirmed.py" --build-dir "$BUILD" --out "$APP" \
+	|| die "could not sign a confirmed image. Flashing the unconfirmed one
+       would produce a unit that reverts 90 s after this script says PASS."
+[ -f "$APP" ] || die "sign_confirmed.py reported success but wrote no $APP"
 # The version this tree builds, so the boot check below can insist the unit
 # is running THIS image and not whatever was on it before. With --no-build
 # against a stale build directory the two can differ, and a stamp on the

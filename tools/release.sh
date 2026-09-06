@@ -100,6 +100,19 @@ SHA=$(shasum -a 256 "$BIN" | cut -d' ' -f1)
 SLOT=$((0x150000))
 [ "$SIZE" -le "$SLOT" ] || { echo "FATAL: image $SIZE > slot $SLOT"; exit 1; }
 
+# The OTA artifact must stay UNCONFIRMED -- the opposite of what the factory
+# scripts flash (tools/sign_confirmed.py). It lands in slot 1, boots once, and
+# firmware/src/main.c confirms it only after WiFi+TLS or the daemon proves the
+# image works. A pre-confirmed artifact would take that safety net away: a bad
+# release would then be permanent on every board that accepted it, with no
+# revert. The size check above already catches --pad, which pads to the full
+# slot -- this names the reason, so nobody "fixes" it by padding here too.
+[ "$SIZE" -lt "$SLOT" ] || {
+	echo "FATAL: $BIN is exactly the slot size -- it looks padded, and a"
+	echo "       padded image carries a trailer. The OTA artifact must be"
+	echo "       neither padded nor confirmed. See tools/sign_confirmed.py."
+	exit 1; }
+
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 cp "$BIN" "$TMP/blink-fw.bin"
 

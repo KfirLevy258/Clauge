@@ -31,8 +31,17 @@ mkdir -p "$WORK/bin" "$WORK/build/mcuboot/zephyr" "$WORK/build/firmware/zephyr" 
 
 cp "$ROOT/tests/ci/fakes/bin/"* "$WORK/bin/"
 head -c 20000 /dev/zero | tr '\0' 'M' >"$WORK/build/mcuboot/zephyr/zephyr.bin"
+head -c 90000 /dev/zero | tr '\0' 'A' >"$WORK/build/firmware/zephyr/zephyr.bin"
 head -c 90000 /dev/zero | tr '\0' 'A' >"$WORK/build/firmware/zephyr/zephyr.signed.bin"
 head -c 32 /dev/zero >"$WORK/home/flash_key.bin"
+
+# tools/sign_confirmed.py reads the signing parameters out of the build's own
+# build.ninja rather than hard-coding them, so the fake build needs one. The
+# slot is small here only to keep the padded image quick to write.
+mkdir -p "$WORK/build/firmware"
+cat >"$WORK/build/firmware/build.ninja" <<NINJA
+  POST_BUILD = cd $WORK && $PY $WORK/bin/imgtool.py sign --version 9.9.9 --header-size 0x20 --slot-size 131072 --align 32 --key $WORK/home/signing.pem $WORK/build/firmware/zephyr/zephyr.bin $WORK/build/firmware/zephyr/zephyr.signed.bin
+NINJA
 
 FW=$(sed -n 's/^#define BLINK_FW_VERSION "\(.*\)"$/\1/p' "$ROOT/firmware/src/version.h")
 [ -n "$FW" ] || fail "cannot read BLINK_FW_VERSION"
@@ -126,7 +135,12 @@ run 0 "$BURN" --edition claude --port $PORT --no-build
 saw "PASS -- this unit is a claude board (individual)"
 saw "logo partition erased"
 called "esptool .*erase_region 0x330000 0x80000"
-called "esptool .*write_flash 0x1000 $WORK/build/mcuboot/zephyr/zephyr.bin 0x20000 $WORK/build/firmware/zephyr/zephyr.signed.bin\$"
+called "esptool .*write_flash 0x1000 $WORK/build/mcuboot/zephyr/zephyr.bin 0x20000 $WORK/build/firmware/zephyr/zephyr.confirmed.bin\$"
+# The CONFIRMED image, never the OTA artifact. zephyr.signed.bin boots once
+# and reverts at 90 s on a bench board, which undoes the burn minutes after
+# this script says PASS.
+never "write_flash.*zephyr.signed.bin"
+called "imgtool sign .*--pad --confirm "
 never "write_flash.*0x330000"
 called 'host -> {"t": "edition", "v": 2, "edition": "claude"}'
 # The erase comes BEFORE the firmware is written: a failure there must stop
@@ -183,6 +197,19 @@ run 1 "$BURN" --edition claude --port $PORT --no-build
 saw "the flash did not take, or the build directory is stale"
 ok "a stale build directory cannot stamp a unit"
 
+echo "== burn.sh: an image that comes back unconfirmed"
+# The one byte this whole path turns on. If --confirm ever stops taking, the
+# only symptom in the field is a board that reverts 90 s after a burn that
+# said PASS -- so the burn has to refuse the image rather than write it.
+board claude none
+export FAKE_BOARD_EDITION_REPLY='[cfg] edition stamped as claude'
+export FAKE_IMGTOOL_NO_CONFIRM=1
+run 1 "$BURN" --edition claude --port $PORT --no-build
+unset FAKE_IMGTOOL_NO_CONFIRM
+saw "image_ok unset"
+never "esptool.*write_flash"
+ok "refuses to flash an image whose trailer is not confirmed"
+
 echo "== burn.sh: a flash that dies mid-way"
 board claude none
 export FAKE_ESPTOOL_FAIL=write_flash
@@ -200,7 +227,8 @@ export FAKE_EFUSE_BITS=0000001
 run 0 "$ENC" --logo "$WORK/acme.bin" $PORT
 saw "with the company logo"
 called "espsecure .*--address 0x1000 "
-called "espsecure .*--address 0x20000 "
+called "espsecure .*--address 0x20000 .*zephyr.confirmed.bin"
+never "espsecure .*zephyr.signed.bin"
 called "espsecure .*--address 0x330000 "
 called "write_flash 0x1000 .*mcuboot.enc 0x20000 .*app.enc 0x330000 .*logo.enc"
 run 0 "$ENC" $PORT

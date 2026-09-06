@@ -97,10 +97,23 @@ enc() { # address, plaintext-in, encrypted-out
 		--flash_crypt_conf 0xf --address "$1" -o "$3" "$2"
 }
 
+# A CONFIRMED image, not zephyr.signed.bin. The signed artifact's trailer says
+# "boot this once" -- correct for OTA, where main.c confirms the image after it
+# proves itself, and wrong for a direct flash, where the board has no daemon and
+# no network at the bench, never becomes healthy, and reverts at 90 s. See
+# tools/sign_confirmed.py.
+APP_CONFIRMED="$BUILD/firmware/zephyr/zephyr.confirmed.bin"
+rm -f "$APP_CONFIRMED"
+"${BLINK_PYTHON:-python3}" "$HERE/sign_confirmed.py" \
+	--build-dir "$BUILD" --out "$APP_CONFIRMED" || {
+	echo "FATAL: could not sign a confirmed image. Flashing the unconfirmed" >&2
+	echo "       one produces a unit that reverts 90 s after it boots." >&2
+	exit 1; }
+
 # Offsets match the sysbuild runners: MCUboot at 0x1000, signed app in slot0
 # at 0x20000. The address is part of the cipher tweak -- never shuffle these.
-enc 0x1000  "$BUILD/mcuboot/zephyr/zephyr.bin"         "$TMP/mcuboot.enc"
-enc 0x20000 "$BUILD/firmware/zephyr/zephyr.signed.bin" "$TMP/app.enc"
+enc 0x1000  "$BUILD/mcuboot/zephyr/zephyr.bin" "$TMP/mcuboot.enc"
+enc 0x20000 "$APP_CONFIRMED"                   "$TMP/app.enc"
 
 # 115200: 921600 fails on this CH340.
 if [ -n "$LOGO" ]; then
