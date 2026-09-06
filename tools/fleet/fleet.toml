@@ -16,7 +16,11 @@
 [hosts.local-mac]
 ssh = ""                    # empty = run here, with no ssh at all
 os = "darwin"
-board = "claude"            # VERIFY before the run: which board is here
+# Measured 2026-09-07, not assumed: board 20500d342b68 on this desk is stamped
+# CODEX -- tools/burn.sh refused `--edition claude` against it, which is the
+# edition latch doing its job. The file said claude, and every scenario here
+# would have failed for the wrong reason.
+board = "codex"
 # Relative paths are resolved against this checkout, not the workdir. The
 # fleet venv is the only interpreter on this Mac that has pyserial, and it is
 # gitignored, so it is not inside the snapshot that gets pushed.
