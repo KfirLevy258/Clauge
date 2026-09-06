@@ -249,6 +249,19 @@ def summary(undriven):
     return f"{what} plugged in, but {undriven[0].note}"
 
 
+def as_sentence(text):
+    """`text` with its first letter raised, for a caller that starts a line.
+
+    NOT str.capitalize(), which lower-cases everything after the first
+    character and turned "Windows has no driver for it" into "windows has no
+    driver for it" on the release desk -- a mangled brand name in the first
+    sentence a customer with a broken board ever reads.
+    """
+    if not text:
+        return ""
+    return text[0].upper() + text[1:]
+
+
 def advice(undriven, blink_cmd="blink"):
     """What to do about it: zero or one line, unindented.
 

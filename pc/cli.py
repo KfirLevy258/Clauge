@@ -1347,7 +1347,7 @@ def cmd_driver(_args) -> int:
 
     undriven = win_driver.undriven_boards()
     if undriven:
-        print(win_driver.summary(undriven).capitalize() + ".")
+        print(win_driver.as_sentence(win_driver.summary(undriven)) + ".")
     print("USB driver ... ", end="", flush=True)
     # Forced only when a board is sitting there undriven. Being told "already
     # installed" is the correct answer on a healthy machine, and the wrong

@@ -179,6 +179,16 @@ class TestSummaryAndAdvice:
         assert win_driver.summary([undriven(), undriven()]).startswith(
             "2 boards are")
 
+    def test_starting_a_sentence_does_not_mangle_the_brand(self):
+        # str.capitalize() lower-cases the rest, and printed "windows has no
+        # driver for it" to the release desk -- in the first sentence a
+        # customer with a broken board ever reads.
+        assert (win_driver.as_sentence(win_driver.summary([undriven()]))
+                == "A board is plugged in, but Windows has no driver for it")
+
+    def test_an_empty_summary_stays_empty(self):
+        assert win_driver.as_sentence("") == ""
+
     def test_a_missing_driver_is_pointed_at_the_command_that_fixes_it(self):
         assert win_driver.advice([undriven()], "blink") == [
             "run `blink driver` to install it"]
