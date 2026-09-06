@@ -61,6 +61,36 @@ USAGE = ("usage: python3 -m pc.fleet_gate"
          " <.fleet/last_run.json> <head sha> <tools/fleet/fleet.toml>")
 
 
+# git's own floor for an abbreviated sha. Shorter than this is not a commit
+# name, it is a coincidence waiting to happen.
+MIN_ABBREV = 7
+
+
+def _same_commit(recorded, head):
+    """Whether the run's commit and the commit being tagged are the same one.
+
+    Deliberately ASYMMETRIC, because the two sides are different kinds of
+    evidence.
+
+    `recorded` comes out of .fleet/last_run.json, which only run.py writes,
+    and run.py writes `git rev-parse HEAD` -- a full sha, always. A short one
+    there means the file was edited by hand, and a hand-edited verdict is not
+    a verdict. That stays refused, which is what
+    test_an_abbreviation_of_the_right_commit_refuses is for.
+
+    `head` is an argument. release.sh passes a full sha; a person checking the
+    gate by hand pastes whatever `git log --oneline` gave them. Refusing that
+    printed "run is for commit 8b56c99fcd..., HEAD is 8b56c99" -- two strings
+    that read as identical -- and accused the desks of proving other code,
+    which is the one thing they were not doing.
+    """
+    a, b = recorded.lower(), head.lower()
+    if a == b:
+        return True
+    # Only the argument may be short, and only down to git's own floor.
+    return (len(b) >= MIN_ABBREV and len(b) < len(a) and a.startswith(b))
+
+
 def _names(value):
     """A comma-separated rendering of whatever run.py recorded."""
     if isinstance(value, (list, tuple)):
@@ -190,7 +220,7 @@ def gate(path, head_sha, inventory_path, now=time.time, max_age_s=MAX_AGE_S):
                 f" (sha = {recorded!r}), so nothing ties it to the code being"
                 f" released. Run the fleet again from this checkout.")
     recorded = recorded.strip()
-    if recorded.lower() != head.lower():
+    if not _same_commit(recorded, head):
         return (f"The fleet run is for commit {recorded}, HEAD is {head}."
                 f" The desks proved other code than the code being tagged."
                 f" Run the fleet on this commit.")

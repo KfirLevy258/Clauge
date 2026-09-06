@@ -172,7 +172,31 @@ def test_wrong_commit_refuses(tmp_path):
 
 
 def test_an_abbreviation_of_the_right_commit_refuses(tmp_path):
+    """In the FILE. run.py writes `git rev-parse HEAD`, which is never short,
+    so a short one there means the verdict was edited by hand."""
     assert "commit" in _refuse(tmp_path, sha=SHA[:12])
+
+
+def test_an_abbreviated_head_argument_is_the_same_commit(tmp_path):
+    """On the ARGUMENT, though, it is just how a person pastes a sha.
+
+    release.sh passes a full one. A person checking the gate by hand pastes
+    what `git log --oneline` gave them, and refusing that printed two strings
+    that read as identical -- "run is for commit 8b56c99fcd..., HEAD is
+    8b56c99" -- while accusing the desks of proving other code.
+    """
+    assert gate(_state(tmp_path), SHA[:7], _inventory(tmp_path),
+                now=lambda: 2000.0) is None
+    assert gate(_state(tmp_path), SHA[:12], _inventory(tmp_path),
+                now=lambda: 2000.0) is None
+
+
+@pytest.mark.parametrize("head", ["a" * 7, SHA[:6], SHA[:3]])
+def test_a_head_argument_too_short_or_wrong_still_refuses(tmp_path, head):
+    """Below git's own floor it is not an abbreviation, it is a coincidence
+    waiting to happen -- and a prefix of the wrong commit is still wrong."""
+    assert gate(_state(tmp_path), head, _inventory(tmp_path),
+                now=lambda: 2000.0) is not None
 
 
 @pytest.mark.parametrize("value", [None, "", "unknown", 12, ["abc"]])
