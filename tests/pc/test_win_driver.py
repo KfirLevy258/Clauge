@@ -246,8 +246,18 @@ class TestDetectionNeverThrows:
         assert win_driver.undriven_boards() == []
 
     def test_pnputil_being_absent_is_an_unknown_not_a_crash(self, monkeypatch):
+        # Both sources gone: the store directory unlistable AND pnputil
+        # missing. The directory has to be taken away explicitly -- on
+        # Windows it is genuinely there and genuinely readable, so without
+        # this the test passed for the wrong reason everywhere else and
+        # failed on the one platform the code runs on (caught on the release
+        # desk, 2026-09-06).
+        def no_dir(p):
+            raise PermissionError(p)
+
         def boom(*a, **k):
             raise FileNotFoundError("pnputil")
+        monkeypatch.setattr(os, "listdir", no_dir)
         monkeypatch.setattr(subprocess, "run", boom)
         assert win_driver.driver_in_store() is None
 
@@ -269,6 +279,28 @@ class TestTheBundledPackage:
         monkeypatch.setattr(win_driver, "_bundle_roots",
                             lambda: iter([str(tmp_path)]))
         assert win_driver.driver_package() == str(staged / win_driver.INF_NAME)
+
+    def test_the_capitals_wch_actually_ships_are_found(self, monkeypatch,
+                                                       tmp_path):
+        # The real package is CH341SER.INF, and it stays in capitals through
+        # the Windows driver store -- which is where the release build's copy
+        # is taken from.
+        staged = tmp_path / "drivers" / "ch341ser"
+        staged.mkdir(parents=True)
+        (staged / "CH341SER.INF").write_text("[Version]\n")
+        monkeypatch.setattr(win_driver, "_bundle_roots",
+                            lambda: iter([str(tmp_path)]))
+        assert win_driver.driver_package() == str(staged / "CH341SER.INF")
+
+    def test_a_directory_with_no_inf_is_not_a_package(self, monkeypatch,
+                                                      tmp_path):
+        staged = tmp_path / "drivers" / "ch341ser"
+        staged.mkdir(parents=True)
+        (staged / "CH341S64.SYS").write_text("")
+        monkeypatch.setattr(win_driver, "_bundle_roots",
+                            lambda: iter([str(tmp_path)]))
+        monkeypatch.setattr(win_driver, "VENDOR_SUBDIR", ("nowhere",))
+        assert win_driver.driver_package() is None
 
 
 class TestInstallSteps:

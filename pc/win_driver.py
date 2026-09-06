@@ -376,12 +376,31 @@ def driver_package():
     produces until tools/fetch_ch340_driver.sh has been run.
     """
     for base in _bundle_roots():
-        inf = os.path.join(base, *BUNDLE_SUBDIR, INF_NAME)
-        if os.path.exists(inf):
+        inf = _inf_in(os.path.join(base, *BUNDLE_SUBDIR))
+        if inf:
             return inf
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    inf = os.path.join(repo, *VENDOR_SUBDIR, INF_NAME)
-    return inf if os.path.exists(inf) else None
+    return _inf_in(os.path.join(repo, *VENDOR_SUBDIR))
+
+
+def _inf_in(directory):
+    """The package's .inf inside `directory`, whatever case it is written in.
+
+    WCH ships the file as CH341SER.INF, in capitals, and it stays in capitals
+    through the driver store. Windows would not care -- its paths are
+    case-insensitive -- but matching by listing rather than by os.path.exists
+    means the same code finds it if a copy ever arrives through something
+    that is case-sensitive, which is every archive tool and every checkout on
+    the two platforms this is cross-built from.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for name in names:
+        if name.lower() == INF_NAME:
+            return os.path.join(directory, name)
+    return None
 
 
 def _bundle_roots():
