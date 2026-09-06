@@ -15,6 +15,7 @@ no-opping in turn, so nothing is left broken to diagnose from afterwards.
 import json
 import os
 import types
+from pathlib import Path
 
 import pytest
 
@@ -893,18 +894,48 @@ def test_a_json_name_that_climbs_out_of_the_work_root_deletes_nothing(
         "a scenario reached outside the work root and deleted a sibling")
 
 
-def test_a_filename_that_is_not_a_usable_directory_name_is_refused(tmp_path):
-    """`...json` has the stem `..`, so even the filename needs vetting.
+# "." and ".." are absent on purpose: no filesystem will hold a file by those
+# names, so a scenario can never arrive as one. The guard still refuses them
+# for a caller passing a bare path string, which is what the stem check is.
+@pytest.mark.parametrize("filename", ["...json", "..json", "....json", "..."])
+def test_a_filename_that_is_not_a_usable_directory_name_is_refused(
+        tmp_path, filename):
+    """Even the FILENAME needs vetting, because the stem becomes a directory
+    that _fresh_work rmtrees.
 
-    Refused where the other unusable names are, before the service is
-    stopped -- and refused again at the delete itself, for a caller that
-    never went through select_scenarios.
+    Stated as the invariant rather than as one interpreter's parsing, because
+    pathlib's is not stable across versions. On 3.12 `...json` has the stem
+    `..` -- a traversal wearing a filename. On 3.14 leading dots stopped being
+    suffix separators, so the same name has the stem `...json`, which is an
+    odd directory name and a perfectly safe one. Asserting the 3.12 answer
+    failed on the Ubuntu desk against code that was never wrong.
+
+    So: for every hostile name, either it is refused, or the stem it yields
+    is a plain name that cannot reach outside the work root. That holds on
+    both, and would still hold if pathlib changed again.
     """
-    path = _scenario_file(tmp_path, "...json", "climber")
-    with pytest.raises(ValueError, match=r"\.\."):
-        agent.select_scenarios(path.parent)
-    with pytest.raises(ValueError):
-        agent.run_scenario(path, "claude", tmp_path / "w", "auto", _deps())
+    path = _scenario_file(tmp_path, filename, "climber")
+    stem = Path(filename).stem
+    dangerous = (not stem or stem in (".", "..")
+                 or any(c in stem for c in "/\\"))
+
+    if dangerous:
+        with pytest.raises(ValueError):
+            agent.select_scenarios(path.parent)
+        # Again at the delete itself, for a caller that never went through
+        # select_scenarios.
+        with pytest.raises(ValueError):
+            agent.run_scenario(path, "claude", tmp_path / "w", "auto", _deps())
+        return
+
+    # Not dangerous on this interpreter -- but only because of what pathlib
+    # made of it, so say what makes it safe rather than merely passing.
+    assert ".." not in Path(stem).parts, stem
+    assert not os.path.isabs(stem), stem
+    work = tmp_path / "w"
+    agent.run_scenario(path, "claude", work, "auto", _deps())
+    assert (work / stem).resolve().is_relative_to(work.resolve()), (
+        f"{filename!r} produced a work directory outside the work root")
 
 
 # --- the results file -------------------------------------------------

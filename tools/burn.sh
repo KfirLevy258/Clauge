@@ -100,11 +100,28 @@ DAEMON_WAS_UP=0
 if launchctl print "$AGENT" >/dev/null 2>&1; then
 	DAEMON_WAS_UP=1
 	launchctl bootout "$AGENT" >/dev/null 2>&1 || true
+	# bootout RETURNS before the process is gone, and the process holds the
+	# port until it is. Probing straight afterwards read as "cannot tell
+	# whether this chip is fused -- is the port free?" and refused to flash
+	# a board that was perfectly fine (2026-09-06, this desk). Wait for the
+	# job to actually leave rather than racing it.
+	i=0
+	while [ $i -lt 20 ] && launchctl print "$AGENT" >/dev/null 2>&1; do
+		i=$((i + 1))
+		sleep 0.25
+	done
 fi
 restore_daemon() {
 	[ "$DAEMON_WAS_UP" = 1 ] || return 0
 	launchctl bootstrap "gui/$(id -u)" \
 		"$HOME/Library/LaunchAgents/com.blink.bridge.plist" >/dev/null 2>&1 || true
+	# BOOTSTRAP REGISTERS; IT DOES NOT START. RunAtLoad is honoured at login,
+	# not on a bootstrap, so this left the desk with no daemon at all until
+	# the next login -- the board silently unattended after a burn that
+	# printed PASS. Measured five times out of five on the install path
+	# (pc/cli.py _LaunchdBackend.install, 2026-09-04); this is the same
+	# defect in the same shape, and it bit here on 2026-09-06.
+	launchctl kickstart -k "$AGENT" >/dev/null 2>&1 || true
 }
 # EXIT restores; INT/TERM restore AND EXIT. A trap that only restored let a
 # Ctrl-C mid-flash carry straight on to the stamp step, with the daemon just
