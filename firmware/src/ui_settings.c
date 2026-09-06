@@ -32,6 +32,7 @@
 #include "backlight.h"
 #include "ota.h"
 #include "proto.h"
+#include "upd_row.h"
 #include "usage_view.h"
 
 #define COL_BG		lv_color_hex(0x0E1116)
@@ -774,6 +775,35 @@ static void dl_overlay_show(const struct ota_ui *snap, bool rebooting)
 	}
 }
 
+/* Paint one of upd_row.h's answers. The words and the colour live together
+ * so a state cannot pick up the wrong pairing -- which is how "Up to date"
+ * came to be drawn in green over an app that was a release behind. The label
+ * budget is ~13 characters (see OTA_UI_AVAILABLE below). */
+static void set_upd_row(lv_obj_t *lbl, enum upd_row row)
+{
+	switch (row) {
+	case UPD_ROW_READY:
+		lv_label_set_text(lbl, "Update ready");
+		lv_obj_set_style_text_color(lbl, COL_GREEN, 0);
+		break;
+	case UPD_ROW_APP_OLD:
+		/* Amber, not red: nothing is broken, the figures keep
+		 * flowing. It is the one thing this screen cannot fix. */
+		lv_label_set_text(lbl, "App is old");
+		lv_obj_set_style_text_color(lbl, COL_AMBER, 0);
+		break;
+	case UPD_ROW_UP_TO_DATE:
+		lv_label_set_text(lbl, "Up to date");
+		lv_obj_set_style_text_color(lbl, COL_GREEN, 0);
+		break;
+	case UPD_ROW_BLANK:
+	default:
+		lv_label_set_text(lbl, "");
+		lv_obj_set_style_text_color(lbl, COL_DIM, 0);
+		break;
+	}
+}
+
 static void upd_timer_cb(lv_timer_t *t)
 {
 	ARG_UNUSED(t);
@@ -875,16 +905,8 @@ static void upd_timer_cb(lv_timer_t *t)
 		 * be reached from this screen at all, so this is the only place
 		 * it can be said. Amber, not green -- nothing is broken.
 		 * Budget is ~13 characters (see OTA_UI_AVAILABLE below). */
-		if (ota_badge()) {
-			lv_label_set_text(upd_lbl, "Update ready");
-			lv_obj_set_style_text_color(upd_lbl, COL_GREEN, 0);
-		} else if (proto_host_outdated()) {
-			lv_label_set_text(upd_lbl, "App is old");
-			lv_obj_set_style_text_color(upd_lbl, COL_AMBER, 0);
-		} else {
-			lv_label_set_text(upd_lbl, "");
-			lv_obj_set_style_text_color(upd_lbl, COL_DIM, 0);
-		}
+		set_upd_row(upd_lbl, upd_row_idle(ota_badge(),
+						  proto_host_outdated()));
 		lv_obj_clear_state(upd_btn, LV_STATE_DISABLED);
 		break;
 	case OTA_UI_CHECKING:
@@ -893,8 +915,11 @@ static void upd_timer_cb(lv_timer_t *t)
 		lv_obj_add_state(upd_btn, LV_STATE_DISABLED);
 		break;
 	case OTA_UI_UP_TO_DATE:
-		lv_label_set_text(upd_lbl, "Up to date");
-		lv_obj_set_style_text_color(upd_lbl, COL_GREEN, 0);
+		/* "No newer firmware" is not "this product is current". See
+		 * upd_row.h: saying so in green over an app a release behind
+		 * is what sent a customer round in a circle -- the row said
+		 * the app was old, the tap said everything was fine. */
+		set_upd_row(upd_lbl, upd_row_checked(proto_host_outdated()));
 		lv_obj_clear_state(upd_btn, LV_STATE_DISABLED);
 		break;
 	case OTA_UI_AVAILABLE:

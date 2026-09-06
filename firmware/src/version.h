@@ -3,7 +3,7 @@
 
 /* One source of truth: the serial hello and the settings panel must never
  * disagree about what is flashed. Bump on any user-visible change. */
-#define BLINK_FW_VERSION "1.3.0"
+#define BLINK_FW_VERSION "1.3.1"
 
 /* The wire protocol spoken over USB, and the daemon's own PROTO_VERSION in
  * pc/version.py. It is a floor, not a format selector: the protocol only ever
