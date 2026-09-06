@@ -118,6 +118,37 @@ Only a board it has identified before may be reset. That is the recovery a
 genuinely wedged unit needs, and it is precisely the thing an unknown device
 must never be given.
 
+### Windows: the driver the shortlist depends on
+
+All of the above enumerates **serial ports**. On Windows the CH340 does not
+become one until a driver is installed, and Windows has never shipped that
+driver — so a customer's board sat in front of them showing the setup wizard
+while `blink status` said `Board not plugged in`, which was the one thing that
+was definitely untrue (2026-09-06). Windows knew about the device the whole
+time; it was just not reachable through anything that lists COM ports.
+
+`blink install` now stages WCH's driver into Windows' driver store with
+`pnputil /add-driver /install`, which is the one step that raises a Windows
+permission prompt — and it raises it only when there is genuinely something to
+install, so a re-run on a healthy machine is silent. A board plugged in
+afterwards binds to the staged driver with no prompt at all. `blink driver`
+does the same thing on demand, for anyone whose install predates this or who
+declined the prompt.
+
+Separately, and for free: `pc/win_driver.py` asks Windows' configuration
+manager directly — the same source Device Manager's yellow triangle comes
+from — so `blink status` and `bridge.log` distinguish an empty desk from a
+board Windows cannot use, and name which it is. That half needs no
+administrator and no bundled driver, so it works even in a build carrying
+neither.
+
+The driver itself is **not in this repository**. It is a third party's binary
+in a public tree, and shipping it inside a product that is sold is a licensing
+decision rather than a build-script default; `tools/fetch_ch340_driver.sh`
+stages it deliberately, and the comment at the top of that script is the whole
+argument. A build without it detects the problem and tells the customer where
+to get the driver by hand.
+
 **One daemon drives one board.** With several attached, the first that answers
 wins and the others are ignored — the protocol, the board-side preference and
 the update path are all written around a single unit. Name a specific one with

@@ -16,11 +16,12 @@ the run -> Artifacts), or the release's `blink-windows-x86_64.zip` (unzip it; ru
 |---|---|---|
 | 1 | Open Claude Desktop, use it once, close it. | -- |
 | 2 | In PowerShell: `dir $env:APPDATA\Claude\plan-usage-history.json` | **The file exists.** If it does not, the Desktop path assumption is wrong: find the file (`dir -Recurse $env:APPDATA,$env:LOCALAPPDATA -Filter plan-usage-history.json`) and report the real path. |
-| 3 | `.\blink.exe` | The disclosure, then four steps ending `[4/4] Background service ... running`. No stack trace. |
+| 3 | `.\blink.exe` | The disclosure, then six steps ending `[6/6] Background service ... running`. No stack trace. Step `[5/6] USB driver` either says `already installed` with no prompt, or raises **one** Windows permission prompt and then says `installed`. **A build that says `this build carries no driver` has not had `tools/fetch_ch340_driver.sh` staged -- that is a release blocker, not a test failure.** |
 | 4 | `.\blink.exe status` | `Bridge registered as a Scheduled Task`, `Claude Code <version>`, `Activity hooks installed (10/10 events)`, `Desktop usage cache parsed, reading N min old`. **If it says `looked at ...`, step 2's path is not the one it checked -- report both.** |
 | 5 | Open a terminal, run `claude`, ask it something, wait for the reply. Then `.\blink.exe status` again. | `Usage data fresh`, `1 live session`. |
 | 6 | `.\blink.exe status --wire` | One JSON line with `session_pct`, `weekly_pct`, `provider":"claude"`, `src":"cli"`, `state`. |
-| 7 | Plug the board in. Device Manager -> Ports: a `USB-SERIAL CH340 (COMn)` entry. | If the entry shows a warning, Windows has no CH340 driver: note the Windows version -- that is a README item. |
+| 7 | Plug the board in. Device Manager -> Ports: a `USB-SERIAL CH340 (COMn)` entry. | No warning triangle: step 3 installed the driver. If a triangle IS there, `.\blink.exe status` must say `a board is plugged in, but Windows has no driver for it` -- **never** `not plugged in` -- and `.\blink.exe driver` must clear it. |
+| 7a | On a machine that has never had the driver: `pnputil /delete-driver <oem>.inf /uninstall` (elevated, `<oem>` from `pnputil /enum-drivers`), unplug, replug, then `.\blink.exe status`. | The undriven line from step 7, then `.\blink.exe driver` clears it and `status` names a COM port. This is the customer case from 2026-09-06 and the only way to see it on a desk that already works. |
 | 8 | Within 60 s the panel shows the numbers from step 6. | Boot clip, then the gauges. |
 | 9 | Start a Claude Code turn; watch the pip. Leave the terminal idle at its prompt for 4 minutes. | Pip pulses while it works, goes steady when done, **does not turn red** while idle. |
 | 10 | Unplug and replug the board. | Panel back within a minute, no reboot loop, no reset of the board each time (`%USERPROFILE%\.blink\bridge.log` says `answered; not resetting it`). |

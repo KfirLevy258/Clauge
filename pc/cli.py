@@ -26,7 +26,7 @@ import sys
 import time
 
 from pc import (install_codex_hooks, install_hooks, install_statusline,
-                protocol, statusline_source, update)
+                protocol, statusline_source, update, win_driver)
 # Eagerly, unlike the other providers, which are imported inside the functions
 # that use them to keep the frozen binary's start-up cheap. This one costs
 # nothing to import (os, and claude_state, which is json/os/sys/time) and it
@@ -1282,6 +1282,101 @@ def _announce():
     print()
 
 
+def _install_steps() -> int:
+    """How many numbered steps `blink install` prints on this platform."""
+    return 6 if sys.platform == "win32" else 5
+
+
+def _stepper(total):
+    """A closure that prints "[n/total] Label ... " and counts for you.
+
+    The count used to be written into each string by hand, which was fine
+    while every platform had the same five. It stopped being fine the moment
+    Windows earned a sixth: five literals would each have needed a
+    conditional, and the failure mode of getting one wrong is an installer
+    that counts to 5 and then prints step 6 of 5.
+    """
+    state = {"n": 0}
+
+    def step(label):
+        state["n"] += 1
+        print(f"[{state['n']}/{total}] {label} ... ", end="", flush=True)
+
+    return step
+
+
+def _install_driver_step() -> str:
+    """The USB-driver line of `blink install`. Windows only.
+
+    Staging the driver here, rather than waiting for a customer to plug the
+    board in and hit the yellow triangle, is the whole point: `pnputil
+    /add-driver /install` puts it in Windows' driver store, and a board
+    plugged in afterwards binds to it silently. Plug and play, once.
+
+    It is also the one step that can raise a Windows permission prompt, and
+    it only does so when there is genuinely something to install -- see
+    win_driver.ensure_driver. Under BLINK_SKIP_SERVICE this is skipped
+    entirely, for the same reason the login service is: the fleet test suite
+    runs `install` for real on the Windows desk, and a modal permission
+    prompt on a machine nobody is sitting at hangs the run until it times out.
+    """
+    if _skip_service():
+        return "not checked (BLINK_SKIP_SERVICE=1)"
+    try:
+        _, line = win_driver.ensure_driver()
+        return line
+    except Exception as e:
+        # The board is the product, but a driver that would not install is
+        # not a reason to abandon an install that has otherwise worked --
+        # the customer can still run `blink driver` afterwards.
+        return f"skipped ({e})"
+
+
+def cmd_driver(_args) -> int:
+    """`blink driver` -- install the USB driver, and say what happened.
+
+    Exists as its own command for two audiences: a customer being walked
+    through a support conversation ("run blink driver"), and anyone whose
+    install ran before this version, or who declined the permission prompt
+    the first time.
+    """
+    if sys.platform != "win32":
+        print("The board's USB-serial chip needs no driver on this system --")
+        print("macOS and Linux both carry one in the kernel.")
+        return 0
+
+    undriven = win_driver.undriven_boards()
+    if undriven:
+        print(win_driver.summary(undriven).capitalize() + ".")
+    print("USB driver ... ", end="", flush=True)
+    # Forced only when a board is sitting there undriven. Being told "already
+    # installed" is the correct answer on a healthy machine, and the wrong
+    # one for somebody looking at a yellow triangle: whatever the store
+    # holds, it is evidently not reaching their board, so install it again.
+    status, line = win_driver.ensure_driver(force=bool(undriven))
+    print(line)
+
+    still = win_driver.undriven_boards()
+    if not still:
+        if undriven:
+            print()
+            print("The board is set up. Check it with:")
+            print(f"  {installed_bin()} status")
+        return 0
+
+    # Installed, or claimed to be, and Windows still will not use the device.
+    # Repeating "run blink driver" here would be a loop, so this is where the
+    # advice stops being something this program can do for them.
+    print()
+    print(f"Windows still cannot use the board: {win_driver.summary(still)}.")
+    if status in ("installed", "ok"):
+        print("  Unplug the board, plug it back in, and run this again.")
+        print("  If it stays, the machine may need a restart.")
+    else:
+        print(f"  Install the driver by hand from {win_driver.DRIVER_PAGE}")
+    return 1
+
+
 def cmd_install(_args) -> int:
     # Before anything is written, and before the disclosure: if the file we are
     # about to edit does not parse, the honest move is to change nothing at all
@@ -1298,7 +1393,14 @@ def cmd_install(_args) -> int:
 
     _announce()
 
-    print("[1/5] Program ... ", end="", flush=True)
+    # Windows gets one extra step -- the USB driver -- and the numbering has
+    # to agree with it, so it is counted rather than written out. macOS and
+    # Linux drive the CH340 out of the kernel and would only be reading a
+    # line that said "not needed on this system".
+    steps = _install_steps()
+    step = _stepper(steps)
+
+    step("Program")
     os.makedirs(bin_dir(), exist_ok=True)
     if _frozen():
         # The program is a directory -- the executable and its _internal/
@@ -1327,7 +1429,7 @@ def cmd_install(_args) -> int:
         # interpreter instead. Customers never take this path.
         print("running from a checkout, nothing to copy")
 
-    print("[2/5] Status line ... ", end="", flush=True)
+    step("Status line")
     os.makedirs(blink_home(), exist_ok=True)
     # Private to the user. The shims write the status line payload -- which
     # names the working directory and the session -- and the per-session
@@ -1344,7 +1446,7 @@ def cmd_install(_args) -> int:
                                  undo_hint=f"{installed_bin()} uninstall")
     print("      " + install_statusline.install(settings_path(), shim_path()))
 
-    print("[3/5] Activity hooks ... ", end="", flush=True)
+    step("Activity hooks")
     _write_shim(hook_shim_path(), "blink-hook.sh")
     try:
         print(install_hooks.install(settings_path(), hook_shim_path()))
@@ -1359,7 +1461,7 @@ def cmd_install(_args) -> int:
     # the machine: on a Codex-free machine there is nothing to disclose, and a
     # paragraph about another vendor's config file would be noise at best and
     # alarming at worst.
-    print("[4/5] Codex hooks ... ", end="", flush=True)
+    step("Codex hooks")
     if codex_present():
         print()
         _announce_codex_hooks()
@@ -1367,7 +1469,11 @@ def cmd_install(_args) -> int:
     else:
         print(_install_codex_hooks())
 
-    print("[5/5] Background service ... ", end="", flush=True)
+    if steps == 6:
+        step("USB driver")
+        print(_install_driver_step())
+
+    step("Background service")
     print(_install_service())
 
     print()
@@ -1465,7 +1571,9 @@ def _uninstall_codex_hooks() -> None:
     uninstall leaves the trust record alone"; silence about it here would be
     the same defect one level up -- a decision the user cannot see.
     """
-    # No try around this, unlike steps [2/5] and [3/5]. install_codex_hooks
+    # No try around this, unlike the status line and activity hook steps of
+    # cmd_install (numbered there, so not named by number here at all --
+    # Windows has a sixth step and the numbering moves). install_codex_hooks
     # .uninstall() catches its own SettingsUnreadable at all three points that
     # can raise one -- the read, the shape check, and now the write -- and
     # returns a "left it alone" sentence with the marker kept, so every failure
@@ -1796,7 +1904,7 @@ def _age(seconds: float) -> str:
     return f"{seconds // 86400} d"
 
 
-def board_lines(known, ports):
+def board_lines(known, ports, undriven=(), blink_cmd="blink"):
     """The Board lines of `blink status`, from what the app remembers and
     what is plugged in right now.
 
@@ -1805,11 +1913,27 @@ def board_lines(known, ports):
     CH340 hardware on the desk needs to see that the app knows the
     difference: the board it talks to, named; everything else listed as
     looked at once and left alone.
+
+    `undriven` is pc.win_driver.undriven_boards() -- boards Windows can see
+    but cannot use, which appear on no serial port and so are invisible in
+    `ports`. They are reported in every branch rather than only in the empty
+    one: a desk can hold a working board AND a second one Windows has not
+    driven, and the working board's line would otherwise hide it.
     """
     port = known.get("port")
     here = [d for d, _ in ports]
     chip = dict(ports)
     out = []
+    if not ports and undriven:
+        # The case that made this function wrong. No serial port exists, so
+        # every branch below reads the desk as empty and says "not plugged
+        # in" -- to a customer looking straight at the board.
+        out.append(f"Board       {win_driver.summary(undriven)}")
+        out += [f"            {line}"
+                for line in win_driver.advice(undriven, blink_cmd)]
+        if port:
+            out.append(f"            last seen on {port}")
+        return out
     if port and port in here:
         ident = []
         if known.get("board_id"):
@@ -1831,13 +1955,23 @@ def board_lines(known, ports):
         names = ", ".join(f"{d} ({c})" for d, c in others)
         out.append(f"            other serial devices: {names}"
                    " -- asked once, not BLINK, left alone")
+    # Reached only when at least one port DID show up: a working board on one
+    # socket and an undriven one on the next. The line above lists the serial
+    # devices that were left alone deliberately; this one is a device that
+    # never became a serial device at all, and saying nothing would read as
+    # the app ignoring a board sitting right there.
+    if undriven:
+        out.append(f"            also: {win_driver.summary(undriven)}")
+        out += [f"            {line}"
+                for line in win_driver.advice(undriven, blink_cmd)]
     return out
 
 
 def _board_lines():
     try:
         from claude_usage_bridge import describe_ports, remembered_board
-        return board_lines(remembered_board(blink_home()), describe_ports())
+        return board_lines(remembered_board(blink_home()), describe_ports(),
+                           win_driver.undriven_boards(), installed_bin())
     except Exception as e:
         return [f"Board       could not list serial ports: {e}"]
 
@@ -2195,6 +2329,8 @@ def main(argv=None) -> int:
         help="Also print the usage message the bridge would send the board"
              " right now, as one JSON line")
     sub.add_parser("update", help="Fetch a newer version of this app")
+    sub.add_parser("driver",
+                   help="Install the board's USB driver (Windows only)")
     prov_p = sub.add_parser(
         "provision",
         help="Stamp this unit's edition (factory step, run once)")
@@ -2221,6 +2357,7 @@ def main(argv=None) -> int:
         "uninstall": cmd_uninstall,
         "status": cmd_status,
         "update": cmd_update,
+        "driver": cmd_driver,
         "provision": cmd_provision,
         "run": cmd_run,
     }[args.cmd](args)

@@ -89,6 +89,14 @@ Needs Claude Code 2.1.100 or newer. The installer changes one file, `~/.claude/s
 
 That one command says whether the service is running, whether Claude Code and Codex are being read, and how old the numbers are. If the panel is dark or wrong, unplug the board and plug it back in first -- the app finds it again on its own. If that does not fix it, email **support@blink-buddy.com** with the output of `blink status` and the last lines of `~/.blink/bridge.log`; nothing in either is a secret.
 
+**On Windows, if the board never appears:** the board's USB chip needs a driver Windows does not ship, and the installer puts it in for you -- it is the one step that asks for the Windows permission prompt, and it only asks when there is something to install. If you skipped that prompt, or installed an older version, run:
+
+```
+%USERPROFILE%\.blink\bin\blink.exe driver
+```
+
+`blink status` says which of these you are looking at: a board Windows cannot use yet reads as *"a board is plugged in, but Windows has no driver for it"*, not as an empty desk.
+
 ## What it works with
 
 For Claude Desktop, the app learns usage by reading Claude Desktop's own local files on your machine, never anything else -- it only ever reads them, and nothing about your usage or your conversations ever leaves the machine.

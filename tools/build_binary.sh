@@ -108,6 +108,29 @@ if [ "$(uname -s)" = "Linux" ]; then
 	set -- "$@" --strip
 fi
 
+# The CH340 driver, on Windows only. macOS and Linux drive the chip out of
+# the kernel and would be carrying a Windows .sys around for nothing.
+#
+# Staged by tools/fetch_ch340_driver.sh, which is a deliberate manual step --
+# read the comment at the top of it before wondering why this is not
+# downloaded here. A build without it is supported and is what every machine
+# produces by default: pc/win_driver.py finds no package and says so.
+DRIVER="$ROOT/vendor/ch341ser"
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*)
+	if [ -f "$DRIVER/ch341ser.inf" ]; then
+		# ":" and not ";" -- this script runs under Git Bash on Windows,
+		# where $ROOT is a /c/... path with no drive-letter colon in it,
+		# and the --add-data lines above already use ":" on that desk.
+		set -- "$@" --add-data "$DRIVER:drivers/ch341ser"
+		echo "bundling the CH340 driver from $DRIVER"
+	else
+		echo "no CH340 driver staged; this build will tell customers to"
+		echo "  install it by hand (tools/fetch_ch340_driver.sh)"
+	fi
+	;;
+esac
+
 cd "$ROOT"
 "$VBIN/pyinstaller" \
 	--onedir \
