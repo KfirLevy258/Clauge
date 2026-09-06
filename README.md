@@ -89,6 +89,14 @@ Needs Claude Code 2.1.100 or newer. The installer changes one file, `~/.claude/s
 
 That one command says whether the service is running, whether Claude Code and Codex are being read, and how old the numbers are. If the panel is dark or wrong, unplug the board and plug it back in first -- the app finds it again on its own. If that does not fix it, email **support@blink-buddy.com** with the output of `blink status` and the last lines of `~/.blink/bridge.log`; nothing in either is a secret.
 
+**If the board says the app is old.** The board and the app ship together, so normally they match. If they have come apart -- the board on a later version than the computer -- the board's own update screen cannot fix it, because the half that is behind is the half it cannot reach. `blink status` says so and names the cure:
+
+```
+Board       COM25 (CH340) -- id 20500d33ff1c, firmware 1.3.2
+            the board is on 1.3.2 and this app is 1.3.1 -- they ship together
+            run: blink update
+```
+
 **On Windows, if the board never appears:** the board's USB chip needs a driver Windows does not ship, and the installer puts it in for you -- it is the one step that asks for the Windows permission prompt, and it only asks when there is something to install. If you skipped that prompt, or installed an older version, run:
 
 ```

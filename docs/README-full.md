@@ -263,6 +263,22 @@ config partition erased first (`esptool.py erase_region 0x3b0000 0x30000`).
 Pass `--port` to name a board when more than one is attached, and `--no-build`
 to reuse the last build.
 
+**What it flashes is not the release artifact.** `zephyr.signed.bin` is signed
+but not *confirmed*: its MCUboot trailer says "boot this once". That is right
+for OTA, where the image lands in slot 1 and the firmware confirms it after it
+proves itself, and wrong for a direct flash -- a board on the bench has no
+daemon and no network, never becomes healthy, and reverts at 90 seconds. On a
+blank unit that is invisible, because there is nothing to revert to; on a
+re-burn it silently undoes the flash minutes after the script printed PASS.
+
+So `tools/sign_confirmed.py` re-signs the same image with `--pad --confirm` and
+that is what goes to the board. It reads the signing parameters out of the
+build's own `build.ninja` rather than repeating them, and it checks the trailer
+it produced -- an image that comes back with `image_ok` unset fails the burn
+before esptool is called. Measured on hardware 2026-09-07: a confirmed image's
+uptime runs straight through the 90-second deadline, where the unconfirmed one
+rebooted.
+
 ### Company units
 
 A unit sold to a company shows the company's logo after the boot animation:
