@@ -433,7 +433,15 @@ def work_name(path):
     this run prints, which is what it was always for.
     """
     stem = Path(path).stem
-    if (not stem or stem in (".", "..") or any(c in stem for c in "/\\")
+    # ALL DOTS, not just "." and "..". Three reasons it is the right test:
+    # `..` is the traversal this guard exists for; `...` and beyond are names
+    # Windows refuses to create at all, so a scenario called `....json` died
+    # with a PermissionError from inside _fresh_work instead of being refused
+    # here with a sentence (Windows desk, 2026-09-06); and pathlib's idea of a
+    # stem is not stable -- Python 3.14 stopped treating leading dots as
+    # suffix separators, so which of these a given filename produces moves
+    # under us. Refusing the whole family is stable under all three.
+    if (not stem.strip(".") or any(c in stem for c in "/\\")
             or stem in RESERVED_WORK_NAMES):
         raise ValueError(
             f"{Path(path).name} cannot be a scenario: {stem!r} is not a name"

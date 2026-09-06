@@ -228,8 +228,12 @@ def test_local_python_resolves_against_the_checkout(tmp_path):
     names it -- relative to the checkout, which is where it is.
     """
     argv = fleet_run.agent_argv(_local(tmp_path))
-    assert pathlib.PurePath(argv[0]).is_absolute()
-    assert argv[0].endswith(".venv-test/bin/python")
+    # By path parts, not by string suffix: the join runs through pathlib, so
+    # on Windows this comes back with backslashes and a "/bin/python" suffix
+    # test fails against a perfectly correct path.
+    argv0 = pathlib.PurePath(argv[0])
+    assert argv0.is_absolute()
+    assert argv0.parts[-3:] == (".venv-test", "bin", "python")
 
 
 def test_push_deletes_the_previous_result_before_unpacking():

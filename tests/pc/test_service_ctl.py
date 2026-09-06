@@ -563,7 +563,13 @@ def test_stop_and_start_drive_this_machine_platform(home, monkeypatch):
 def test_a_failing_command_is_reported_not_raised(home, monkeypatch):
     monkeypatch.delenv("BLINK_SKIP_SERVICE")
     _pretend_installed(monkeypatch)
-    out = service_ctl.stop_service(runner=_Runs(codes=[1, 1, 1]))
+    # The command that has to FAIL is the stop itself, and on Windows that is
+    # the second call: schtasks /query decides whether anything is installed,
+    # and a /query that fails means "not installed", which stop() answers
+    # rather than errors on -- by design, so a finally block can call it. So
+    # let the query succeed there and fail the /end after it.
+    codes = [0, 1] if sys.platform == "win32" else [1, 1, 1]
+    out = service_ctl.stop_service(runner=_Runs(codes=codes))
     assert out.ok is False and "not" in str(out).lower()
 
 

@@ -914,16 +914,26 @@ def test_a_filename_that_is_not_a_usable_directory_name_is_refused(
     is a plain name that cannot reach outside the work root. That holds on
     both, and would still hold if pathlib changed again.
     """
-    path = _scenario_file(tmp_path, filename, "climber")
+    try:
+        path = _scenario_file(tmp_path, filename, "climber")
+    except OSError:
+        # Windows will not hold a name that is only dots, and strips trailing
+        # ones. A scenario can never arrive as a name the filesystem refuses
+        # to create, so there is nothing here for the guard to be right or
+        # wrong about.
+        pytest.skip(f"this filesystem cannot hold a file called {filename!r}")
     stem = Path(filename).stem
-    dangerous = (not stem or stem in (".", "..")
-                 or any(c in stem for c in "/\\"))
+    dangerous = not stem.strip(".") or any(c in stem for c in "/\\")
 
     if dangerous:
-        with pytest.raises(ValueError):
-            agent.select_scenarios(path.parent)
-        # Again at the delete itself, for a caller that never went through
-        # select_scenarios.
+        if filename.endswith(".json"):
+            # select_scenarios globs *.json, so that is the only shape it can
+            # ever be handed. A file called `...` is not a scenario at all and
+            # is right to be ignored there.
+            with pytest.raises(ValueError):
+                agent.select_scenarios(path.parent)
+        # And again at the delete itself, which is the thing being protected,
+        # for a caller that never went through select_scenarios.
         with pytest.raises(ValueError):
             agent.run_scenario(path, "claude", tmp_path / "w", "auto", _deps())
         return
