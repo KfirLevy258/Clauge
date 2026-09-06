@@ -115,15 +115,20 @@ fi
 # read the comment at the top of it before wondering why this is not
 # downloaded here. A build without it is supported and is what every machine
 # produces by default: pc/win_driver.py finds no package and says so.
-DRIVER="$ROOT/vendor/ch341ser"
+# A RELATIVE path, unlike every other --add-data here, and it has to be.
+#
+# Git Bash rewrites arguments that look like paths on their way to a native
+# program, and an absolute one here came out as \c\Users\...\vendor\ch341ser
+# -- slashes flipped, drive letter never mapped -- so PyInstaller reported
+# "Unable to find" and the build died (measured on the release desk,
+# 2026-09-06). A path with no leading slash and no drive in it has nothing to
+# rewrite. The pyinstaller call below runs from $ROOT, which is what makes it
+# resolve.
 case "$(uname -s)" in
 MINGW* | MSYS* | CYGWIN*)
-	if [ -f "$DRIVER/ch341ser.inf" ]; then
-		# ":" and not ";" -- this script runs under Git Bash on Windows,
-		# where $ROOT is a /c/... path with no drive-letter colon in it,
-		# and the --add-data lines above already use ":" on that desk.
-		set -- "$@" --add-data "$DRIVER:drivers/ch341ser"
-		echo "bundling the CH340 driver from $DRIVER"
+	if [ -f "$ROOT/vendor/ch341ser/ch341ser.inf" ]; then
+		set -- "$@" --add-data "vendor/ch341ser:drivers/ch341ser"
+		echo "bundling the CH340 driver from $ROOT/vendor/ch341ser"
 	else
 		echo "no CH340 driver staged; this build will tell customers to"
 		echo "  install it by hand (tools/fetch_ch340_driver.sh)"
