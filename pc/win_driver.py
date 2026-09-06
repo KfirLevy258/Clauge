@@ -2,10 +2,18 @@
 
 Every CYD ships a WCH CH340. macOS and Linux carry a driver for it in the
 kernel; Windows does not, and never has. So a customer on Windows plugs the
-board in and gets a device with a yellow triangle in Device Manager, no COM
-port, and -- until this module existed -- `blink status` saying "Board not
-plugged in", which is the one thing that was definitely not true. That wording
-sent a customer looking for a bad cable (2026-09-06).
+board in and gets a device that does nothing, no COM port, and -- until this
+module existed -- `blink status` saying "Board not plugged in", which is the
+one thing that was definitely not true. That wording sent a customer looking
+for a bad cable (2026-09-06).
+
+Two shapes of the same problem, and they look different to Windows. On a
+machine that has simply never had the driver, the device sits there with no
+function driver bound and NO problem code -- Windows does not consider it
+broken, and Device Manager may show nothing more alarming than an unknown
+device. On a machine where an install was attempted and failed, it gets
+CM_PROB_FAILED_INSTALL and the yellow triangle the customer described. This
+module detects both; see NO_DRIVER_BOUND for what the first one cost.
 
 The reason status could not tell the difference is that everything else here
 enumerates SERIAL PORTS, through pyserial. A chip with no driver never becomes

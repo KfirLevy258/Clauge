@@ -136,11 +136,26 @@ does the same thing on demand, for anyone whose install predates this or who
 declined the prompt.
 
 Separately, and for free: `pc/win_driver.py` asks Windows' configuration
-manager directly — the same source Device Manager's yellow triangle comes
-from — so `blink status` and `bridge.log` distinguish an empty desk from a
-board Windows cannot use, and name which it is. That half needs no
+manager directly, so `blink status` and `bridge.log` distinguish an empty desk
+from a board Windows cannot use, and name which it is. That half needs no
 administrator and no bundled driver, so it works even in a build carrying
 neither.
+
+What it asks for is worth recording, because the obvious question is the wrong
+one. An undriven board does **not** carry a problem code. Measured on the
+Windows 10 release desk with the driver package deleted and the machine
+rebooted so the board enumerated fresh: the device reported problem 0, and
+`pnputil /enum-devices /problem` reported "No devices were found on the
+system", while there was no COM port and no way to reach the board at all.
+Windows does not treat a device with no function driver as broken — it is
+simply a device that does nothing. The first version of this module keyed on
+`CM_PROB_FAILED_INSTALL`, reasoning from the yellow triangle a customer had
+described, and reported that desk as healthy.
+
+So the signal is that no driver is **bound**: the devnode has no Service.
+Problem codes still count — a device really can be disabled, or fail its
+install, which is the shape the customer's machine was in — but they are the
+rarer half.
 
 The driver itself is **not in this repository**. It is a third party's binary
 in a public tree, and shipping it inside a product that is sold is a licensing
