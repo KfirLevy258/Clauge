@@ -7,3 +7,12 @@
 *.png binary
 *.bin binary
 *.pem binary
+
+# WCH's driver package is signed, and CH341SER.CAT holds a hash of
+# CH341SER.INF. The rule above checks every text file out as LF -- which
+# rewrites that .INF, invalidates the catalogue, and makes Windows refuse the
+# install with no useful message. The bytes have to survive untouched.
+vendor/ch341ser/*.INF -text
+vendor/ch341ser/*.CAT binary
+vendor/ch341ser/*.SYS binary
+vendor/ch341ser/*.DLL binary

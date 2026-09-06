@@ -157,12 +157,16 @@ Problem codes still count — a device really can be disabled, or fail its
 install, which is the shape the customer's machine was in — but they are the
 rarer half.
 
-The driver itself is **not in this repository**. It is a third party's binary
-in a public tree, and shipping it inside a product that is sold is a licensing
-decision rather than a build-script default; `tools/fetch_ch340_driver.sh`
-stages it deliberately, and the comment at the top of that script is the whole
-argument. A build without it detects the problem and tells the customer where
-to get the driver by hand.
+The driver itself lives at `vendor/ch341ser/`, and its README records where it
+came from and how to replace it. It is bundled into the Windows build only —
+the other two platforms would be carrying a Windows `.sys` around for nothing —
+and a Windows build that cannot find it **fails** rather than quietly producing
+a download that cannot set up a board. That guard exists because the only
+symptom downstream is a single line of `blink install` output.
+
+Detection does not depend on any of it. A build carrying no driver still names
+the problem and points at the vendor's download, which is what `blink status`
+does on a machine where the install was declined.
 
 **One daemon drives one board.** With several attached, the first that answers
 wins and the others are ignored — the protocol, the board-side preference and

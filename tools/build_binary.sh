@@ -131,13 +131,24 @@ fi
 # enough for Git Bash to recognise a path list and map the drive properly.
 case "$(uname -s)" in
 MINGW* | MSYS* | CYGWIN*)
-	if [ -f "$ROOT/vendor/ch341ser/ch341ser.inf" ]; then
+	if [ -f "$ROOT/vendor/ch341ser/CH341SER.INF" ]; then
 		DRIVER_WIN=$(cygpath -w "$ROOT/vendor/ch341ser")
 		set -- "$@" --add-data "${DRIVER_WIN};drivers/ch341ser"
 		echo "bundling the CH340 driver from $DRIVER_WIN"
+	elif [ -n "${BLINK_ALLOW_NO_DRIVER:-}" ]; then
+		echo "no CH340 driver, and BLINK_ALLOW_NO_DRIVER is set: this build"
+		echo "  will tell customers to install it by hand"
 	else
-		echo "no CH340 driver staged; this build will tell customers to"
-		echo "  install it by hand (tools/fetch_ch340_driver.sh)"
+		# Fail, rather than quietly producing a Windows build that cannot
+		# set up a board. The driver is committed under vendor/ch341ser, so
+		# its absence means something is wrong with this checkout -- and the
+		# only symptom downstream is one line of `blink install` output,
+		# which is far too easy to miss on a release.
+		echo "FATAL: no CH340 driver at $ROOT/vendor/ch341ser" >&2
+		echo "  A Windows build without it cannot set up a customer's board." >&2
+		echo "  See vendor/ch341ser/README.md. To build anyway:" >&2
+		echo "    BLINK_ALLOW_NO_DRIVER=1 $0" >&2
+		exit 1
 	fi
 	;;
 esac

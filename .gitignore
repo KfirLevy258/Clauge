@@ -38,10 +38,3 @@ bridge.pid
 # commit on 2026-08-22 from a `pip download` run in the repo root.
 /*.whl
 /*.tar.gz
-
-# A third party's Windows driver, staged by tools/fetch_ch340_driver.sh for
-# the Windows build to bundle. Not in the tree on purpose -- this repository
-# is public and the product is sold, so shipping WCH's driver is a licensing
-# decision somebody makes deliberately, not a binary that arrives in a clone.
-# See the comment at the top of that script.
-/vendor/
