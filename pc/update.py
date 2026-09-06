@@ -26,6 +26,7 @@ it false, turn it on when the path has earned it, turn it off within minutes if
 a release goes wrong. Auto-update without a remote off switch is a mechanism
 with no brakes.
 """
+import errno
 import hashlib
 import io
 import json
@@ -36,6 +37,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 
 from pc import ota
@@ -323,10 +325,16 @@ def swap_in(new_dir, target, version, run=subprocess.run):
     """Make the program at `new_dir` the one at `target`'s directory.
 
     Self-tests it first, then rotates: <bin> -> <bin>.old, <bin>.new -> <bin>.
-    Renaming a directory is allowed on every platform while programs are
-    running from inside it (a running executable can be renamed but not
-    overwritten; its directory likewise), which is what makes an in-place
-    update possible without a second program to do the swapping.
+    A running executable can be renamed but not overwritten, which is what
+    makes an in-place update possible without a second program to do the
+    swapping.
+
+    That is where the ease ends on Windows, which refuses to rename a
+    directory while any process holds a file open inside it -- and the daemon
+    holds bin\\blink.exe. The renames go through _replace(), which waits for
+    the handle instead of reporting failure on the first refusal. Callers that
+    can stop the daemon first should (see cli.halt_service); the retry is the
+    net under them, not a substitute.
     """
     cur, old, new = _dirs(target)
     exe = os.path.join(new_dir, os.path.basename(target))
@@ -341,18 +349,20 @@ def swap_in(new_dir, target, version, run=subprocess.run):
                        " current one")
     if os.path.abspath(new_dir) != os.path.abspath(new):
         _rmtree(new)
-        os.replace(new_dir, new)
+        _replace(new_dir, new)
     try:
         _rmtree(old)
         if os.path.exists(cur):
-            os.replace(cur, old)
-        os.replace(new, cur)
+            _replace(cur, old)
+        _replace(new, cur)
     except OSError as e:
         # Put back whatever we moved, so a half-applied update is not left
-        # pointing the login service at nothing.
+        # pointing the login service at nothing. Retried too: the thing that
+        # blocked the move out is just as able to block the move back, and
+        # this is the branch where giving up leaves no program at all.
         if not os.path.exists(cur) and os.path.exists(old):
             try:
-                os.replace(old, cur)
+                _replace(old, cur)
             except OSError:
                 pass
         _rmtree(new)
@@ -490,3 +500,49 @@ def _rm(path):
 
 def _rmtree(path):
     shutil.rmtree(path, ignore_errors=True)
+
+
+# A handle is let go within a moment or two of the process holding it dying;
+# these add up to about three seconds, which is long enough for that and short
+# enough that a genuinely stuck update does not look like a hang.
+REPLACE_TRIES = 10
+REPLACE_DELAY = 0.3
+
+# Windows says access denied (5), sharing violation (32) or directory not
+# empty (145); Python surfaces the first two as EACCES/EPERM and the third as
+# ENOTEMPTY. EBUSY is the macOS/Linux equivalent (a mount point).
+_TRANSIENT_ERRNO = frozenset({errno.EACCES, errno.EPERM, errno.EBUSY,
+                              errno.ENOTEMPTY})
+_TRANSIENT_WINERROR = frozenset({5, 32, 145})
+
+
+def _replace(src, dst, sleep=time.sleep, tries=REPLACE_TRIES):
+    """os.replace, retried while something still holds the old directory.
+
+    POSIX renames a directory whatever is open inside it. WINDOWS DOES NOT:
+    while any process holds a file open under <bin>, renaming <bin> fails with
+    WinError 5. The daemon runs from bin\\blink.exe, so `blink update` races
+    its own background service letting go of it -- and the race was not even
+    run, because a single os.replace either won on the first try or reported
+    failure to the customer.
+
+    Which is what a Windows desk showed: "could not replace ...\\.blink\\bin:
+    [WinError 5] Access is denied" printed, and the app was on the new version
+    anyway. The update worked; the person running it was told it had not.
+
+    Raises the LAST error if every attempt fails, so the message the caller
+    prints still names what actually went wrong.
+    """
+    last = None
+    for attempt in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            if (e.errno not in _TRANSIENT_ERRNO
+                    and getattr(e, "winerror", None) not in _TRANSIENT_WINERROR):
+                raise
+            last = e
+            if attempt + 1 < tries:
+                sleep(REPLACE_DELAY)
+    raise last

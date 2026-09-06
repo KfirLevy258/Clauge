@@ -327,5 +327,135 @@ class TestOptOut(unittest.TestCase):
         self.assertFalse(update.auto_update_allowed(self.d))
 
 
+class TestReplaceRetries(unittest.TestCase):
+    """Windows refuses to rename <bin> while the daemon holds blink.exe open.
+
+    The observed symptom was not a failed update -- it was a SUCCESSFUL one
+    that told the customer it had failed:
+
+        could not replace C:\\Users\\...\\.blink\\bin: [WinError 5] Access is denied
+
+    printed, with the app on the new version anyway. A single os.replace either
+    won the race on its first try or reported defeat; it never waited.
+    """
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp(prefix="blink-replace-")
+        self.src = os.path.join(self.d, "src")
+        self.dst = os.path.join(self.d, "dst")
+        os.makedirs(self.src)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def _flaky(self, refusals, exc):
+        """An os.replace that refuses `refusals` times and then works."""
+        real = os.replace
+        state = {"n": 0}
+
+        def fake(a, b):
+            state["n"] += 1
+            if state["n"] <= refusals:
+                raise exc
+            return real(a, b)
+
+        return fake, state
+
+    def _run(self, fake, **kw):
+        real = os.replace
+        os.replace = fake
+        slept = []
+        try:
+            update._replace(self.src, self.dst, sleep=slept.append, **kw)
+        finally:
+            os.replace = real
+        return slept
+
+    def _denied(self, winerror=5):
+        e = OSError(13, "Access is denied")
+        e.winerror = winerror
+        return e
+
+    def test_a_handle_that_is_let_go_makes_the_rename_succeed(self):
+        fake, state = self._flaky(3, self._denied())
+        slept = self._run(fake)
+        self.assertTrue(os.path.isdir(self.dst))
+        self.assertEqual(state["n"], 4)
+        # It waited between tries rather than spinning.
+        self.assertEqual(slept, [update.REPLACE_DELAY] * 3)
+
+    def test_a_sharing_violation_is_waited_out_too(self):
+        # WinError 32 is what a file merely open under <bin> produces; 5 is
+        # what an executing image produces. Both are the same wait.
+        fake, _ = self._flaky(1, self._denied(32))
+        self._run(fake)
+        self.assertTrue(os.path.isdir(self.dst))
+
+    def test_a_handle_nobody_lets_go_of_still_fails(self):
+        fake, state = self._flaky(99, self._denied())
+        with self.assertRaises(OSError) as caught:
+            self._run(fake, tries=4)
+        # The LAST error, so the message swap_in prints still names what
+        # actually went wrong instead of something generic.
+        self.assertEqual(getattr(caught.exception, "winerror", None), 5)
+        self.assertEqual(state["n"], 4)
+
+    def test_an_error_that_waiting_cannot_fix_is_raised_at_once(self):
+        import errno as _errno
+        fake, state = self._flaky(99, OSError(_errno.ENOENT, "No such file"))
+        with self.assertRaises(OSError):
+            self._run(fake)
+        self.assertEqual(state["n"], 1, "waiting cannot conjure a missing file")
+
+    def test_a_rename_that_works_first_time_never_sleeps(self):
+        slept = self._run(os.replace)
+        self.assertEqual(slept, [])
+        self.assertTrue(os.path.isdir(self.dst))
+
+
+class TestSwapWaitsForTheHandle(unittest.TestCase):
+    """The retry has to be reached from swap_in, not only exist beside it."""
+
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp(prefix="blink-swapwait-")
+        self.bin = os.path.join(self.d, "bin")
+        self.target = os.path.join(self.bin, "blink")
+        os.makedirs(os.path.join(self.bin, "_internal"))
+        with open(self.target, "wb") as f:
+            f.write(b"old binary")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_an_update_that_wins_on_the_second_try_reports_success(self):
+        real, state = os.replace, {"n": 0}
+
+        def flaky(a, b):
+            state["n"] += 1
+            # Refuse the move of <bin> out of the way exactly once, the way
+            # a daemon that has not quite exited does.
+            if state["n"] == 2:
+                e = OSError(13, "Access is denied")
+                e.winerror = 5
+                raise e
+            return real(a, b)
+
+        os.replace = flaky
+        try:
+            ok, msg = update.apply(archive(NEW), self.target, "0.7.0",
+                                   run=fake_run())
+        finally:
+            os.replace = real
+        self.assertTrue(ok, msg)
+        self.assertEqual(msg, "updated to 0.7.0")
+        self.assertEqual(open(os.path.join(self.bin, "blink"), "rb").read(),
+                         NEW["blink"])
+        self.assertNotIn("could not replace", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

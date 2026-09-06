@@ -823,3 +823,58 @@ def test_kill_recorded_daemon_reads_the_legacy_pid_beside_the_old_program(home, 
         f.write("4242")
     cli._kill_recorded_daemon()
     assert r.ran("taskkill", "/f", "/t", "/pid", "4242")
+
+
+# ------------------------------------------------------------------- halt --
+
+def test_schtasks_halt_stops_the_daemon_but_keeps_the_registration(
+        home, monkeypatch):
+    """Windows will not rename <bin> while the daemon holds blink.exe open.
+
+    halt() exists to let go of it just before the update swap. What it must
+    NOT do is unregister: a failed update that also deleted the task would
+    leave a machine that never starts Blink again.
+    """
+    _platform(monkeypatch, "win32")
+    r = _runs(monkeypatch)
+    killed = []
+    monkeypatch.setattr(cli, "_kill_recorded_daemon", lambda: killed.append("pid"))
+
+    cli.backend().halt()
+    assert r.ran("schtasks", "/end")
+    assert killed == ["pid"]
+    assert not r.ran("schtasks", "/delete")
+    assert not r.ran("reg", "delete")
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux", "freebsd14"])
+def test_halt_does_nothing_off_windows(home, monkeypatch, platform):
+    """A rename elsewhere does not care what is open, and launchd or systemd
+    would put the daemon straight back -- so stopping it buys a gap on the
+    board and nothing else."""
+    _platform(monkeypatch, platform)
+    r = _runs(monkeypatch)
+    killed = []
+    monkeypatch.setattr(cli, "_kill_recorded_daemon", lambda: killed.append("pid"))
+
+    assert cli.backend().halt() is None
+    assert r.calls == []
+    assert killed == []
+
+
+def test_halt_service_never_raises(home, monkeypatch):
+    """It runs in the middle of an update. Nothing it can fail at is worth
+    turning a working update into a traceback."""
+    _platform(monkeypatch, "win32")
+
+    monkeypatch.delenv("BLINK_SKIP_SERVICE", raising=False)
+    reached = []
+
+    class Boom:
+        def halt(self):
+            reached.append(True)
+            raise RuntimeError("schtasks is not on this machine")
+
+    monkeypatch.setattr(cli, "backend", lambda: Boom())
+    assert cli.halt_service() is None
+    assert reached, "the swallow must be around a halt that actually ran"

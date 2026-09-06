@@ -648,6 +648,18 @@ class _Backend:
     def restart(self) -> str:
         return "not running under a supervisor; restart it yourself"
 
+    def halt(self) -> None:
+        """Stop the running daemon, leaving the service registered.
+
+        Only Windows needs this, and only right before the update swap: it is
+        the one platform that refuses to rename <bin> while the daemon holds
+        bin\\blink.exe open. Elsewhere a rename does not care what is open, and
+        stopping a daemon that launchd or systemd would restart a second later
+        buys a gap on the board and nothing else. So: a no-op by default, on
+        purpose.
+        """
+        return None
+
     def remove(self) -> str:
         return "nothing to remove"
 
@@ -1061,6 +1073,20 @@ class _SchtasksBackend(_Backend):
         return ("restarted, but it is not running -- "
                 f"see {log_path()}")
 
+    def halt(self) -> None:
+        """Let go of bin\\blink.exe so the update swap can rename the directory.
+
+        Both mechanisms, because an install may use either: /end reaches the
+        instance the scheduled task launched, and the recorded pid reaches a
+        daemon that started its own successor detached. The task registration
+        and the Run key are both left alone -- restart() puts a daemon back a
+        moment later, and a halt that unregistered the service would turn a
+        failed update into a machine that never starts Blink again.
+        """
+        subprocess.run(["schtasks", "/end", "/tn", TASK_NAME],
+                       capture_output=True, **update.ota.NO_WINDOW)
+        _kill_recorded_daemon()
+
     def remove(self) -> str:
         subprocess.run(["schtasks", "/end", "/tn", TASK_NAME], capture_output=True, **update.ota.NO_WINDOW)
         subprocess.run(["schtasks", "/delete", "/f", "/tn", TASK_NAME],
@@ -1222,6 +1248,22 @@ def restart_service() -> str:
     if _skip_service():
         return "skipped (BLINK_SKIP_SERVICE=1)"
     return backend().restart()
+
+
+def halt_service() -> None:
+    """Stop the daemon before replacing the program underneath it.
+
+    Best effort and silent: on the platforms where it does nothing this is
+    correct, and on the one where it matters the retry in update._replace()
+    still covers a stop that did not take. Nothing here is worth a line of
+    output in the middle of an update.
+    """
+    if _skip_service():
+        return
+    try:
+        backend().halt()
+    except Exception:
+        pass
 
 
 def _say_bye():
@@ -1568,6 +1610,10 @@ def cmd_install(_args) -> int:
             staged = bin_dir() + ".new"
             shutil.rmtree(staged, ignore_errors=True)
             shutil.copytree(src, staged, symlinks=True)
+            # Re-running the installer over a live install hits the same
+            # Windows rename refusal that `blink update` did; the service is
+            # (re)installed and started further down either way.
+            halt_service()
             ok, message = update.swap_in(staged, installed_bin(),
                                          RELEASE_VERSION)
             if not ok:
@@ -2270,6 +2316,10 @@ def cmd_update(_args) -> int:
         print(f"Download failed: {e}")
         print("Nothing was changed.")
         return 1
+    # Let go of the program before replacing it. Windows will not rename <bin>
+    # while the daemon holds bin\blink.exe open, and the daemon is restarted a
+    # few lines below regardless -- so this only moves that bounce earlier.
+    halt_service()
     ok, message = update.apply(blob, installed_bin(), version)
     print(message)
     if not ok:
