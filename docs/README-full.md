@@ -118,6 +118,56 @@ Only a board it has identified before may be reset. That is the recovery a
 genuinely wedged unit needs, and it is precisely the thing an unknown device
 must never be given.
 
+### Windows: the driver the shortlist depends on
+
+All of the above enumerates **serial ports**. On Windows the CH340 does not
+become one until a driver is installed, and Windows has never shipped that
+driver — so a customer's board sat in front of them showing the setup wizard
+while `blink status` said `Board not plugged in`, which was the one thing that
+was definitely untrue (2026-09-06). Windows knew about the device the whole
+time; it was just not reachable through anything that lists COM ports.
+
+`blink install` now stages WCH's driver into Windows' driver store with
+`pnputil /add-driver /install`, which is the one step that raises a Windows
+permission prompt — and it raises it only when there is genuinely something to
+install, so a re-run on a healthy machine is silent. A board plugged in
+afterwards binds to the staged driver with no prompt at all. `blink driver`
+does the same thing on demand, for anyone whose install predates this or who
+declined the prompt.
+
+Separately, and for free: `pc/win_driver.py` asks Windows' configuration
+manager directly, so `blink status` and `bridge.log` distinguish an empty desk
+from a board Windows cannot use, and name which it is. That half needs no
+administrator and no bundled driver, so it works even in a build carrying
+neither.
+
+What it asks for is worth recording, because the obvious question is the wrong
+one. An undriven board does **not** carry a problem code. Measured on the
+Windows 10 release desk with the driver package deleted and the machine
+rebooted so the board enumerated fresh: the device reported problem 0, and
+`pnputil /enum-devices /problem` reported "No devices were found on the
+system", while there was no COM port and no way to reach the board at all.
+Windows does not treat a device with no function driver as broken — it is
+simply a device that does nothing. The first version of this module keyed on
+`CM_PROB_FAILED_INSTALL`, reasoning from the yellow triangle a customer had
+described, and reported that desk as healthy.
+
+So the signal is that no driver is **bound**: the devnode has no Service.
+Problem codes still count — a device really can be disabled, or fail its
+install, which is the shape the customer's machine was in — but they are the
+rarer half.
+
+The driver itself lives at `vendor/ch341ser/`, and its README records where it
+came from and how to replace it. It is bundled into the Windows build only —
+the other two platforms would be carrying a Windows `.sys` around for nothing —
+and a Windows build that cannot find it **fails** rather than quietly producing
+a download that cannot set up a board. That guard exists because the only
+symptom downstream is a single line of `blink install` output.
+
+Detection does not depend on any of it. A build carrying no driver still names
+the problem and points at the vendor's download, which is what `blink status`
+does on a machine where the install was declined.
+
 **One daemon drives one board.** With several attached, the first that answers
 wins and the others are ignored — the protocol, the board-side preference and
 the update path are all written around a single unit. Name a specific one with

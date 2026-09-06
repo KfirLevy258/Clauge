@@ -108,6 +108,51 @@ if [ "$(uname -s)" = "Linux" ]; then
 	set -- "$@" --strip
 fi
 
+# The CH340 driver, on Windows only. macOS and Linux drive the chip out of
+# the kernel and would be carrying a Windows .sys around for nothing.
+#
+# Staged by tools/fetch_ch340_driver.sh, which is a deliberate manual step --
+# read the comment at the top of it before wondering why this is not
+# downloaded here. A build without it is supported and is what every machine
+# produces by default: pc/win_driver.py finds no package and says so.
+# A native C:\... path and a ";" separator, unlike every other --add-data
+# here. Both were arrived at the hard way on the release desk (2026-09-06):
+#
+#   - Handing Git Bash the /c/Users/... form produced
+#     \c\Users\...\vendor\ch341ser -- slashes flipped, drive letter never
+#     mapped. It rewrites arguments that look like paths on their way to a
+#     native program, and gets this one wrong. A path already beginning
+#     "C:\" is left alone, which is what cygpath is for.
+#   - Making it relative instead did not help: PyInstaller resolves a
+#     relative source against the SPEC directory, which --specpath puts in
+#     $BUILD, not against the working directory.
+#
+# The lines above survive on ":" only because their destination is "." --
+# enough for Git Bash to recognise a path list and map the drive properly.
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*)
+	if [ -f "$ROOT/vendor/ch341ser/CH341SER.INF" ]; then
+		DRIVER_WIN=$(cygpath -w "$ROOT/vendor/ch341ser")
+		set -- "$@" --add-data "${DRIVER_WIN};drivers/ch341ser"
+		echo "bundling the CH340 driver from $DRIVER_WIN"
+	elif [ -n "${BLINK_ALLOW_NO_DRIVER:-}" ]; then
+		echo "no CH340 driver, and BLINK_ALLOW_NO_DRIVER is set: this build"
+		echo "  will tell customers to install it by hand"
+	else
+		# Fail, rather than quietly producing a Windows build that cannot
+		# set up a board. The driver is committed under vendor/ch341ser, so
+		# its absence means something is wrong with this checkout -- and the
+		# only symptom downstream is one line of `blink install` output,
+		# which is far too easy to miss on a release.
+		echo "FATAL: no CH340 driver at $ROOT/vendor/ch341ser" >&2
+		echo "  A Windows build without it cannot set up a customer's board." >&2
+		echo "  See vendor/ch341ser/README.md. To build anyway:" >&2
+		echo "    BLINK_ALLOW_NO_DRIVER=1 $0" >&2
+		exit 1
+	fi
+	;;
+esac
+
 cd "$ROOT"
 "$VBIN/pyinstaller" \
 	--onedir \

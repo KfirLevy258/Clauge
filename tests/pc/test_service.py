@@ -382,13 +382,151 @@ def test_schtasks_install_does_not_believe_a_dead_recorded_pid(home, monkeypatch
     assert "not running" in cli.backend().install()
 
 
-def test_schtasks_install_surfaces_why_it_failed(home, monkeypatch):
+def _autostart(monkeypatch, set_err="", present=False):
+    """Stand in for the user's Run key, which only exists on Windows.
+
+    Returns the list every _autostart_set call appends to, so a test can see
+    whether the fallback was actually taken rather than only what was said
+    about it.
+    """
+    written = []
+    state = {"present": present}
+
+    def _set():
+        if set_err:
+            return set_err
+        written.append(cli._autostart_command())
+        state["present"] = True
+        return ""
+
+    monkeypatch.setattr(cli, "_autostart_set", _set)
+    monkeypatch.setattr(cli, "_autostart_clear",
+                        lambda: state.update(present=False))
+    monkeypatch.setattr(cli, "_autostart_present", lambda: state["present"])
+    monkeypatch.setattr(cli, "_start_launcher", lambda: written.append("start"))
+    return written
+
+
+def test_schtasks_install_falls_back_when_windows_refuses_the_task(
+        home, monkeypatch):
+    """A logon trigger needs administrator; the user's Run key does not.
+
+    Measured on the release desk, 2026-09-06: from a non-elevated process
+    `schtasks /create /sc onlogon` answers "Access is denied" while
+    `/sc once` succeeds, on stock ACLs with no policy set. This used to give
+    up there, and the result was a customer with a working board, a correctly
+    installed driver, no daemon, and a panel stuck on its own setup screen.
+    """
     _platform(monkeypatch, "win32")
     _runs(monkeypatch, codes=[1], stderr="ERROR: Access is denied.\n")
+    written = _autostart(monkeypatch)
+    _recorded_pid()
 
     msg = cli.backend().install()
-    assert msg.startswith("could not register a Scheduled Task:")
+    assert msg == "running (starts when you log in)"
+    # It really registered, and really started something -- not just said so.
+    assert cli._autostart_command() in written
+    assert "start" in written
+
+
+def test_schtasks_install_says_so_when_neither_mechanism_works(home,
+                                                               monkeypatch):
+    """Both refused. That is worth reporting in full, with both reasons."""
+    _platform(monkeypatch, "win32")
+    _runs(monkeypatch, codes=[1], stderr="ERROR: Access is denied.\n")
+    _autostart(monkeypatch, set_err="registry is read-only")
+
+    msg = cli.backend().install()
+    assert "could not register a Scheduled Task" in msg
     assert "Access is denied." in msg
+    assert "registry is read-only" in msg
+
+
+def test_schtasks_install_will_not_claim_the_fallback_is_running(home,
+                                                                 monkeypatch):
+    """Same honesty the task path owes: registered is not running."""
+    _platform(monkeypatch, "win32")
+    _runs(monkeypatch, codes=[1], stderr="ERROR: Access is denied.\n",
+          running=False)
+    _autostart(monkeypatch)
+
+    msg = cli.backend().install()
+    assert "not running" in msg
+
+
+def test_schtasks_status_reports_the_fallback_rather_than_not_installed(
+        home, monkeypatch):
+    """The line that made a working install look like a missing one."""
+    _platform(monkeypatch, "win32")
+    _runs(monkeypatch, codes=[1])          # no such task
+    _autostart(monkeypatch, present=True)
+
+    assert cli.backend().status() == "registered to start when you log in"
+
+
+def test_schtasks_status_still_says_not_installed_when_neither_is_there(
+        home, monkeypatch):
+    _platform(monkeypatch, "win32")
+    _runs(monkeypatch, codes=[1])
+    _autostart(monkeypatch, present=False)
+
+    assert cli.backend().status() == "not installed"
+
+
+def test_schtasks_remove_clears_the_run_key_too(home, monkeypatch):
+    """Uninstall does not know which mechanism was used, so it clears both.
+
+    A leftover Run entry points at a program uninstall is about to delete,
+    and would try to start it at every logon for the life of the machine.
+    """
+    _platform(monkeypatch, "win32")
+    _runs(monkeypatch)
+    _autostart(monkeypatch, present=True)
+    monkeypatch.setattr(cli, "_kill_recorded_daemon", lambda: None)
+    monkeypatch.setattr(cli, "_kill_by_path", lambda: None)
+
+    cli.backend().remove()
+    assert cli._autostart_present() is False
+
+
+def test_schtasks_restart_starts_the_launcher_when_there_is_no_task(
+        home, monkeypatch):
+    """`blink update` on a Run-key install must not leave nothing running."""
+    _platform(monkeypatch, "win32")
+    _runs(monkeypatch, codes=[0, 1])       # /end ok, /run fails: no such task
+    written = _autostart(monkeypatch, present=True)
+    monkeypatch.setattr(cli, "_kill_recorded_daemon", lambda: None)
+    _recorded_pid()
+
+    assert cli.backend().restart() == "restarted"
+    assert "start" in written
+
+
+def test_schtasks_restart_still_gives_up_when_there_is_no_fallback_either(
+        home, monkeypatch):
+    _platform(monkeypatch, "win32")
+    _runs(monkeypatch, codes=[0, 1])
+    _autostart(monkeypatch, present=False)
+    monkeypatch.setattr(cli, "_kill_recorded_daemon", lambda: None)
+
+    assert cli.backend().restart() == "could not restart it"
+
+
+def test_the_autostart_runs_the_same_launcher_as_the_task(home):
+    """Both mechanisms must start the bridge identically -- hidden, logging
+    to its own file. A fallback that started it differently would be a second
+    code path to keep working."""
+    assert cli._autostart_command() == (
+        f'wscript.exe //B //Nologo "{cli.launcher_path()}"')
+
+
+def test_the_registry_helpers_are_safe_where_there_is_no_registry(home,
+                                                                  monkeypatch):
+    """They are called from status() on every platform the tests exercise."""
+    monkeypatch.setattr(cli, "_winreg", lambda: None)
+    assert cli._autostart_present() is False
+    assert cli._autostart_set() == "no registry on this system"
+    cli._autostart_clear()                 # must not raise
 
 
 def test_schtasks_remove_ends_deletes_and_kills(home, monkeypatch):

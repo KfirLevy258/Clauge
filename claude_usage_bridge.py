@@ -14,7 +14,8 @@ import serial  # pyserial
 from serial.tools import list_ports
 
 from pc import ota as ota_mod
-from pc import ingest, install_statusline, protocol, statusline_source, update
+from pc import (ingest, install_statusline, protocol, statusline_source,
+                update, win_driver)
 from pc.version import RELEASE_VERSION
 from pc.bridge import Bridge
 
@@ -374,6 +375,17 @@ def wait_for_port(explicit=None, poll_s=3.0, on_wait=None):
             # whose board is simply unplugged, and it is not an error.
             print(f"[bridge] waiting for the board ({explicit or 'USB'})...",
                   file=sys.stderr)
+            # On Windows it may not be unplugged at all. A CH340 with no
+            # driver is on no serial port, so the wait above is what a
+            # customer's log showed for hours while the board sat in front of
+            # them. Named here because the log is the first thing a support
+            # conversation asks for.
+            undriven = win_driver.undriven_boards()
+            if undriven:
+                print(f"[bridge] {win_driver.summary(undriven)}",
+                      file=sys.stderr)
+                for line in win_driver.advice(undriven):
+                    print(f"[bridge] {line}", file=sys.stderr)
             announced = True
         if on_wait is not None:
             try:
