@@ -838,7 +838,8 @@ def test_schtasks_halt_stops_the_daemon_but_keeps_the_registration(
     _platform(monkeypatch, "win32")
     r = _runs(monkeypatch)
     killed = []
-    monkeypatch.setattr(cli, "_kill_recorded_daemon", lambda: killed.append("pid"))
+    monkeypatch.setattr(cli, "_kill_recorded_daemon",
+                        lambda **kw: killed.append("pid"))
 
     cli.backend().halt()
     assert r.ran("schtasks", "/end")

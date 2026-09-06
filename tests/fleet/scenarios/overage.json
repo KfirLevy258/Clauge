@@ -1,0 +1,11 @@
+{
+  "name": "overage",
+  "note": "Session percent crosses 100 and keeps climbing while state moves to failed. A reading past a full ring is still a reading, not a fault -- the board must keep applying frames instead of dropping them at the ring's visual limit.",
+  "steps": [
+    {"at": 0,  "provider": "claude", "session_pct": 96.0,  "weekly_pct": 44.0, "state": "running"},
+    {"at": 8,  "provider": "claude", "session_pct": 100.0, "weekly_pct": 45.0, "state": "running"},
+    {"at": 16, "provider": "claude", "session_pct": 102.0, "weekly_pct": 45.0, "state": "failed"}
+  ],
+  "duration_s": 25,
+  "expect": {"min_tx": 3, "min_board_usage": 3, "min_stale_lines": 0, "min_sleep_wakes": 0}
+}

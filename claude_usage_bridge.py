@@ -6,6 +6,7 @@ Run inside the Zephyr venv (has pyserial) or `pip install pyserial`:
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -72,6 +73,233 @@ CHIP_NAMES = {
     0x0403: "FTDI",
     ESPRESSIF_VID: "Espressif USB",
 }
+
+
+class Tap:
+    """BLINK_TAP: a transcript of everything crossing the serial link.
+
+    The fleet suite runs this daemon against a real board and then has to
+    prove what happened. Nothing else can: the daemon's own stderr log is
+    prose meant for a person, and the board cannot be interrogated after the
+    fact. So when BLINK_TAP names a file, every message and every line the
+    board printed is appended to it as JSON, one object per line, and the
+    test asserts against that.
+
+    Three streams, because two are not enough. `tx` and `rx` prove what the
+    host sent and what the board answered -- but the board answers only
+    hello/ping/pref/ota_*; there is no per-frame ack, so rx alone can never
+    show that a usage frame was applied. What can show it is the board's own
+    console: proto.c prints the usage it took ("[usage] session 50% (12s)
+    ...") on the same wire. That line is the end-to-end evidence, so
+    `console` records it.
+
+    Appended and reopened per write so a test tailing the file sees whole
+    lines, and so a daemon that dies mid-run leaves everything it had.
+
+    Note the deliberate collision of two different `t`s: the tap's own field
+    is the epoch timestamp of the record, while the protocol keys a message's
+    type as "t" inside `msg`. They never meet -- one is the envelope, the
+    other the payload.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        # Serial hands over whatever has arrived, which routinely cuts a
+        # printk in half. Hold the tail until its newline turns up.
+        self._pending = b""
+        self._complained = False
+
+    def _append(self, record):
+        """Append one record, and never let a bad tap path stop the daemon.
+
+        An unwritable or full BLINK_TAP path raises OSError as the file is
+        opened, and console() runs in the read loop -- whose except treats it
+        as a disconnected board. Left to propagate, a broken tap would present
+        as hardware that keeps dropping off the bus, which is the most
+        expensive possible way to report a wrong filename. So it is caught and
+        named as what it is.
+
+        Reported once, then silently skipped, following pc/ingest's rule for a
+        source that has already failed: the board pings every ten seconds and
+        the loop reads continuously, so one line per failed write would bury
+        the daemon's real log within minutes.
+        """
+        try:
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError as e:
+            if not self._complained:
+                self._complained = True
+                print(f"[tap] cannot write {self._path}: {e}."
+                      f" The transcript is incomplete.", file=sys.stderr)
+
+    def tx(self, msg, sent):
+        """Record an outbound message, and whether it reached the wire.
+
+        `sent` is not decoration. send() refuses any line over the board's
+        512-byte limit -- and a fully loaded two-provider frame already
+        measures 484 -- so the refusal happens in exactly the boundary cases
+        this suite exists to catch. A transcript that recorded the refusal as
+        a plain tx would say the host sent a frame the board ignored, and the
+        hunt would start in the firmware for a bug that is in the host.
+
+        Required rather than defaulted so no future caller can record a tx
+        without having decided the question. Later tasks count sent frames, so
+        the key is on every tx record, not only the failures.
+        """
+        self._append({"dir": "tx", "t": time.time(), "msg": msg,
+                      "sent": bool(sent)})
+
+    def rx(self, msg):
+        self._append({"dir": "rx", "t": time.time(), "msg": msg})
+
+    def console(self, data):
+        """Record raw board output, whole lines only.
+
+        Decoded with errors="replace": board output is not guaranteed clean
+        UTF-8 -- a reset mid-line emits noise -- and this is called from the
+        daemon's read loop, where raising would take the link down over a
+        test facility.
+
+        The board's JSON arrives on this same wire, so protocol lines appear
+        here too. That is the point of a raw console tap; a test that wants
+        only messages reads the rx records instead.
+        """
+        self._pending += data
+        *whole, self._pending = self._pending.split(b"\n")
+        for line in whole:
+            text = line.decode("utf-8", errors="replace").rstrip("\r")
+            self._append({"dir": "console", "t": time.time(), "line": text})
+
+    def wrap(self, write_msg, on_message):
+        """(write_msg, on_message) that record, then delegate.
+
+        Wrappers rather than edits at the call sites: the daemon's send() and
+        its inbound dispatch keep their exact behaviour, and the whole
+        facility stays removable.
+
+        The tx record is written after delegating, not before, because only
+        the delegate knows whether the message actually went out -- and from
+        a finally, so a delegate that raises (a board unplugged mid-write)
+        still leaves a not-sent record. That is the moment the transcript is
+        most worth reading, so it is the last one that should be missing.
+        """
+        def write2(m):
+            ok = False
+            try:
+                ok = write_msg(m)
+                return ok
+            finally:
+                self.tx(m, sent=ok)
+
+        def rx2(m):
+            self.rx(m)
+            return on_message(m)
+
+        return write2, rx2
+
+
+def open_tap():
+    """The Tap for this connection, or None when BLINK_TAP is unset.
+
+    Separate from install_tap() because the transcript has to start earlier
+    than the read loop does. The port is opened, then probed, and the probe
+    reads and discards whatever the board said -- which is precisely when the
+    board says what it is and what state it was in. One connection, one Tap,
+    created before the first read.
+    """
+    path = os.environ.get("BLINK_TAP")
+    return Tap(path) if path else None
+
+
+def install_tap(write_msg, on_message, tap=None):
+    """(tap, write_msg, on_message) for this connection.
+
+    Unset BLINK_TAP hands back the two callables it was given, unchanged and
+    unwrapped, and no file is opened. A daemon that behaves differently
+    because a test facility exists is a defect, so the inert path costs one
+    environment lookup and nothing else.
+
+    A caller that already has this connection's Tap passes it in, and gets it
+    back rather than a second one. That matters beyond tidiness: the Tap
+    holds the tail of a console line until its newline arrives, and the
+    probe's last read routinely ends mid-print. A fresh Tap here would drop
+    that tail on the floor and the line would arrive in the transcript with
+    its beginning missing.
+    """
+    tap = tap or open_tap()
+    if tap is None:
+        return None, write_msg, on_message
+    write2, rx2 = tap.wrap(write_msg, on_message)
+    return tap, write2, rx2
+
+
+def poll_interval():
+    """Seconds between usage polls: the shipped 60, unless a test says less.
+
+    A fleet scenario is a timeline -- the percentage climbs, then goes past
+    100 -- and the daemon emits one usage message per poll. At a poll a
+    minute a thirty-second scenario produces exactly one frame, so the
+    sequence the test exists to observe never reaches the board at all. The
+    suite sets BLINK_POLL_INTERVAL_S to about 3 and gets its timeline.
+
+    Worth knowing before shortening it: poll_once() writes a `time` message
+    on EVERY poll, before and independently of the usage message, so this
+    also multiplies `time` traffic to the board. Anything counting frames in
+    the tap must count records whose msg["t"] == "usage" rather than counting
+    tx records.
+
+    Malformed or non-positive is refused rather than obeyed: 0 or a negative
+    makes the poll gate true on every turn of the read loop, which would
+    hammer a rate-limited usage endpoint as fast as the loop spins. It falls
+    back to the default and says so -- once, because main() resolves this at
+    startup and never asks again.
+
+    Non-finite is refused for the opposite reason, and is the quieter hazard
+    of the two. "nan", "inf" and "1e400" all parse without raising, and a
+    positivity check alone lets them through -- every comparison against nan
+    is False, so `nan <= 0` is False. Either one poisons
+    `next_poll = monotonic() + interval`, after which `monotonic() >=
+    next_poll` is False for the rest of the run: polling stops dead, the
+    board never receives usage again, and nothing anywhere says why. Hence
+    isfinite FIRST, before any comparison that nan would win by default.
+    """
+    raw = os.environ.get("BLINK_POLL_INTERVAL_S")
+    if raw is None:
+        return POLL_INTERVAL_S
+    try:
+        seconds = float(raw)
+    except ValueError:
+        seconds = 0
+    if not math.isfinite(seconds) or seconds <= 0:
+        # "usable" rather than "positive": inf IS positive, and telling
+        # someone who typed it that it is not would send them looking in the
+        # wrong direction.
+        print(f"[bridge] BLINK_POLL_INTERVAL_S={raw!r} is not a usable"
+              f" number of seconds; polling every {POLL_INTERVAL_S} s.",
+              file=sys.stderr)
+        return POLL_INTERVAL_S
+    return seconds
+
+
+def build_bus():
+    """The daemon's usage source: scripted when BLINK_SCENARIO says so.
+
+    A fleet test has to reproduce the same invented usage history -- "past
+    100%", "four hours stale" -- on three machines, which no real provider
+    can do, since a real provider reports whatever that machine's tools
+    happened to write. Pointing BLINK_SCENARIO at a scenario file replaces
+    the whole provider set with the one that replays it.
+
+    It replaces rather than joins the set on purpose: a real Claude install
+    on the test machine would otherwise merge its own readings into the
+    scenario and the assertion would depend on whose desk it ran on.
+    """
+    scenario = os.environ.get("BLINK_SCENARIO")
+    if not scenario:
+        return ingest.IngestionBus()
+    from pc.providers.scripted import ScriptedProvider
+    return ingest.IngestionBus(providers=[ScriptedProvider(scenario)])
 
 
 def describe_ports():
@@ -295,7 +523,7 @@ def learn_board(known, port, msg):
             "fw": msg.get("fw") or msg.get("cur") or known.get("fw")}
 
 
-def probe_is_our_board(ser, timeout=PROBE_S):
+def probe_is_our_board(ser, timeout=PROBE_S, tap=None):
     """Ask the thing on this port whether it is a Blink board, without a reset.
 
     Why this exists: the reset below is not free, and it is not aimed at a
@@ -312,6 +540,17 @@ def probe_is_our_board(ser, timeout=PROBE_S):
 
     A pleasant side effect: our own board stops being rebooted every time the
     daemon restarts, which it was, on every login and every service restart.
+
+    `tap` is the connection's transcript, when one is being kept, and this is
+    the only reason it is a parameter. What the board says here would
+    otherwise be read and thrown away: ser.read(n) does not return early on
+    partial data, so a single 0.2 s read comes back holding everything said
+    in that window -- the connect print, the pref reply, and anything the
+    welcome itself provoked. The one that provoked it matters most: a
+    sleeping board wakes on this welcome and prints that it is waking, so the
+    only evidence that it ever slept was being consumed by the question that
+    woke it. Unset BLINK_TAP means tap is None and this path is exactly what
+    it always was.
     """
     try:
         ser.reset_input_buffer()
@@ -323,6 +562,11 @@ def probe_is_our_board(ser, timeout=PROBE_S):
             chunk = ser.read(256)
             if not chunk:
                 continue
+            if tap:
+                # Before the identification below returns, not after: the
+                # chunk that identifies the board is usually the one carrying
+                # everything else it had to say.
+                tap.console(chunk)
             for msg in reader.feed(chunk):
                 # Any well-formed message of ours will do. The board sends
                 # ota_query on welcome and pings on its own schedule; which one
@@ -532,13 +776,17 @@ def main(argv=None):
     # authenticates to Anthropic, and the daemon deliberately does not know
     # which providers exist -- pc/ingest owns that, so onboarding a second
     # tool never reaches this loop.
-    bus = ingest.IngestionBus()
+    bus = build_bus()
     # bus.fetch(), never bus.poll: the fetch has to carry the project name
     # beside the numbers (Bridge.poll_once reads session_pair off it), and a
     # bound method proxies attribute reads to the plain function underneath,
     # so `fetch = bus.poll` left every real desk unnamed while the tests --
     # which built their own fetch -- stayed green.
     fetch = bus.fetch()
+    # Resolved once, here, rather than read inside the loop: the interval is
+    # a property of this run, and the read loop turns often enough that an
+    # environment lookup per pass would be a strange place to spend time.
+    poll_every = poll_interval()
 
     last_err = None
     explicit_port = bool(args.port)
@@ -611,12 +859,17 @@ def main(argv=None):
             # purpose, and clears DTR first so GPIO0 is high when EN releases
             # (run mode, not the ROM loader).
             ser = serial.Serial(port, args.baud, timeout=0.2)
+            # The transcript starts at the port, not at the read loop. Built
+            # here, per connection, and handed to install_tap further down so
+            # a console line torn between the probe and the loop is still one
+            # line. None unless BLINK_TAP is set, which is every customer.
+            tap = open_tap()
             # Ask before pulling the reset line. See probe_is_our_board: the
             # VID:PID that got us here belongs to a chip used by a great deal
             # of hardware that is not ours, and a reset is not a question, it
             # is an action taken on someone's device.
             already_running = probe_is_our_board(
-                ser, PROBE_PATIENT_S if patient else PROBE_S)
+                ser, PROBE_PATIENT_S if patient else PROBE_S, tap)
             asked.add(port)
 
             # May this port be reset if it stays silent?
@@ -711,6 +964,10 @@ def main(argv=None):
         reader = protocol.LineReader()
 
         def send(m):
+            # Returns whether the message reached the wire. Nothing in Bridge
+            # reads it; the tap does, so a message refused below is recorded
+            # as refused instead of as sent.
+            #
             # ota_data is not logged: an image is ~5000 chunks and each line
             # carries 344 characters of base64, which would bury every other
             # message in the log. Bridge prints its own progress every 200.
@@ -730,8 +987,9 @@ def main(argv=None):
             raw, why = protocol.encode_checked(m)
             if raw is None:
                 print(f"[bridge] NOT SENT: {why}", file=sys.stderr)
-                return
+                return False
             ser.write(raw)
+            return True
 
         # The board approved an update. esptool needs the port to itself, so
         # close it, write slot0, and let the outer reconnect loop pick the
@@ -790,7 +1048,18 @@ def main(argv=None):
             update.restart_from_daemon(self_bin)     # does not return
             return True
 
-        bridge = Bridge(write_msg=send, fetch_usage=fetch,
+        # The tap sits around the two callables that carry the link. It was
+        # built at the top of this connection (so the probe's reads are in it)
+        # and is not shared with the next one: a half-line left over from a
+        # board unplugged mid-print cannot glue itself to a later session.
+        # dispatch reaches `bridge` late, by closure: it is assigned just
+        # below and nothing calls dispatch before the read loop.
+        def dispatch(m):
+            return bridge.on_message(m)
+
+        tap, write_msg, dispatch = install_tap(send, dispatch, tap)
+
+        bridge = Bridge(write_msg=write_msg, fetch_usage=fetch,
                         flash_image=flash_image,
                         report_failure=report_failure,
                         set_preferred=bus.set_preferred,
@@ -828,9 +1097,11 @@ def main(argv=None):
                     # Echo raw board console (logs + its [usage] prints) for visibility.
                     sys.stderr.buffer.write(data)
                     sys.stderr.buffer.flush()
+                    if tap:
+                        tap.console(data)
                     for msg in reader.feed(data):
                         print(f"[bridge] <- {msg}", file=sys.stderr)
-                        bridge.on_message(msg)
+                        dispatch(msg)
                         # A message of ours off this port is the only
                         # positive identification there is. Write it down:
                         # the next start opens this port directly instead
@@ -861,7 +1132,7 @@ def main(argv=None):
                     # below is free.)
                     if bridge.board_alive():
                         bridge.poll_once()
-                    next_poll = time.monotonic() + POLL_INTERVAL_S
+                    next_poll = time.monotonic() + poll_every
                 if time.monotonic() >= next_fast_poll:
                     # The fast tick, after the heartbeat on purpose: when both
                     # come due in the same pass the heartbeat has already sent

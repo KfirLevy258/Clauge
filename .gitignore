@@ -24,6 +24,12 @@ docs/superpowers/
 # PyInstaller output; binaries are built per-platform in CI, never committed.
 /dist/
 
+# The fleet suite's local results, and the venv the suite runs in. Both are
+# per-machine: last_run.json names a commit and a wall clock, and a release
+# gated on someone else's copy of it would be gated on nothing.
+.fleet/
+.venv-test/
+
 # The running daemon's pid file. It was TRACKED, so every session with the
 # service up left `git status` dirty and the number went into commits as
 # whatever pid happened to be running on the author's machine -- which is not

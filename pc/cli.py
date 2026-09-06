@@ -657,14 +657,53 @@ class _Backend:
         stopping a daemon that launchd or systemd would restart a second later
         buys a gap on the board and nothing else. So: a no-op by default, on
         purpose.
+
+        Not stop() below, which is deliberately a different thing: stop() is
+        half of a pair a test run must be able to undo on every platform, and
+        it reports what happened. This is best effort, silent, and only where
+        an open file handle would otherwise fail a rename.
         """
         return None
+
+    def stop(self, runner=None) -> str:
+        """Stop the installed service, without uninstalling it.
+
+        Restart() is what `blink update` needs; this pair is what a test run
+        needs. The fleet suite drives the real daemon against a real board, so
+        it has to take the serial port off the service that owns it and hand
+        it back afterwards -- on a machine the user works on, where anything
+        that touched the plist, the unit file or the Scheduled Task itself
+        would rewrite their own installation on the way past. So: stop and
+        start only, and a service that is not installed is an answer rather
+        than an error, because start() is called from a finally block where
+        an exception would replace the failure the run was there to find.
+
+        runner is subprocess.run unless a caller substitutes one. Resolved at
+        call time rather than bound as a default argument, so a test that
+        stubs subprocess.run is still in charge of what this can execute.
+        """
+        return "not running under a supervisor; stop it yourself"
+
+    def start(self, runner=None) -> str:
+        """Start the installed service again. See stop() for the pair.
+
+        Not a restart: this assumes stop() ran, and does not go looking for
+        anything else to kill. A caller that wants both is asking for
+        restart().
+        """
+        return "not running under a supervisor; start it yourself"
 
     def remove(self) -> str:
         return "nothing to remove"
 
     def status(self) -> str:
         return f"unknown on {sys.platform}"
+
+
+# launchctl exits with an errno. ESRCH is what booting out a job launchd is
+# not running gives back ("Boot-out failed: 3: No such process"), which is an
+# answer rather than a failure -- see _LaunchdBackend.stop.
+_ESRCH = 3
 
 
 class _LaunchdBackend(_Backend):
@@ -687,6 +726,23 @@ class _LaunchdBackend(_Backend):
         # immediately after it can fail while launchd is still tearing the old
         # job down, which left a reinstall with no service running at all --
         # observed on the second install of the day, silently.
+        #
+        # That retry is still worth having, but it was only ever half of this
+        # story: it guards a bootstrap that FAILS. A bootstrap that succeeds
+        # also starts nothing. Measured on a live machine, with this very
+        # plist (RunAtLoad is set in _PLIST_TEMPLATE):
+        #
+        #   launchctl bootout   gui/501/com.blink.bridge   -> rc 0
+        #   launchctl bootstrap gui/501 <plist>            -> rc 0
+        #   launchctl print     gui/501/com.blink.bridge   -> "not running",
+        #                                                     runs = 0
+        #                          (still not running six seconds later)
+        #   launchctl kickstart gui/501/com.blink.bridge   -> running, runs = 1
+        #
+        # So bootstrap registers the job and kickstart is what runs it. Until
+        # this line existed the customer was told "running (launchd)" about a
+        # job that was registered and idle, and that would not have actually
+        # started before their next login.
         for attempt in range(4):
             r = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", plist_path()],
                                capture_output=True, **update.ota.NO_WINDOW)
@@ -780,6 +836,69 @@ class _LaunchdBackend(_Backend):
         # left to do is read why it died.
         return ("restarted, but launchd reports it is not running -- "
                 f"see {log_path()}")
+
+    def stop(self, runner=None) -> str:
+        """bootout, not `launchctl stop`.
+
+        The plist sets KeepAlive, so a stopped job is one launchd starts
+        straight back up -- the process would be gone for about a second and
+        the serial port would be held again before anything else could take
+        it. bootout unloads the job; the plist stays exactly where it is, and
+        start() below bootstraps that same file back in.
+
+        A job that is not loaded is stopped, not a failure. launchctl exits
+        with an errno, and booting out something launchd has never heard of
+        gives ESRCH -- "Boot-out failed: 3: No such process". That is an
+        ordinary state: a plist on disk whose agent was already booted out,
+        by a previous run or by hand. Reported as a failure it aborts the
+        fleet agent with "the serial port is probably still held", about a
+        port that is in fact free.
+        """
+        if not os.path.exists(plist_path()):
+            return "not installed"
+        uid = os.getuid()
+        r = (runner or subprocess.run)(
+            ["launchctl", "bootout", f"gui/{uid}/{LABEL}"],
+            capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode == 0:
+            return "stopped"
+        if r.returncode == _ESRCH:
+            return "stopped (it was not loaded)"
+        return f"could not stop it: launchctl bootout gui/{uid}/{LABEL}"
+
+    def start(self, runner=None) -> str:
+        """bootstrap, and then kickstart, because bootstrap starts nothing.
+
+        `launchctl bootstrap` registers the job with launchd and exits 0
+        without running it, RunAtLoad in the plist notwithstanding. Measured
+        on a live machine -- see the block in install(), which had the same
+        gap -- a bootstrapped job sits at "not running / runs = 0" for as
+        long as you care to watch it, and one kickstart turns it into
+        "running / runs = 1" with a pid.
+
+        This is the fleet suite's restore path, called from a finally block
+        on a machine someone works at. Answering "started" for a registered
+        but idle job is the worst answer available here: the run reports
+        success, the daemon never retakes the serial port, and the desk goes
+        dark with nothing pointing at the cause. So a kickstart that fails
+        is a failed start, even though the job is registered -- what the
+        caller asked for is a process holding the port again.
+        """
+        if not os.path.exists(plist_path()):
+            return "not installed"
+        uid = os.getuid()
+        run = runner or subprocess.run
+        r = run(["launchctl", "bootstrap", f"gui/{uid}", plist_path()],
+                capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode != 0:
+            # No job to kick, and a second failing command would only bury the
+            # one line the operator needs to paste.
+            return f"could not start it: launchctl bootstrap gui/{uid} {plist_path()}"
+        k = run(["launchctl", "kickstart", f"gui/{uid}/{LABEL}"],
+                capture_output=True, **update.ota.NO_WINDOW)
+        if k.returncode == 0:
+            return "started"
+        return f"could not start it: launchctl kickstart gui/{uid}/{LABEL}"
 
     def remove(self) -> str:
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
@@ -1076,16 +1195,63 @@ class _SchtasksBackend(_Backend):
     def halt(self) -> None:
         """Let go of bin\\blink.exe so the update swap can rename the directory.
 
-        Both mechanisms, because an install may use either: /end reaches the
-        instance the scheduled task launched, and the recorded pid reaches a
-        daemon that started its own successor detached. The task registration
-        and the Run key are both left alone -- restart() puts a daemon back a
-        moment later, and a halt that unregistered the service would turn a
-        failed update into a machine that never starts Blink again.
+        Windows is the one platform where halting is not the same as stopping
+        a supervised service: it is the one that refuses to rename a directory
+        while a process holds a file open inside it. stop() already frees
+        exactly what needs freeing here -- /end for the instance the task
+        launched, and the recorded pid for a daemon that started its own
+        successor detached -- and leaves the task and the Run key alone, which
+        is the property that matters: a halt that unregistered the service
+        would turn a failed update into a machine that never starts Blink
+        again.
+
+        The answer is discarded on purpose. There is nothing a caller in the
+        middle of an update can do with "not installed", and update._replace()
+        waits for the handle regardless of whether this took.
         """
-        subprocess.run(["schtasks", "/end", "/tn", TASK_NAME],
-                       capture_output=True, **update.ota.NO_WINDOW)
-        _kill_recorded_daemon()
+        self.stop()
+
+    def _registered(self, runner=None) -> bool:
+        r = (runner or subprocess.run)(["schtasks", "/query", "/tn", TASK_NAME],
+                                       capture_output=True, **update.ota.NO_WINDOW)
+        return r.returncode == 0
+
+    def stop(self, runner=None) -> str:
+        """/end, and then the daemon /end cannot reach.
+
+        Same trap as restart(): /end stops the instance the TASK launched,
+        while a daemon that replaced itself started its successor detached
+        (see update.restart_from_daemon). That successor keeps the serial
+        port, and a second process asking for the same COM port is refused
+        with "Access is denied" -- which looks exactly like a board fault. So
+        the kill happens even when there is no task registered at all: the
+        port is the thing being freed here, not the task, and an unregistered
+        task with a live detached daemon says so rather than reporting the
+        bare "not installed" that would deny the port was ever held.
+        """
+        run = runner or subprocess.run
+        registered = self._registered(run)
+        r = None
+        if registered:
+            r = run(["schtasks", "/end", "/tn", TASK_NAME],
+                    capture_output=True, **update.ota.NO_WINDOW)
+        killed = _kill_recorded_daemon(runner=run)
+        if not registered:
+            return ("not installed; killed a detached daemon" if killed
+                    else "not installed")
+        if r.returncode == 0:
+            return "stopped"
+        return f'could not stop it: schtasks /end /tn "{TASK_NAME}"'
+
+    def start(self, runner=None) -> str:
+        run = runner or subprocess.run
+        if not self._registered(run):
+            return "not installed"
+        r = run(["schtasks", "/run", "/tn", TASK_NAME],
+                capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode == 0:
+            return "started"
+        return f'could not start it: schtasks /run /tn "{TASK_NAME}"'
 
     def remove(self) -> str:
         subprocess.run(["schtasks", "/end", "/tn", TASK_NAME], capture_output=True, **update.ota.NO_WINDOW)
@@ -1187,6 +1353,32 @@ class _SystemdBackend(_Backend):
             return "restarted"
         return ("restarted, but systemd reports it is not running -- "
                 "see: systemctl --user status blink-bridge.service")
+
+    def stop(self, runner=None) -> str:
+        if not self._has_systemctl():
+            return super().stop(runner)
+        if not os.path.exists(unit_path()):
+            return "not installed"
+        r = (runner or subprocess.run)(
+            ["systemctl", "--user", "stop", "blink-bridge.service"],
+            capture_output=True, **update.ota.NO_WINDOW)
+        # An explicit stop is not undone by Restart=always, so unlike launchd
+        # this needs nothing stronger than the obvious command.
+        if r.returncode == 0:
+            return "stopped"
+        return "could not stop it: systemctl --user stop blink-bridge.service"
+
+    def start(self, runner=None) -> str:
+        if not self._has_systemctl():
+            return super().start(runner)
+        if not os.path.exists(unit_path()):
+            return "not installed"
+        r = (runner or subprocess.run)(
+            ["systemctl", "--user", "start", "blink-bridge.service"],
+            capture_output=True, **update.ota.NO_WINDOW)
+        if r.returncode == 0:
+            return "started"
+        return "could not start it: systemctl --user start blink-bridge.service"
 
     def remove(self) -> str:
         if not self._has_systemctl():
@@ -1297,8 +1489,12 @@ def _remove_service() -> str:
 _rm = update._rm
 
 
-def _kill_recorded_daemon():
+def _kill_recorded_daemon(runner=None) -> int:
     """Stop the bridge by the pid it wrote for itself, not by its name.
+
+    Returns how many pids it signalled, which stop() reports: on a machine
+    with no Scheduled Task registered, a daemon killed here is the difference
+    between a freed serial port and one still held.
 
     Ending the Scheduled Task ends the process the task launched. PyInstaller's
     onefile bootloader re-executes the same .exe as a child, and that child
@@ -1311,7 +1507,8 @@ def _kill_recorded_daemon():
     what the previous attempt did. /t takes the bootloader's child with it.
     """
     if sys.platform != "win32":
-        return
+        return 0
+    killed = 0
     # Every place a daemon may have left its pid: ~/.blink since 1.1.0, and
     # beside the program before that -- which, after 1.1.0's install has
     # rotated the directory, means bin.old. The first 1.0.4 -> 1.1.0
@@ -1327,9 +1524,16 @@ def _kill_recorded_daemon():
             continue
         if pid == os.getpid():
             continue              # somehow ours; nothing to stop
-        subprocess.run(["taskkill", "/f", "/t", "/pid", str(pid),
-                        "/fi", "IMAGENAME eq " + os.path.basename(installed_bin())],
-                       capture_output=True, **update.ota.NO_WINDOW)
+        # runner, so _Backend.stop() can be handed one and have every command
+        # it causes go the same way. None is subprocess.run, resolved here
+        # rather than as a default argument so the existing callers -- and the
+        # tests that stub subprocess.run for them -- are unaffected.
+        (runner or subprocess.run)(
+            ["taskkill", "/f", "/t", "/pid", str(pid),
+             "/fi", "IMAGENAME eq " + os.path.basename(installed_bin())],
+            capture_output=True, **update.ota.NO_WINDOW)
+        killed += 1
+    return killed
 
 
 def _kill_by_path():

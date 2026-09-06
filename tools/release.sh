@@ -11,6 +11,38 @@ TAG="v$(sed -n 's/#define BLINK_FW_VERSION "\(.*\)"/\1/p' "$ROOT/firmware/src/ve
 
 VER="${TAG#v}"
 [ -n "$VER" ] || { echo "FATAL: no version in version.h"; exit 1; }
+# A release nobody put on a board is a guess. tools/fleet/run.py drives a real
+# board on all three desks and writes .fleet/last_run.json; pc/fleet_gate.py
+# re-reads that file here and insists on all six of: green, for THIS commit,
+# finished within twelve hours, not narrowed by --only, not narrowed by
+# --scenarios, and one clean pass from every desk in tools/fleet/fleet.toml.
+#
+# The last two are why the gate is not simply `grep ok`. `run.py --only
+# kfir-ubuntu` exits 0 with ok: true and is RIGHT to -- that run passed -- so
+# a single-desk result is both honest and nowhere near enough to ship on. The
+# desk list comes from fleet.toml rather than from the result, which cannot
+# vouch for its own completeness.
+#
+# It refuses whenever it cannot check: no file, an unreadable one, a missing
+# inventory, or a python3 too old for tomllib (/usr/bin/python3 is still 3.9
+# on macOS, and this script calls plain `python3`). Silence from a gate must
+# never read as approval.
+#
+# PYTHONPATH because -m adds the CALLER's directory to sys.path, not this
+# checkout, and a release may be started from anywhere.
+if [ "${BLINK_SKIP_FLEET:-}" = "1" ]; then
+	echo "WARNING: BLINK_SKIP_FLEET=1 -- $TAG is being built with no proof" >&2
+	echo "         that it runs on any board. Nothing below checks that." >&2
+else
+	PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m pc.fleet_gate \
+		"$ROOT/.fleet/last_run.json" "$(git -C "$ROOT" rev-parse HEAD)" \
+		"$ROOT/tools/fleet/fleet.toml" || {
+		echo "FATAL: the fleet gate refused $TAG for the reason above." >&2
+		echo "       Prove this commit on all three desks first:" >&2
+		echo "         python3 tools/fleet/run.py" >&2
+		echo "       BLINK_SKIP_FLEET=1 releases without it." >&2
+		exit 1; }
+fi
 # The tag has to exist on the remote BEFORE the draft is created.
 #
 # A draft release does not create its git tag -- GitHub only writes the tag

@@ -96,6 +96,15 @@ class IngestionBus:
         # regardless of whether that call finds anything to seed.
         self._seeded = False
 
+    def provider_ids(self):
+        """Which providers this bus is polling, by id.
+
+        A public accessor so a caller that needs to know -- the fleet tests
+        checking that BLINK_SCENARIO really did replace the real sources --
+        does not have to reach into _providers and freeze that name in place.
+        """
+        return [p.get_provider_id() for p in self._providers]
+
     def add_provider(self, provider):
         """Onboard a provider at runtime. Nothing else has to change."""
         self._providers.append(provider)
