@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 
-from pc import (install_codex_hooks, install_hooks, install_statusline,
+from pc import (install_codex_hooks, install_hooks, install_statusline, ota,
                 protocol, statusline_source, update, win_driver)
 # Eagerly, unlike the other providers, which are imported inside the functions
 # that use them to keep the frozen binary's start-up cheap. This one costs
@@ -2162,6 +2162,16 @@ def board_lines(known, ports, undriven=(), blink_cmd="blink"):
         out.append(f"            also: {win_driver.summary(undriven)}")
         out += [f"            {line}"
                 for line in win_driver.advice(undriven, blink_cmd)]
+    # The board running a LATER release than this app. The two ship from one
+    # tag and install together, so this means something split them -- a
+    # hand-flash, or an app update that failed after the firmware went on.
+    # Whichever, the half that is behind is the one the panel cannot reach:
+    # the board's update row says the app is old and no tap can fix it.
+    # Naming the command is the whole point of the line.
+    if ota.is_newer(known.get("fw") or "", RELEASE_VERSION):
+        out.append(f"            the board is on {known['fw']} and this app is"
+                   f" {RELEASE_VERSION} -- they ship together")
+        out.append(f"            run: {blink_cmd} update")
     return out
 
 

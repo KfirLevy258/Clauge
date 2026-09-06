@@ -229,6 +229,108 @@ def test_hello_still_wins_and_does_not_double_announce(capsys):
     assert b._board_ahead() is False
 
 
+# --- the pair must not split ------------------------------------------------
+#
+# Firmware and the daemon ship from one tag and install together: _on_ota_flash
+# does the app first, so the newest firmware is never driven by the oldest app.
+# The split happens when the app half cannot be worked out at all -- a network
+# blip or a signature that will not verify makes fetch_signed_manifest return
+# None, and _app_available answers None, which is indistinguishable from "this
+# release has no newer app". Offering the firmware anyway turned a transient
+# failure into a permanent mismatch, and the half left behind is the one the
+# panel cannot reach.
+
+from pc.version import RELEASE_VERSION as _APP_VER    # noqa: E402
+
+
+def _ahead_of_the_app():
+    major, minor, patch = (int(n) for n in _APP_VER.split("."))
+    return f"{major + 1}.{minor}.{patch}"
+
+
+def _ota_bridge(sent, manifest, app_update, self_update=lambda *a: True):
+    b = Bridge(write_msg=sent.append, fetch_usage=lambda: None,
+               fetch_manifest=lambda: manifest, self_update=self_update)
+    b._app_available = lambda m: app_update
+    return b
+
+
+def _newer_release(version):
+    return {"version": version, "size": 100, "sha256": "ab" * 32}
+
+
+def test_firmware_newer_than_this_app_is_not_offered_without_its_app_half(
+        capsys):
+    sent = []
+    version = _ahead_of_the_app()
+    b = _ota_bridge(sent, _newer_release(version), None)
+    b.on_message({"t": "ota_query", "v": 2, "cur": "0.6.0"})
+
+    assert any(m.get("t") == "ota_none" for m in sent)
+    assert not any(m.get("t") == "ota_avail" for m in sent)
+    err = capsys.readouterr().err
+    assert "not offering" in err
+    assert "signed manifest could not be read" in err
+
+
+def test_firmware_newer_than_this_app_IS_offered_with_its_app_half(capsys):
+    """The ordinary case, and the reason the rule is about the app half
+    rather than about the version: both are in hand, so they install
+    together and nothing is left behind."""
+    sent = []
+    version = _ahead_of_the_app()
+    b = _ota_bridge(sent, _newer_release(version),
+                    (version, {"size": 1, "sha256": "cd" * 32}))
+    b.on_message({"t": "ota_query", "v": 2, "cur": "0.6.0"})
+
+    avail = [m for m in sent if m.get("t") == "ota_avail"]
+    assert avail, sent
+    assert avail[0].get("app") == version
+
+
+def test_a_release_level_with_this_app_is_offered_as_it_always_was():
+    """A firmware-only release -- the manifest carries no newer daemon -- is
+    exactly the case _app_available answers None for legitimately. The rule
+    must not swallow it."""
+    sent = []
+    b = _ota_bridge(sent, _newer_release(_APP_VER), None)
+    b.on_message({"t": "ota_query", "v": 2, "cur": "0.6.0"})
+
+    assert any(m.get("t") == "ota_avail" for m in sent), sent
+
+
+def test_a_platform_with_no_published_app_still_gets_its_firmware(capsys):
+    """The pair CANNOT be kept on a machine the release publishes no daemon
+    for. Refusing firmware there would strand it forever, so it is offered
+    with the reason in the log."""
+    sent = []
+    version = _ahead_of_the_app()
+    b = _ota_bridge(sent, _newer_release(version), None)
+
+    from pc import update as update_mod
+    real = update_mod.platform_key
+    update_mod.platform_key = lambda: None
+    try:
+        b.on_message({"t": "ota_query", "v": 2, "cur": "0.6.0"})
+    finally:
+        update_mod.platform_key = real
+
+    assert any(m.get("t") == "ota_avail" for m in sent), sent
+    assert "publishes no app for this platform" in capsys.readouterr().err
+
+
+def test_a_daemon_that_cannot_replace_itself_is_not_held_back():
+    """Nothing wires self_update outside claude_usage_bridge -- a checkout, a
+    test, `blink run` from source. There is no app half to pair with there,
+    and refusing firmware would break the development path for a rule that
+    exists to protect customers."""
+    sent = []
+    b = Bridge(write_msg=sent.append, fetch_usage=lambda: None,
+               fetch_manifest=lambda: _newer_release(_ahead_of_the_app()))
+    b.on_message({"t": "ota_query", "v": 2, "cur": "0.6.0"})
+    assert any(m.get("t") == "ota_avail" for m in sent), sent
+
+
 class OverageCapIsWiredTest(unittest.TestCase):
     """poll_once must actually apply the cap.
 

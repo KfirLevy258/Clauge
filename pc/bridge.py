@@ -268,6 +268,16 @@ class Bridge:
         # the board says so on the confirmation screen, because the customer is
         # about to approve two installs with one tap and should know it.
         self._app_update = self._app_available(m)
+        why = self._app_pairing(m)
+        if why:
+            # Not offered rather than offered half. A board a release ahead of
+            # its app is a mismatch nothing on the panel can fix, and this is
+            # the one moment where declining costs only a retry.
+            print(f"[bridge] ota: not offering {m.get('version')} -- {why}",
+                  file=sys.stderr)
+            self._ota_reset()
+            self._write(protocol.ota_none())
+            return
         app = self._app_update[0] if self._app_update else None
         print(f"[bridge] ota: offering {m['version']} ({m['size']} bytes)"
               + (f", app {app}" if app else ""), file=sys.stderr)
@@ -298,6 +308,48 @@ class Bridge:
             return update.available(self._fetch_signed())
         except Exception:
             return None
+
+    def _app_pairing(self, m):
+        """Why this app cannot pair with release `m`, or "" when it can.
+
+        The board can end up a release AHEAD of the app on this computer, and
+        then the half that is behind is the half the panel cannot reach: the
+        board's update row says the app is old and no tap on it can help.
+        1.3.1 made the board tell the truth about that; this is what stops it
+        happening by accident.
+
+        Firmware and the daemon ship from one tag and are meant to install
+        together -- _on_ota_flash does the app first, precisely so the newest
+        firmware is never driven by the oldest app. The pair splits when the
+        app half cannot be worked out at all: fetch_signed_manifest returns
+        None on a network blip or a signature that does not verify, and
+        _app_available answers None either way, which is indistinguishable
+        from "this release has no newer app". Offering the firmware anyway
+        turns a transient failure into a permanent mismatch.
+
+        A platform with no published daemon build is a different thing and
+        gets a different answer -- there the pair CANNOT be kept, by design,
+        and refusing firmware forever would strand those machines. They are
+        offered it, with a line in the log saying why.
+        """
+        version = m.get("version", "")
+        if not ota_mod.is_newer(version, RELEASE_VERSION):
+            return ""           # this app is level with the release or ahead
+        if self._self_update is None:
+            return ""           # not running as a daemon that can replace itself
+        try:
+            from pc import update
+            if update.platform_key() is None:
+                print(f"[bridge] ota: {version} publishes no app for this"
+                      " platform; the board will run ahead of the app",
+                      file=sys.stderr)
+                return ""
+        except Exception:
+            pass
+        if self._app_update is not None:
+            return ""           # both halves in hand: _on_ota_flash pairs them
+        return (f"release {version} is newer than this app ({RELEASE_VERSION})"
+                " but its signed manifest could not be read")
 
     def _resume_pending(self):
         """Finish an install the user approved before we replaced ourselves.
