@@ -25,8 +25,8 @@ is the board's own console line -- unconditional, one per applied frame:
   - min_stale_lines: how many of those board lines must carry the STALE
     marker (only stale_age.json asks for more than zero).
   - min_sleep_wakes: how many times the board must wake from sleep and then
-    apply a frame -- a "[sleep] host back; opening eyes" line (ui_sleep.c:100)
-    followed by an applied one. Only sleep_wake.json asks for more than zero,
+    apply a frame -- a tap_asserts.WOKE_MARKER line off the board, followed
+    by an applied one. Only sleep_wake.json asks for more than zero,
     and it earns it by stopping the daemon, not by spacing its steps out.
 
 That last key replaced a `quiet_window_s` that could not fail. The board
@@ -79,24 +79,36 @@ def test_at_least_four_scenarios_present():
 
 
 def test_every_scenario_loads_and_plays_to_completion():
-    """Every step becomes a frame, one per poll, in the order written.
+    """Every step becomes a frame, one new one per poll, in the order written.
 
-    One per poll is the provider's contract (pc/providers/scripted.py): a
-    poll carries one usage message to the board however many frames it was
-    given, so a scenario whose min_tx is its step count -- which is all of
-    them -- needs one poll per step. A daemon that starts polling late
-    therefore replays the timeline late rather than losing the middle of it.
+    One NEW step per poll is the provider's contract
+    (pc/providers/scripted.py): a poll carries one usage message to the board
+    however many frames it was given, so a scenario whose min_tx is its step
+    count -- which is all of them -- needs one poll per step. A daemon that
+    starts polling late therefore replays the timeline late rather than
+    losing the middle of it.
+
+    Polled beyond the last step, the provider repeats that step rather than
+    going empty, because a reading is a level and not an event. The check is
+    therefore on the sequence of DISTINCT readings, in order, not on the
+    number of frames a given number of polls happens to produce.
     """
     for doc, path in _all_scenarios():
         clock = [0.0]
         sp = ScriptedProvider(path, now=lambda: clock[0])
         clock[0] = doc["duration_s"] + 1          # every step is due at once
         played = []
-        for _ in range(len(doc["steps"]) + 1):
+        # Two extra polls: enough to show the last reading holds instead of
+        # the source disappearing under the heartbeat.
+        for _ in range(len(doc["steps"]) + 2):
             played += sp.poll(clock[0])
-        assert len(played) == len(doc["steps"]), path
-        assert [f.session_pct for f in played] == \
-            [s["session_pct"] for s in doc["steps"]], f"{path}: oldest first"
+
+        pcts = [f.session_pct for f in played]
+        want = [s["session_pct"] for s in doc["steps"]]
+        assert pcts[:len(want)] == want, f"{path}: oldest first"
+        assert set(pcts[len(want):]) <= {want[-1]}, (
+            f"{path}: past the last step the provider must repeat it, not"
+            f" invent readings -- got {pcts[len(want):]}")
 
 
 def test_every_scenario_has_a_well_formed_expect_block():

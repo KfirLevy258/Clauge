@@ -26,8 +26,8 @@ assertions are wrong here:
     that is alive can never leave the board 30 s silent (HOST_TIMEOUT_MS,
     proto.c:29) at any poll interval. Sleep is a daemon-lifecycle event, not
     a data event: it fires when the daemon is GONE. What proves it happened
-    is "[sleep] host back; opening eyes", printed from inside ui_sleep_run()
-    (firmware/src/ui_sleep.c:100) and reachable from nowhere else.
+    is the line ui_sleep_run() prints when its sleep loop exits, reachable
+    from nowhere else -- see WOKE_MARKER below.
 
   - Counting tx records over-counts. poll_once() (pc/bridge.py:396-401)
     writes a `time` message on EVERY poll, before and independently of the
@@ -67,11 +67,19 @@ STALE_MARKER = "STALE"
 # ui_sleep.c:100. The board prints this on the way out of its sleep loop and
 # nowhere else, so it cannot appear unless sleep_should_start() fired -- which
 # needs proto_host_lost(), which needs 30 s with no host line at all. It is
-# also the first half of the cycle the tap can actually SEE: "[proto] host
-# went away" and "[sleep] host silent; closing eyes" are both printed while
-# the daemon is stopped and nothing is reading the port, so they are lost.
-# This one is printed because the daemon came back, with the port open.
-WOKE_MARKER = "[sleep] host back; opening eyes"
+# also the half of the cycle the tap can actually SEE: "[sleep] dozing" is
+# printed while the daemon is stopped and nothing is reading the port, so it
+# is lost. This one is printed because the daemon came back, with the port
+# open.
+#
+# The exact string is firmware/src/ui_sleep.c's, immediately after the sleep
+# loop exits. It was written down here as "[sleep] host back; opening eyes",
+# which the firmware has never printed -- so the assertion could not pass on
+# any board, and the first real fleet run failed a board that had slept and
+# woken perfectly (2026-09-07: "[sleep] waking" at 77.0 s, a fresh frame
+# applied at 78.0 s). test_the_wake_marker_is_a_string_the_firmware_prints
+# now reads the firmware and fails if this drifts again.
+WOKE_MARKER = "[sleep] waking"
 
 # All four, and no defaulting. A key that falls back to zero when it is
 # missing deletes its own assertion: a stale_age-shaped run with no STALE

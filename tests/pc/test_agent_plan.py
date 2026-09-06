@@ -21,6 +21,7 @@ import pytest
 
 from pc.service_ctl import Outcome
 from tests.fleet import agent
+from tests.fleet.tap_asserts import WOKE_MARKER
 
 
 class _FakeProc:
@@ -370,8 +371,11 @@ def _sleeper(events=None):
             env["BLINK_TAP"]) else False
         out = _tap_lines({"steps": [{"at": 0}, {"at": 5}]})
         if woke:
-            out.insert(0, {"dir": "console", "t": 0.0,
-                           "line": "[sleep] host back; opening eyes"})
+            # From the marker, never a copy of it. A third hand-written copy
+            # of this string is a third place for it to disagree with the
+            # firmware -- which is exactly how a board that slept and woke
+            # correctly failed its first real fleet run.
+            out.insert(0, {"dir": "console", "t": 0.0, "line": WOKE_MARKER})
         return out
     return _spawner(lines, events)
 
@@ -555,8 +559,7 @@ def test_a_late_connect_on_the_WAKE_pass_is_inconclusive_too(tmp_path):
     def late_second(env, attempt):
         out = _tap_lines({"steps": [{"at": 0}, {"at": 5}]})
         if os.path.getsize(env["BLINK_TAP"]) > 0:      # the wake pass
-            out.insert(0, {"dir": "console", "t": 0.0,
-                           "line": "[sleep] host back; opening eyes"})
+            out.insert(0, {"dir": "console", "t": 0.0, "line": WOKE_MARKER})
             out = [dict(r, t=r["t"] + 30) for r in out]
         return out
 

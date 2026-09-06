@@ -9,7 +9,7 @@ that merely echoes them, or accepting an `expect` block that demands nothing.
 import json
 from pathlib import Path
 
-from tests.fleet.tap_asserts import check
+from tests.fleet.tap_asserts import WOKE_MARKER, check
 
 SCENARIOS = Path(__file__).resolve().parents[2] / "tests" / "fleet" / "scenarios"
 
@@ -100,8 +100,30 @@ def test_stale_lines_are_counted():
 
 
 def _woke(t):
-    """ui_sleep.c:100, printed only from inside the board's sleep loop."""
-    return {"dir": "console", "t": t, "line": "[sleep] host back; opening eyes"}
+    """The line the board prints when its sleep loop exits.
+
+    Built FROM the marker rather than repeating it. This helper used to carry
+    its own copy of the string, so the checker and its tests agreed with each
+    other and with nothing else -- the suite was green while the marker was a
+    sentence the firmware has never printed, and the first real fleet run
+    failed a board that had slept and woken correctly.
+    """
+    return {"dir": "console", "t": t, "line": WOKE_MARKER}
+
+
+def test_the_wake_marker_is_a_string_the_firmware_prints():
+    """The one assertion the fleet's sleep verdict rests on.
+
+    Nothing else in the suite can catch this: a marker the firmware never
+    prints makes every sleep_wake run fail, and a marker that is merely
+    out of date makes it fail on the desk rather than here, hours later,
+    looking like a hardware fault.
+    """
+    src = (Path(__file__).resolve().parents[2]
+           / "firmware" / "src" / "ui_sleep.c").read_text(encoding="utf-8")
+    assert f'printk("{WOKE_MARKER}\\n")' in src, (
+        f"{WOKE_MARKER!r} is not printed by ui_sleep.c any more -- the fleet"
+        " suite's sleep verdict is asserting a line no board will emit")
 
 
 def test_a_sleep_wake_needs_the_board_to_say_it_woke_and_then_apply():
@@ -110,8 +132,8 @@ def test_a_sleep_wake_needs_the_board_to_say_it_woke_and_then_apply():
     The board stamps last_host_ms on ANY host protocol line (proto.c:262) and
     the daemon pongs every ping, so with a daemon alive the 30s host timeout
     is unreachable at any poll interval -- a gap between applied frames is
-    just a gap. "[sleep] host back; opening eyes" is printed nowhere but
-    inside ui_sleep_run(), which runs only when the host was genuinely lost.
+    just a gap. WOKE_MARKER is printed nowhere but where ui_sleep_run()'s
+    sleep loop exits, which happens only when the host was genuinely lost.
     """
     exp = dict(BASE, min_sleep_wakes=1)
     slept = [_rx(0, "hello"), _tx(1, session_pct=50.0), _applied(1.1),

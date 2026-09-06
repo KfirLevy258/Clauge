@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import claude_usage_bridge as cub
 from pc import protocol
+from tests.fleet.tap_asserts import WOKE_MARKER
 
 
 def _lines(path):
@@ -243,9 +244,13 @@ class _FakeSerial:
 # What the board says when the probe's welcome wakes it: proto.c prints on
 # connect, answers with pref, and the sleep loop notices within a frame or
 # two at 12 fps. All of it arrives inside the probe's window, in one chunk.
+# The wake line is taken from tap_asserts rather than written out again:
+# three hand-written copies of it is how the fleet suite came to assert a
+# sentence the firmware has never printed.
+WAKE_LINE = WOKE_MARKER
 WAKE_CHUNK = (b'[proto] host connected\n'
               b'{"t":"pref","v":1,"provider":"claude"}\n'
-              b'[sleep] host back; opening eyes\n')
+              + WAKE_LINE.encode() + b'\n')
 
 
 def test_the_probe_window_is_in_the_transcript(tmp_path):
@@ -264,7 +269,7 @@ def test_the_probe_window_is_in_the_transcript(tmp_path):
 
     lines = [l["line"] for l in _lines(tmp_path / "tap.jsonl")
              if l["dir"] == "console"]
-    assert "[sleep] host back; opening eyes" in lines
+    assert WAKE_LINE in lines
     assert "[proto] host connected" in lines
 
 
@@ -278,15 +283,18 @@ def test_one_tap_spans_the_probe_and_the_read_loop(tmp_path):
     """
     path = tmp_path / "tap.jsonl"
     tap = cub.Tap(str(path))
+    # Split mid-line, wherever the marker happens to divide: the point is
+    # that the halves are joined across the handover, not where the cut is.
+    head, tail = WAKE_LINE[:8], WAKE_LINE[8:]
     cub.probe_is_our_board(
-        _FakeSerial([b'{"t":"ping","v":1}\n[sleep] host back;']), 0.2, tap)
+        _FakeSerial([b'{"t":"ping","v":1}\n' + head.encode()]), 0.2, tap)
 
     same, _, _ = cub.install_tap(lambda m: None, lambda m: None, tap)
     assert same is tap
-    same.console(b" opening eyes\n")
+    same.console(tail.encode() + b"\n")
 
     lines = [l["line"] for l in _lines(path) if l["dir"] == "console"]
-    assert "[sleep] host back; opening eyes" in lines
+    assert WAKE_LINE in lines
 
 
 def test_the_probe_is_unchanged_for_anyone_not_recording(tmp_path,

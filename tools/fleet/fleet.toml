@@ -40,7 +40,11 @@ has_claude_desktop = false
 [hosts.galit-win10]
 ssh = "galit@lenovo-r90r7u44.lan"
 os = "windows"              # ssh lands in cmd.exe, not a POSIX shell
-board = "codex"             # VERIFY before the run: this desk may hold claude
+# Measured 2026-09-07, not assumed: the daemon on this desk is sending
+# provider "claude" and the board (20500d33ff1c, COM25) is showing it. The
+# file said codex, which would have failed every scenario for the wrong
+# reason. Re-check whenever a board moves desks.
+board = "claude"
 python = "python"           # 3.11.2, pyserial 3.5
 # %USERPROFILE% on this machine is non-ASCII, so the workdir stays relative
 # to it and cmd.exe does the expanding. Nothing here sends that name over the

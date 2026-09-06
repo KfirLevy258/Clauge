@@ -23,12 +23,13 @@ Each step is a NormalizedUsageFrame expressed as plain JSON, plus two fields
 that are not part of the frame itself:
 
   - `at`: seconds since the provider was constructed. poll() emits a step
-    once elapsed real time (per the `now` clock) reaches it, and only once --
-    a scenario step is an event, not a level, so replaying it on every poll
-    would misrepresent a single reading as a continuous one. One step per
+    once elapsed real time (per the `now` clock) reaches it. One NEW step per
     poll, oldest first: a poll turns into a single usage message however many
     frames it carries, so a late first poll has to delay the timeline rather
-    than collapse the steps that came due while it waited. See poll().
+    than collapse the steps that came due while it waited. Between steps the
+    last one is reported again, because that is what a source is -- a level
+    that holds until something writes over it, not an event that happens
+    once. See poll().
 
   - `age_s` (default 0): how old the reading should claim to be, i.e.
     `observed_at = now - age_s`. This exists because staleness and "how old
@@ -56,6 +57,9 @@ class ScriptedProvider(ProviderParser):
         self._steps = sorted(self._usable_steps(doc.get("steps", [])),
                               key=lambda s: s["at"])
         self._emitted = set()
+        # The most recent step's frame, re-reported until the next one is
+        # due, the way a real source's current reading is. See poll().
+        self._held = None
         self._now = now
         self._t0 = now()
 
@@ -80,7 +84,8 @@ class ScriptedProvider(ProviderParser):
         return "scripted"
 
     def poll(self, now_epoch):
-        """The OLDEST step that has come due and not yet been emitted. One.
+        """The OLDEST step that has come due and not yet been emitted. One --
+        and after that, that same reading again until the next step is due.
 
         Not every due step, which is what this used to return, because the
         daemon collapses one poll into one usage message: IngestionBus.poll
@@ -108,6 +113,26 @@ class ScriptedProvider(ProviderParser):
         A step whose frame cannot be built does not consume the call: it is a
         typo in a hand-written scenario, not a reading, and dropping the poll
         with it would cost the run a frame it was owed.
+
+        THE STEP IS HELD AFTERWARDS, which is the half this was missing. A
+        real provider reports a level: it returns the current reading on every
+        poll until the source writes a new one. This returned each step once
+        and then nothing, so whichever of the daemon's two ticks happened to
+        consume a step decided whether the board ever saw it -- and the fast
+        tick drops a frame whose only change is `age_s`, because age is
+        deliberately volatile (protocol.VOLATILE_USAGE_KEYS: the board ages
+        the reading against its own clock, so re-sending it is traffic
+        carrying no news).
+
+        That cost stale_age its last step on the first real fleet run: the
+        fast tick took the 4-hour reading, correctly said "no news", and the
+        3-second heartbeat -- which sends unconditionally and would have
+        delivered it -- found the provider empty from then on. A healthy
+        board and a correct daemon, failed by a provider that behaves like
+        nothing that exists.
+
+        The held frame keeps its ORIGINAL observed_at, so its age grows the
+        way a real stale reading's does instead of being pinned.
         """
         elapsed = self._now() - self._t0
         for i, step in enumerate(self._steps):
@@ -116,8 +141,9 @@ class ScriptedProvider(ProviderParser):
             self._emitted.add(i)
             frame = self._build_frame(step)
             if frame is not None:
+                self._held = frame
                 return [frame]
-        return []
+        return [self._held] if self._held is not None else []
 
     def _build_frame(self, step):
         """One step as a frame, or None when the step doesn't fit.

@@ -18,16 +18,22 @@ def test_steps_emit_when_due_and_only_once(tmp_path):
     sp = ScriptedProvider(p, now=lambda: clock[0])
     first = sp.poll(clock[0])
     assert [f.session_pct for f in first] == [50.0]
-    assert sp.poll(clock[0]) == []          # emitted once
+    # Advanced ONCE, and then held. A source reports a level: the reading
+    # stands until the next step writes over it. This used to go empty, which
+    # left whichever of the daemon's two ticks happened to consume a step
+    # deciding whether the board ever saw it.
+    assert [f.session_pct for f in sp.poll(clock[0])] == [50.0]
+    assert [f.session_pct for f in sp.poll(clock[0])] == [50.0]
     clock[0] += 10
     second = sp.poll(clock[0])
     assert [f.session_pct for f in second] == [102.0]
     assert second[0].provider == "claude"
     assert second[0].state == "failed"
+    assert [f.session_pct for f in sp.poll(clock[0])] == [102.0]
 
 
 def test_two_steps_due_at_once_are_still_two_frames(tmp_path):
-    """One step per poll, oldest first -- a late start delays, never merges.
+    """One NEW step per poll, oldest first -- a late start delays, never merges.
 
     The daemon's first poll can land ten seconds after the provider was
     constructed: the poll gate only fires once the board has pinged, and a
@@ -46,7 +52,8 @@ def test_two_steps_due_at_once_are_still_two_frames(tmp_path):
     clock[0] += 12                      # both steps came due before any poll
     assert [f.session_pct for f in sp.poll(clock[0])] == [10.0]
     assert [f.session_pct for f in sp.poll(clock[0])] == [25.0]
-    assert sp.poll(clock[0]) == []
+    # ...and then the last reading stands, rather than the source vanishing.
+    assert [f.session_pct for f in sp.poll(clock[0])] == [25.0]
 
 
 def test_age_s_backdates_observed_at(tmp_path):
