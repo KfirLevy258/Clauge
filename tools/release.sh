@@ -27,7 +27,7 @@ git -C "$ROOT" ls-remote --exit-code --tags "$REPO_URL" "refs/tags/$TAG" \
 # The firmware and the daemon ship from this one tag, so they must already
 # agree about what it is. Cheaper to fail here than to publish a release whose
 # two halves introduce themselves differently.
-sh "$HERE/../tests/ci/check_versions.sh"
+sh "$HERE/../tests/ci/check_versions.sh" --release
 PROTO=$(sed -n 's/^#define BLINK_PROTO_VERSION \([0-9][0-9]*\).*$/\1/p' \
 	"$ROOT/firmware/src/version.h")
 [ -z "$(git -C "$ROOT" status --porcelain)" ] || {
