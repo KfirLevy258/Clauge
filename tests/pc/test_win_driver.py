@@ -163,8 +163,17 @@ class TestWhatTheCustomerIsTold:
         assert "blink driver" in line
 
     def test_a_real_failure_carries_its_reason(self):
-        assert "pnputil exited 5" in win_driver.install_message(
-            "failed", "pnputil exited 5")
+        assert "pnputil exited 9" in win_driver.install_message(
+            "failed", "pnputil exited 9")
+
+    def test_a_denied_elevation_says_what_to_do_instead(self):
+        # Measured on the release desk: running the install without
+        # administrator gets pnputil exit code 5, and "failed (pnputil exited
+        # 5)" is nothing a customer can act on. This is the most likely way
+        # the install fails on a real machine, so it gets real words.
+        line = win_driver.install_message("needs-admin")
+        assert "administrator" in line
+        assert "blink driver" in line
 
 
 class TestSummaryAndAdvice:

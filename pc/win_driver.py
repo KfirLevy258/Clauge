@@ -143,6 +143,12 @@ _ERROR_SUCCESS_REBOOT_REQUIRED = 3010
 # What ShellExecuteEx reports when somebody clicks No on the Windows
 # permission prompt. Also not a failure of ours.
 _ERROR_CANCELLED = 1223
+# pnputil's exit code when it ran WITHOUT administrator rights. Which means
+# the elevation did not happen: either Windows had no interactive desktop to
+# show the consent prompt on, or something answered it for us. Worth its own
+# wording -- "pnputil exited 5" tells a customer nothing they can act on, and
+# this is the most likely way the install fails on a real machine.
+_ERROR_ACCESS_DENIED = 5
 
 INSTALL_TIMEOUT_S = 180
 
@@ -241,6 +247,10 @@ def install_message(status, note=""):
         return ("skipped -- the Windows permission prompt was declined."
                 " Run `blink driver` and choose Yes to finish setting up"
                 " the board")
+    if status == "needs-admin":
+        return ("needs administrator -- Windows did not grant it. Right-click"
+                " Command Prompt, choose \"Run as administrator\", and run"
+                " `blink driver` there")
     return f"failed ({note or 'no reason given'})"
 
 
@@ -621,6 +631,8 @@ def install_driver(inf_path=None):
         return "installed", ""
     if rc == _ERROR_SUCCESS_REBOOT_REQUIRED:
         return "installed", "restart the machine to finish"
+    if rc == _ERROR_ACCESS_DENIED:
+        return "needs-admin", ""
     return "failed", f"pnputil exited {rc}"
 
 
