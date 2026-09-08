@@ -1,4 +1,6 @@
 import hashlib
+import io
+import sys
 import unittest
 
 from pc import ota
@@ -628,6 +630,49 @@ class TestTheEfuseProbeAnswer(unittest.TestCase):
             False)
         self.assertIsNone(ota.flash_encrypted_chip(
             "p", run=self._run_saying("Traceback (most recent call last)\n")))
+
+    def test_a_probe_that_never_answers_says_why(self):
+        """It used to say nothing at all.
+
+        The probe's stderr was discarded, so a daemon that could not read the
+        eFuses logged no reason -- and the only visible symptom was 47
+        characters on the board's screen about a chip.
+        """
+        def denied(cmd, **kw):
+            class R:
+                returncode = 1
+                stdout = ""
+                stderr = "could not open port 'COM25': Access is denied."
+            return R()
+
+        err = io.StringIO()
+        real, sys.stderr = sys.stderr, err
+        try:
+            self.assertIsNone(ota.flash_encrypted_chip(
+                "COM25", run=denied))
+        finally:
+            sys.stderr = real
+        said = err.getvalue()
+        self.assertIn("could not read the chip's eFuses", said)
+        self.assertIn("COM25", said)
+        self.assertIn("Access is denied", said)
+
+    def test_an_exception_from_the_runner_is_reported(self):
+        tries = []
+
+        def boom(cmd, **kw):
+            tries.append(cmd)
+            raise OSError("the port vanished")
+
+        err = io.StringIO()
+        real, sys.stderr = sys.stderr, err
+        try:
+            self.assertIsNone(ota.flash_encrypted_chip(
+                "COM25", run=boom))
+        finally:
+            sys.stderr = real
+        self.assertEqual(len(tries), 1)
+        self.assertIn("the port vanished", err.getvalue())
 
     def test_the_probe_is_the_bundled_module_when_frozen(self):
         import sys

@@ -187,17 +187,31 @@ def flash_encrypted_chip(port, run=subprocess.run):
     boot until it is flashed the other way -- recoverable, but not something
     to do to someone's device by accident. Two of these boards exist here and
     only one is fused, so this asks the chip rather than assuming.
+
+    None stops the update with "Could not check the chip; not flashing" on the
+    board: forty-seven characters about a chip the customer never asked about.
+    Everything the probe said about WHY used to be thrown away -- only stdout
+    was read, and only for the one line it expected -- so a daemon that could
+    not reach the chip logged nothing whatsoever, and a customer's failed
+    update was diagnosable only from a photograph of the screen. It is printed
+    here instead.
     """
+    why = ""
     try:
-        out = run(_efuse_probe() + ["--port", port],
-                  capture_output=True, text=True, timeout=60,
-                  **NO_WINDOW).stdout
-    except Exception:
-        return None
-    for line in out.splitlines():
-        words = line.split()
-        if len(words) == 2 and words[0] == "flash_encryption":
-            return words[1] == "enabled"
+        proc = run(_efuse_probe() + ["--port", port],
+                   capture_output=True, text=True, timeout=60, **NO_WINDOW)
+    except Exception as e:
+        why = str(e)
+    else:
+        for line in (proc.stdout or "").splitlines():
+            words = line.split()
+            if len(words) == 2 and words[0] == "flash_encryption":
+                return words[1] == "enabled"
+        why = ((proc.stderr or proc.stdout or "").strip()
+               or f"exit {proc.returncode} and no answer")
+
+    print(f"[ota] could not read the chip's eFuses on {port}; not flashing."
+          f" The probe said: {why[-300:]}", file=sys.stderr)
     return None
 
 
