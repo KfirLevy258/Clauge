@@ -44,3 +44,9 @@ bridge.pid
 # commit on 2026-08-22 from a `pip download` run in the repo root.
 /*.whl
 /*.tar.gz
+
+# Finder's per-directory metadata. Not ignored until 2026-09-09, so three of
+# these sat in `git status` as untracked work across every worktree and made a
+# clean tree look dirty -- which is exactly how a real uncommitted change goes
+# unnoticed.
+.DS_Store
