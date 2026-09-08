@@ -22,16 +22,28 @@ The board picks a data source at boot - you never choose one:
 
 ## Prerequisites
 
-- **Zephyr** (v4.3.x) with its Python venv and SDK, e.g. under `~/zephyr-v4.4.0`.
+- **Zephyr v4.3.x** with its Python venv, and **Zephyr SDK 0.17.4**. The build
+  scripts find the workspace themselves (`tools/lib_zephyr.sh` looks under
+  `~/zephyrproject`, `~/zephyr-v*` and the same two under `~/Projects`); set
+  `BLINK_ZEPHYR` to override.
+
+  **Not v4.4.0.** Measured 2026-09-09: its mbedTLS is 4.1.0, which removed the
+  legacy `mbedtls/sha256.h` that [`src/ota.c`](src/ota.c) includes, and the
+  LVGL it pins moved `gesture_limit` out of the public `lv_indev` headers,
+  which [`src/ui_settings.c`](src/ui_settings.c) reads. 4.3.1 has both
+  (mbedTLS 3.6.6, `gesture_limit` in `lv_indev_private.h`) and wants SDK
+  0.17.4 rather than the 1.0.1 that 4.4.0 asks for. Do not register both SDKs
+  at once -- 1.0.1's CMake config breaks 4.3.1's configure even when 0.17.4 is
+  registered alongside it.
 - The **CYD board** on USB (a CH340 serial port, `/dev/cu.usbserial-*` on macOS).
 - Your **signing keys** (see [Keys](#keys)).
 
 ## Build
 
 ```bash
-source ~/zephyr-v4.4.0/.venv/bin/activate
-source ~/zephyr-v4.4.0/zephyr/zephyr-env.sh
+. tools/lib_zephyr.sh && blink_zephyr_activate   # from the repo root
 
+cd firmware
 west build --sysbuild -d build-sb -b esp32_devkitc/esp32/procpu . \
   -- -DSB_CONFIG_BOOTLOADER_MCUBOOT=y -DUSE_CCACHE=0 \
   -DSB_CONFIG_BOOT_SIGNATURE_KEY_FILE="\"$HOME/.blink/ota_signing_key_p256.pem\""

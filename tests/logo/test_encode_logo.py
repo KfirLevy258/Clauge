@@ -1,6 +1,6 @@
 """Round-trip tests for the BLGO company-logo builder.
 
-Run: ~/zephyr-v4.4.0/.venv/bin/python3 -m pytest tests/logo
+Run: .venv-test/bin/python -m pytest tests/logo
 Synthetic pictures only -- no ffmpeg, no real logo.
 """
 import os

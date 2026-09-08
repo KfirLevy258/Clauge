@@ -62,12 +62,17 @@ production caller at all — only tests exercised it.
 ## Tests
 
 ```sh
-python -m venv .venv-test
+python3 -m venv .venv-test          # 3.11+; a bare `python` may not exist
 .venv-test/bin/python -m pip install \
     pyserial==3.5 esptool==5.3.1 ecdsa==0.19.1 certifi==2026.7.22 \
     pytest numpy Pillow
 .venv-test/bin/python -m pytest tests/ -q
 ```
+
+`tests/ci/check_factory.sh` shells out to `python3` and needs numpy and
+Pillow, so on a machine whose system `python3` lacks them, run it as
+`BLINK_PYTHON=$PWD/.venv-test/bin/python sh tests/ci/check_factory.sh`. The
+other CI scripts have no such dependency.
 
 **1398 passing** as of 2026-09-09. The first four packages are pinned in
 `pc/requirements.txt` and are pinned on purpose; `numpy` and `Pillow` are only
@@ -85,6 +90,11 @@ it points at the real home no matter what `conftest.py` does. Resolve paths
 inside functions, not at module scope.
 
 ## Hardware
+
+**Zephyr 4.3.x, SDK 0.17.4 — not 4.4.0**, which cannot build this firmware:
+its mbedTLS 4.x dropped `mbedtls/sha256.h` (`src/ota.c`) and its LVGL moved
+`gesture_limit` out of the public headers (`src/ui_settings.c`). The scripts
+locate the workspace via `tools/lib_zephyr.sh`; `BLINK_ZEPHYR` overrides.
 
 **Check `FLASH_CRYPT_CNT` before any flash.** Fused units exist, and writing a
 plaintext image to a fused chip produces a board that will not boot until it is

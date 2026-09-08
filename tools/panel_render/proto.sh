@@ -3,7 +3,8 @@
 set -eu
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../.." && pwd)
 HERE="$ROOT/tools/panel_render"
-LVGL_DIR="${LVGL_DIR:-$HOME/zephyr-v4.4.0/modules/lib/gui/lvgl}"
+. "$ROOT/tools/lib_zephyr.sh"
+LVGL_DIR="${LVGL_DIR:-$(blink_zephyr_ws 2>/dev/null)/modules/lib/gui/lvgl}"
 BUILD="${TMPDIR:-/tmp}/blink-proto"
 mkdir -p "$BUILD"
 find "$LVGL_DIR/src" -name '*.c' > "$BUILD/srcs.txt"

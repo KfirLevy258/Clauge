@@ -327,8 +327,7 @@ You only need this to put firmware on a board yourself (after that, it updates o
 The default build is what ships: USB only, with no radio, no sign-in and no token store compiled in. The on-device Wi-Fi path is still here and still builds - add `-DEXTRA_CONF_FILE=wifi.conf` to the command below - it is simply not in anything released.
 
 ```bash
-source ~/zephyr-v4.4.0/.venv/bin/activate
-source ~/zephyr-v4.4.0/zephyr/zephyr-env.sh
+. tools/lib_zephyr.sh && blink_zephyr_activate   # finds the workspace itself
 
 cd firmware
 west build --sysbuild -d build-sb -b esp32_devkitc/esp32/procpu . \

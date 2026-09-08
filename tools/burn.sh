@@ -26,6 +26,9 @@
 set -eu
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+# Sourced here rather than beside lib_efuse.sh below, because the Python this
+# script picks (a few lines down) may come from the Zephyr venv.
+. "$ROOT/tools/lib_zephyr.sh"
 EDITION=""
 PORT="${BLINK_PORT:-}"
 SKIP_BUILD=0
@@ -65,7 +68,7 @@ die()  { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
 #    esptool.py that is already on PATH -- one chosen on purpose, or the
 #    stubs in tests/ci/check_factory.sh, must win.
 PY="${BLINK_PYTHON:-$ROOT/.venv/bin/python}"
-[ -x "$PY" ] || PY="$HOME/zephyr-v4.4.0/.venv/bin/python"
+[ -x "$PY" ] || PY="$(blink_zephyr_ws 2>/dev/null)/.venv/bin/python"
 [ -x "$PY" ] || PY=$(command -v python3) || die "no python3"
 for mod in serial numpy PIL; do
 	"$PY" -c "import $mod" 2>/dev/null ||
@@ -168,10 +171,7 @@ if [ "$SKIP_BUILD" = 0 ]; then
 	[ -f "$KEY" ] || die "signing key not found at $KEY.
        Every unit must be signed with the SAME key or its OTA updates will be
        rejected in the field. See tools/backup_keys.sh."
-	# shellcheck disable=SC1090
-	. "$HOME/zephyr-v4.4.0/.venv/bin/activate" 2>/dev/null || true
-	ZEPHYR_BASE="${ZEPHYR_BASE:-$HOME/zephyr-v4.4.0/zephyr}"
-	export ZEPHYR_BASE
+	blink_zephyr_activate || die "cannot build without a Zephyr workspace."
 	( cd "$ROOT/firmware" && west build --sysbuild -d build-sb -b "$BOARD" . -- \
 		-DSB_CONFIG_BOOTLOADER_MCUBOOT=y -DUSE_CCACHE=0 \
 		-DSB_CONFIG_BOOT_SIGNATURE_KEY_FILE="\"$KEY\"" ) >/dev/null 2>&1 \

@@ -9,7 +9,7 @@ macOS has no timeout(1), so the deadline lives here rather than in the shell.
 Usage:
     python3 tools/touch_trace.py --seconds 90 --out /tmp/touch.log
 Run it with the zephyr venv python -- system python3 has no pyserial:
-    ~/zephyr-v4.4.0/.venv/bin/python3
+    .venv-test/bin/python
 """
 import argparse
 import glob

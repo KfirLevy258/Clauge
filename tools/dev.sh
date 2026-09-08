@@ -18,7 +18,8 @@ PIDFILE="/tmp/claude-usage-bridge.pid"
 
 activate() {
 	# shellcheck disable=SC1090
-	source ~/zephyr-v4.4.0/.venv/bin/activate
+	source "$ROOT/tools/lib_zephyr.sh"
+	blink_zephyr_activate || exit 1
 }
 
 down() {
@@ -87,9 +88,7 @@ flash)
 			;;
 		esac
 	fi
-	activate
-	# shellcheck disable=SC1090
-	source ~/zephyr-v4.4.0/zephyr/zephyr-env.sh >/dev/null 2>&1
+	activate   # sources zephyr-env.sh too
 	cd "$ROOT/firmware"
 	west build -b "$BOARD" . -- -DUSE_CCACHE=0 | tail -3
 	# 921600 is beyond what this board's CH340 tolerates; it fails mid-write.

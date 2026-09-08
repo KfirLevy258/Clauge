@@ -70,8 +70,8 @@ gh release view "$TAG" --repo "$REPO" --json assets \
 	-q '.assets[].name' 2>/dev/null | grep -qx blink-fw.bin && {
 	echo "FATAL: $TAG already carries blink-fw.bin -- bump version.h"; exit 1; }
 
-source ~/zephyr-v4.4.0/.venv/bin/activate
-source ~/zephyr-v4.4.0/zephyr/zephyr-env.sh
+source "$ROOT/tools/lib_zephyr.sh"
+blink_zephyr_activate || exit 1
 KEY="${OTA_SIGNING_KEY:-$HOME/.blink/ota_signing_key_p256.pem}"
 [ -f "$KEY" ] || { echo "FATAL: signing key missing at $KEY (set OTA_SIGNING_KEY)"; exit 1; }
 # Stamp the real version into the MCUboot image header. Zephyr's default for
