@@ -13,9 +13,41 @@
 # Written defensively for `set -euo pipefail` callers: a grep that matches
 # nothing must not abort the script before it can explain itself.
 
-# BLINK_ETOOLS overrides the directory; tests/ci/check_factory.sh points it at
-# stubs so the scripts that source this can run against no chip at all.
-EFUSE_DEFAULT_ETOOLS="${BLINK_ETOOLS:-/Library/Frameworks/Python.framework/Versions/3.10/bin}"
+# BLINK_ETOOLS overrides the directory outright, and must keep doing so:
+# tests/ci/check_factory.sh points it at stubs so the scripts that source this
+# can run against no chip at all. Nothing below may outrank it.
+#
+# Failing that, this used to name /Library/Frameworks/Python.framework/-
+# Versions/3.10/bin and nothing else. That was one machine's Python, and on any
+# other one efuse_probe reported "espefuse.py not found" -- which burn.sh
+# correctly turns into "cannot tell whether this chip is fused. Refusing to
+# flash blind." So the factory script did not misflash anything; it simply
+# could not burn a unit at all on a new machine, and said so in a sentence
+# about the chip rather than about a missing tool. Found 2026-09-09 on a
+# replacement Mac, on the first real burn attempted there.
+#
+# So look for a directory that actually holds espefuse.py. The old framework
+# path stays last: it is still right on the machine it was written for.
+efuse_default_etools() {
+	local d
+	if [ -n "${BLINK_ETOOLS:-}" ]; then
+		printf '%s\n' "$BLINK_ETOOLS"
+		return 0
+	fi
+	# Beside the interpreter the caller chose, if it named one. pip installs
+	# espefuse.py next to the python it belongs to, so this is where a repo
+	# venv's copy lives.
+	if [ -n "${BLINK_PYTHON:-}" ]; then
+		d=$(dirname -- "$BLINK_PYTHON")
+		[ -f "$d/espefuse.py" ] && { printf '%s\n' "$d"; return 0; }
+	fi
+	# Then whatever is on PATH -- an esptool installed deliberately wins over
+	# any guess this file could make.
+	d=$(command -v espefuse.py 2>/dev/null) && [ -n "$d" ] && {
+		printf '%s\n' "$(dirname -- "$d")"; return 0; }
+	printf '%s\n' "/Library/Frameworks/Python.framework/Versions/3.10/bin"
+}
+EFUSE_DEFAULT_ETOOLS="$(efuse_default_etools)"
 
 # espefuse leaves the chip sitting in the ROM download bootloader: it has
 # --before but no --after (checked against 5.1.0), and its teardown is a bare

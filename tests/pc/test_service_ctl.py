@@ -298,6 +298,44 @@ def test_launchd_without_a_plist_is_not_an_error(home, monkeypatch):
     assert r.calls == []
 
 
+def test_launchd_status_tells_never_installed_from_merely_not_loaded(
+        home, monkeypatch):
+    """Two states, one `launchctl print` failure, and they need two sentences.
+
+    A plist on disk whose agent is not loaded is an install that exists and
+    needs starting. No plist is an install that never happened. Both make
+    `launchctl print` exit non-zero, and reporting both as "not installed"
+    sends someone to reinstall a service that is already there -- while
+    hiding the ordinary aftermath of a burn or a fleet run, each of which
+    boots the agent out and is supposed to put it back.
+
+    Observed for real on 2026-09-09: the agent was booted out by hand before a
+    burn, the burn correctly declined to restore a service it had not stopped,
+    and `blink status` then said "Bridge not installed" over a plist sitting
+    in ~/Library/LaunchAgents.
+
+    status() takes no runner, so subprocess is patched directly. The two
+    assertions differ ONLY in whether the plist exists -- launchctl fails
+    identically in both -- so this cannot pass by accident of the fake.
+    """
+    _platform(monkeypatch, "darwin")
+
+    def _print_fails(argv, **kw):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _print_fails)
+
+    assert cli._LaunchdBackend().status() == "not installed"
+
+    _write(cli.plist_path())
+    out = cli._LaunchdBackend().status()
+    assert out != "not installed"
+    assert "not loaded" in out
+    # Not "running", or cmd_status would set bridge_running and promise a
+    # shim repair that no daemon is there to perform.
+    assert not out.startswith("running")
+
+
 # --------------------------------------------------------------- schtasks --
 
 def test_schtasks_stop_ends_the_task_and_kills_the_detached_daemon(

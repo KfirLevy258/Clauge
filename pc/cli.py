@@ -923,6 +923,25 @@ class _LaunchdBackend(_Backend):
         r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"],
                            capture_output=True, text=True, **update.ota.NO_WINDOW)
         if r.returncode != 0:
+            # launchctl has never heard of this label, and that is TWO states
+            # sharing one sentence. A plist on disk that is merely not loaded
+            # is an install that exists and needs starting; no plist at all is
+            # an install that never happened. Answering "not installed" to
+            # both sends someone to reinstall a service that is already there.
+            #
+            # It also hides the ordinary aftermath of a burn or a fleet run.
+            # Both boot the agent out and are expected to put it back, and if
+            # one does not, this line is where a person looks first -- so the
+            # state it must name most clearly is exactly the one it was
+            # collapsing away.
+            #
+            # stop() and start() have always checked for the plist before
+            # answering. status() did not, which is why status() is the one
+            # that lied. Found 2026-09-09 by booting the agent out by hand,
+            # burning a board, and then asking.
+            if os.path.exists(plist_path()):
+                return ("installed but not loaded -- run "
+                        f"`{installed_bin()} install` to start it")
             return "not installed"
 
         fields = {}
