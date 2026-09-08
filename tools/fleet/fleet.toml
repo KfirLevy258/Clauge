@@ -20,6 +20,17 @@ os = "darwin"
 # CODEX -- tools/burn.sh refused `--edition claude` against it, which is the
 # edition latch doing its job. The file said claude, and every scenario here
 # would have failed for the wrong reason.
+#
+# Re-confirmed 2026-09-09 after the Mac was replaced: the SAME board came with
+# it. Its boot animation is the codex one (owner's eyes) and its hello reports
+# board_id 20500d342b68, which is this line's own id. Worth stating because
+# "this desk" now means a different machine, and an id that survives the move
+# is the only thing that makes the sentence above still true.
+#
+# How to check without stamping anything: the edition is only reported in
+# answer to an `edition` message, and that message LATCHES on a unit that has
+# never been stamped -- so it is not a read. Replug the board instead. The boot
+# animation names the edition, and the hello it sends on reset carries the id.
 board = "codex"
 # Relative paths are resolved against this checkout, not the workdir. The
 # fleet venv is the only interpreter on this Mac that has pyserial, and it is
