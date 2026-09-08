@@ -32,23 +32,58 @@ BUILD="${TMPDIR:-/tmp}/blink-build"
 # build then died on line 27, and `python` was 3.11.2 and healthy.
 #
 # So each candidate is executed, not just located, and the first that answers
-# with a 3.x version wins. `py -3` is the Windows launcher, worth trying last
-# because it is absent everywhere else.
+# with a new enough version wins. `py -3` is the Windows launcher, worth trying
+# last because it is absent everywhere else. BLINK_PYTHON is tried first, so a
+# machine whose default interpreter is too old can name a better one without
+# editing this file -- the same override burn.sh and check_factory.sh take.
+#
+# "New enough" means 3.10, and the floor is not cosmetic. pc/requirements.txt
+# pins esptool==5.3.1, which declares Requires-Python >=3.10, so an older
+# interpreter gets through this check and then dies at the pip step with
+#
+#     ERROR: No matching distribution found for esptool==5.3.1
+#
+# preceded by a wall of "Ignored the following versions that require a
+# different python version" -- a message about esptool that is really about
+# the interpreter, and which sends the reader to the pin rather than the
+# python. macOS still ships 3.9 as /usr/bin/python3, so a stock Mac is BELOW
+# the floor by default: the old test (version_info[0] == 3) accepted it.
+# Found 2026-09-09 on a new machine; CI never met it because
+# .github/workflows/release-binaries.yml pins setup-python to 3.11.
 PY=""
-for cand in python3 python py; do
+PY_TRIED=""
+# The versioned names are the fallback for exactly the macOS case above: the
+# bare `python3` is Apple's 3.9 and fails the floor, while a Homebrew or
+# python.org install is sitting right there under its own version. Newest
+# first, so a machine with several does not build on its oldest.
+for cand in ${BLINK_PYTHON:-} python3 python \
+            python3.14 python3.13 python3.12 python3.11 python3.10 py; do
 	command -v "$cand" >/dev/null 2>&1 || continue
-	"$cand" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' \
+	ver=$("$cand" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) || continue
+	PY_TRIED="$PY_TRIED $cand ($ver)"
+	"$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
 		>/dev/null 2>&1 || continue
 	PY="$cand"
 	break
 done
 [ -n "$PY" ] || {
-	echo "need a working python3 to build" >&2
-	echo "  tried: python3, python, py -- none ran and reported 3.x" >&2
+	echo "need python 3.10 or newer to build" >&2
+	echo "  tried:${PY_TRIED:- nothing that ran}" >&2
+	echo "  pc/requirements.txt pins esptool==5.3.1, which needs >= 3.10." >&2
+	echo "  Set BLINK_PYTHON to a newer interpreter, e.g." >&2
+	echo "    BLINK_PYTHON=python3.13 sh tools/build_binary.sh" >&2
 	exit 1
 }
 
-"$PY" -m venv "$BUILD" >/dev/null
+# --clear, because $BUILD is a fixed path under TMPDIR that survives between
+# runs, and `venv` over an existing directory does NOT replace what is already
+# in bin/. Re-running after a build that used a different interpreter leaves
+# the OLD bin/python in place while rewriting pyvenv.cfg to name the new one:
+# the config says 3.13 and the venv runs 3.9. Observed 2026-09-09, where the
+# symptom was a second identical "No matching distribution found for
+# esptool==5.3.1" after the interpreter selection above had already been
+# fixed -- the fix was correct and the stale venv was hiding it.
+"$PY" -m venv --clear "$BUILD" >/dev/null
 # A Windows venv puts its executables in Scripts/, not bin/. This script runs
 # under Git Bash there, so the path style is the only difference that matters.
 VBIN="$BUILD/bin"
