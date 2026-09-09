@@ -1461,6 +1461,66 @@ def restart_service() -> str:
     return backend().restart()
 
 
+# The exact word every backend returns when the service is back up, and
+# nothing else. Compared with == and not with startswith(), which is not
+# fussiness: three of the four backends report failure as "restarted, but
+# launchd reports it is not running -- see ...", and a prefix test reads that
+# as success. `4ba9c7d fix: Linux and Windows claimed a running service from
+# an exit code` was this same mistake one layer down.
+_RESTART_OK = "restarted"
+
+# Nothing was attempted, so there is nothing here to call broken: a test
+# harness with BLINK_SKIP_SERVICE=1, and a platform with no supervisor to
+# bounce (a developer running out of a checkout).
+_RESTART_NOT_ATTEMPTED = ("skipped (", "not running under a supervisor")
+
+
+def restart_left_it_down(detail: str) -> bool:
+    """Did the bounce end with no daemon running?
+
+    `blink update` printed the backend's answer and returned 0 regardless, so
+    a service that did not come back was one line in the middle of a
+    successful-looking update. The board then sits on "Link the PC daemon"
+    forever with nothing on the computer saying why -- which is exactly what
+    a customer hit upgrading 1.2.5 -> 1.3.2 on 2026-09-09. Their 1.2.5
+    updater could not tell (every check in restart() landed in 1.3.0 and
+    1.3.2, after the version doing the upgrading); this one can, and the
+    point of saying so is that `blink install` fixes it in one command.
+    """
+    if detail == _RESTART_OK:
+        return False
+    return not detail.startswith(_RESTART_NOT_ATTEMPTED)
+
+
+def _refresh_shims() -> None:
+    """Put THIS version's shims on disk, as part of an update.
+
+    `blink update` replaces the program and nothing else, and both shims ship
+    inside it: after a swap, ~/.blink/blink-hook.sh is still the copy the
+    previous release wrote out. The daemon's DriftWatchdog repairs that
+    within five minutes -- but only while a daemon is running, and a daemon
+    that did not come back is precisely the case this matters in. Two file
+    writes here remove the dependency instead of relying on the half that may
+    be down to fix the other half.
+
+    Only shims that are ALREADY there are rewritten. A path that does not
+    exist belongs to an install that never happened or was undone, and
+    `update` is not the command that sets one up.
+
+    Best effort: an update whose program swap has already succeeded must not
+    report failure because a shim could not be rewritten. The watchdog still
+    sits behind this.
+    """
+    for path, name in ((shim_path(), "blink-statusline.sh"),
+                       (hook_shim_path(), "blink-hook.sh")):
+        if not os.path.exists(path):
+            continue
+        try:
+            _write_shim(path, name)
+        except OSError as e:
+            print(f"  could not refresh {os.path.basename(path)}: {e}")
+
+
 def halt_service() -> None:
     """Stop the daemon before replacing the program underneath it.
 
@@ -2557,7 +2617,20 @@ def cmd_update(_args) -> int:
     print(message)
     if not ok:
         return 1
-    print("Background service ... " + restart_service())
+    # Before the service comes back, so the daemon that starts is reading the
+    # shims this release ships rather than last release's.
+    _refresh_shims()
+    detail = restart_service()
+    print("Background service ... " + detail)
+    if restart_left_it_down(detail):
+        # The program on disk is the new one; what is missing is a process.
+        # Say which half worked, because "update failed" would send someone
+        # to download it again -- and downloading it again would not help.
+        print()
+        print("The new version is installed, but the background service is")
+        print("not running, so the board will stay on \"Link the PC daemon\".")
+        print(f"Run `{installed_bin()} install` to finish.")
+        return 1
     return 0
 
 
