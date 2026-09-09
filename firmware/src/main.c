@@ -283,6 +283,23 @@ static void ota_report_outcome(void)
 	 * pair, and comparing "1.2.5>1.3.2" against BLINK_FW_VERSION would
 	 * announce a successful update as a failed one. */
 	whatsnew_split(trail, from, sizeof(from), to, sizeof(to));
+	/*
+	 * The board's own verdict on the update, in the console log.
+	 *
+	 * It had none. The daemon logs that it flashed an image and the panel
+	 * puts up a popup that is gone as soon as anyone taps OK, so the one
+	 * question support actually asks after a failed update -- did the
+	 * board come up on the version it was aiming at -- had no answer
+	 * anywhere afterwards.
+	 *
+	 * It also makes this decision observable on a bench. That matters
+	 * more than it looks: reading the breadcrumb wrongly reports a
+	 * SUCCESSFUL update as a failure, silently, and the popup it puts up
+	 * is the only other evidence.
+	 */
+	printk("[ota] update %s: wanted %s, running %s (from %s)\n",
+	       strcmp(to, BLINK_FW_VERSION) == 0 ? "landed" : "REVERTED",
+	       to, BLINK_FW_VERSION, from[0] ? from : "?");
 	if (strcmp(to, BLINK_FW_VERSION) == 0) {
 		int n = snprintf(msg, sizeof(msg), "Updated to version %s.",
 				 BLINK_FW_VERSION);
