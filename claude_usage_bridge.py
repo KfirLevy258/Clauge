@@ -15,8 +15,8 @@ import serial  # pyserial
 from serial.tools import list_ports
 
 from pc import ota as ota_mod
-from pc import (ingest, install_statusline, protocol, statusline_source,
-                update, win_driver)
+from pc import (ingest, install_statusline, logbook, protocol,
+                statusline_source, update, win_driver)
 from pc.version import RELEASE_VERSION
 from pc.bridge import Bridge
 
@@ -690,6 +690,16 @@ def main(argv=None):
     ap.add_argument("--baud", type=int, default=115200)
     args = ap.parse_args(argv)
 
+    # Stamp every line from here on. First thing in main(), because the most
+    # valuable timestamps are on the startup failures below -- a crash-looping
+    # service writes the same paragraph to bridge.log every ten seconds, and
+    # without a time on it there is no way to tell one loop from a hundred.
+    #
+    # Wraps whatever stderr already is: launchd and systemd redirect for us
+    # and the Windows service has opened its own file in `blink run` by now,
+    # so this sits on top of that rather than choosing a destination itself.
+    sys.stderr = logbook.Journal(sys.stderr)
+
     # Before anything else: if a previous update died between renaming the old
     # binary aside and moving the new one in, the login service is pointing at
     # a path that does not exist -- and would go on doing so at every boot,
@@ -724,6 +734,22 @@ def main(argv=None):
     # swaps the program directory and has never rewritten a shim. Both shims
     # are listed rather than just the hook, so the statusline shim gets the
     # same protection it turned out never to have had either.
+    # The board's 10 s keepalive, counted rather than printed. See
+    # pc/logbook.py: it was about 60% of a real customer's log.
+    heartbeat = logbook.Heartbeat()
+    # The usage frame goes out every poll whether or not anything moved. The
+    # fields named here are the ones that carry meaning: the two countdowns
+    # and the two ages are left out ON PURPOSE, because they differ on every
+    # frame by construction and including them would suppress nothing at all.
+    usage_frames = logbook.Repeats(("session_pct", "weekly_pct", "stale",
+                                    "provider", "src", "state", "n_sess",
+                                    "n_run"), "usage frames")
+    # The clock sync goes out on the same schedule and its epoch is new by
+    # definition, so the only thing about it that can actually change is the
+    # offset -- a customer travelling, or the twice-yearly DST step. Those
+    # are worth a line each; the other 1439 a day are not.
+    time_frames = logbook.Repeats(("utc_offset_min",), "clock syncs")
+    _REPEATED = {"usage": usage_frames, "time": time_frames}
     watchdog = install_statusline.DriftWatchdog(
         settings_path(), shim_path(),
         shims=((shim_path(), "blink-statusline.sh"),
@@ -764,10 +790,26 @@ def main(argv=None):
     # Host-side upkeep that runs whether or not a board is attached. Passed
     # into wait_for_port below so an unplugged machine still repairs a wiped
     # hook instead of sitting idle until the cable comes back.
+    #
+    # The log rotation rides here for the same reason: it has to happen on a
+    # machine whose board is unplugged too. That is in fact the case where
+    # the file grew fastest, because the "waiting for the board" path used to
+    # print on a timer.
+    _log_file = os.path.join(blink_home, "bridge.log")
+
     def _upkeep():
         drifted = watchdog.tick()
         if drifted:
             print(f"[watchdog] {drifted}", file=sys.stderr)
+        for line in (heartbeat.due(), usage_frames.due(), time_frames.due()):
+            if line:
+                print(line, file=sys.stderr)
+        if logbook.rotate_if_full(_log_file, sys.stderr):
+            # After the truncation, so this is the first line in the new
+            # file and a reader who opens bridge.log at the wrong moment is
+            # told where the rest of it went.
+            print(f"[bridge] log rotated; the previous one is"
+                  f" {os.path.basename(_log_file)}.1", file=sys.stderr)
 
     # Every provider, every source, behind one callable.
     #
@@ -962,6 +1004,7 @@ def main(argv=None):
         last_err = None
         print(f"[bridge] connected on {port}", file=sys.stderr)
         reader = protocol.LineReader()
+        console = logbook.ConsoleEcho()
 
         def send(m):
             # Returns whether the message reached the wire. Nothing in Bridge
@@ -971,7 +1014,19 @@ def main(argv=None):
             # ota_data is not logged: an image is ~5000 chunks and each line
             # carries 344 characters of base64, which would bury every other
             # message in the log. Bridge prints its own progress every 200.
-            if m.get("t") != "ota_data":
+            # ota_data for the reason below; pong because it is the other
+            # half of a keepalive heartbeat already counts, and printing one
+            # end of a silent exchange is worse than printing neither.
+            #
+            # A usage frame is logged when it says something new. It is the
+            # payload of the whole product, so it is never dropped for being
+            # routine -- only for being the same thing this log already said
+            # a minute ago, which on an idle desk it is 1439 times a day.
+            kind = m.get("t")
+            if kind in _REPEATED:
+                if _REPEATED[kind].worth_logging(m):
+                    print(f"[bridge] -> {m}", file=sys.stderr)
+            elif kind not in ("ota_data", "pong"):
                 print(f"[bridge] -> {m}", file=sys.stderr)
             # encode_CHECKED. This is the only writer, and it used to call
             # plain encode() -- so protocol.encode_checked, written precisely
@@ -1094,13 +1149,30 @@ def main(argv=None):
                 # actually arrived keeps the link busy instead.
                 data = ser.read(ser.in_waiting or 1)
                 if data:
-                    # Echo raw board console (logs + its [usage] prints) for visibility.
-                    sys.stderr.buffer.write(data)
-                    sys.stderr.buffer.flush()
+                    # The board's console (its [proto]/[ota]/[usage] prints),
+                    # a whole line at a time and through the same print path
+                    # as everything else.
+                    #
+                    # This used to be sys.stderr.buffer.write(data): a binary
+                    # write straight to the descriptor while every other line
+                    # in this file went through print(). The two interleave
+                    # mid-line, and a real log is full of the result --
+                    # "[u[bridge] <- {'t': 'ping'" -- on the one file
+                    # README-full.md asks a customer to send us. It also
+                    # echoed every protocol line that the reader below then
+                    # logged again in parsed form. See pc/logbook.py.
+                    for line in console.feed(data):
+                        print(line, file=sys.stderr)
                     if tap:
                         tap.console(data)
                     for msg in reader.feed(data):
-                        print(f"[bridge] <- {msg}", file=sys.stderr)
+                        # The keepalive is counted, not printed. At one ping
+                        # every 10 s it was 60% of the log by line count and
+                        # says nothing the next real message does not.
+                        if msg.get("t") == "ping":
+                            heartbeat.beat()
+                        else:
+                            print(f"[bridge] <- {msg}", file=sys.stderr)
                         dispatch(msg)
                         # A message of ours off this port is the only
                         # positive identification there is. Write it down:

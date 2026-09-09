@@ -429,3 +429,16 @@ reads and the age of each reading. Then a replug of the board. If neither
 helps, email **support@blink-buddy.com** with that output
 and the tail of `~/.blink/bridge.log` (neither contains a credential or any
 message text).
+
+Every line in that log carries the local date and time it was written. The
+file is capped at 2 MB and the three previous ones are kept beside it as
+`bridge.log.1` through `bridge.log.3`, so it holds about a month of history
+and cannot grow without limit -- one customer's reached 2 MB in a week before
+this existed. If the problem you are reporting is older than the log, send
+`bridge.log.1` too.
+
+The daemon does not write a line for every message it sends. The board's
+10-second keepalive is counted rather than printed, and a usage reading that
+repeats what the previous one said is held back; both are reported as a count
+every ten minutes. So a quiet stretch in the log means a quiet desk, not a
+daemon that stopped.
