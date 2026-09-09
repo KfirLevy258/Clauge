@@ -31,6 +31,7 @@
 #include "tz_fetch.h"
 #include "ota.h"
 #include "upd_tap.h"
+#include "whatsnew.h"
 #include "ui_touchfx.h"
 #include "version.h"
 
@@ -267,14 +268,38 @@ static bool ota_blocks_sleep(void)
  * the notice popup has somewhere to live. */
 static void ota_report_outcome(void)
 {
-	char tgt[CFG_OTA_VER_MAX];
+	char trail[CFG_OTA_VER_MAX];
+	char from[CFG_OTA_VER_MAX], to[CFG_OTA_VER_MAX];
+	/* Static rather than automatic: this is a quarter of a kilobyte and
+	 * it runs on the main thread during boot, beside the LVGL work. It
+	 * is called once, so the BSS is the cheaper of the two. */
+	static char msg[WHATSNEW_MAX + 48];
 
-	if (cfg_get_ota_state(tgt, sizeof(tgt)) != 1) {
+	if (cfg_get_ota_state(trail, sizeof(trail)) != 1) {
 		return;
 	}
 	cfg_set_ota_state(0, "");
-	if (strcmp(tgt, BLINK_FW_VERSION) == 0) {
-		ui_settings_notice("Updated to version " BLINK_FW_VERSION ".");
+	/* Through whatsnew_split, always: the breadcrumb may be a packed
+	 * pair, and comparing "1.2.5>1.3.2" against BLINK_FW_VERSION would
+	 * announce a successful update as a failed one. */
+	whatsnew_split(trail, from, sizeof(from), to, sizeof(to));
+	if (strcmp(to, BLINK_FW_VERSION) == 0) {
+		int n = snprintf(msg, sizeof(msg), "Updated to version %s.",
+				 BLINK_FW_VERSION);
+
+		/*
+		 * The notes go after the header's NUL, which is then
+		 * overwritten with the newline that joins them -- so a
+		 * release with nothing to say about itself leaves exactly
+		 * the sentence this popup showed before, rather than a
+		 * heading with a blank space under it.
+		 */
+		if (n > 0 && (size_t)n + 1 < sizeof(msg) &&
+		    whatsnew_render(from, BLINK_FW_VERSION, msg + n + 1,
+				    sizeof(msg) - n - 1) > 0) {
+			msg[n] = '\n';
+		}
+		ui_settings_notice(msg);
 	} else {
 		ui_settings_notice("Update failed, previous version restored.");
 	}
@@ -1284,7 +1309,11 @@ static void net_worker(void *a, void *b, void *c)
 			ota_last_manifest(&m);
 			ota_ui_set(OTA_UI_DOWNLOADING, &m, 0);
 			if (ota_install(&m) == OTA_OK) {
-				cfg_set_ota_state(1, m.version);
+				char trail[CFG_OTA_VER_MAX];
+
+				whatsnew_trail(BLINK_FW_VERSION, m.version,
+					       trail, sizeof(trail));
+				cfg_set_ota_state(1, trail);
 				ota_ui_set(OTA_UI_REBOOTING, &m, 100);
 				k_sleep(K_SECONDS(1));	/* let the UI paint it */
 				ui_boot_mark_intentional_reboot();

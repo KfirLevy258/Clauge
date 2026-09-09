@@ -70,6 +70,22 @@ gh release view "$TAG" --repo "$REPO" --json assets \
 	-q '.assets[].name' 2>/dev/null | grep -qx blink-fw.bin && {
 	echo "FATAL: $TAG already carries blink-fw.bin -- bump version.h"; exit 1; }
 
+# The popup a customer sees after this update has to be able to describe it.
+# whatsnew.c carries one short entry per release, compiled into the image,
+# and the entry for THIS version has to exist before the version ships --
+# afterwards is too late, because the board is already on someone's desk
+# saying nothing.
+#
+# A notes table that is allowed to go stale does not degrade to silence. It
+# degrades to describing the previous release as though it were this one,
+# which is worse than the single sentence this replaced.
+grep -q "\"$VER\"" "$ROOT/firmware/src/whatsnew.c" || {
+	echo "FATAL: firmware/src/whatsnew.c has no entry for $VER." >&2
+	echo "       The update popup would describe an older release as" >&2
+	echo "       though it were this one. Add two lines at the top of" >&2
+	echo "       NOTES[] saying what a customer gets, then re-run." >&2
+	exit 1; }
+
 source "$ROOT/tools/lib_zephyr.sh"
 blink_zephyr_activate || exit 1
 KEY="${OTA_SIGNING_KEY:-$HOME/.blink/ota_signing_key_p256.pem}"

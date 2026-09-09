@@ -21,6 +21,7 @@ target_sources(app PRIVATE
 	src/sleep_gate.c
 	src/upd_row.c
 	src/upd_tap.c
+	src/whatsnew.c
 	src/logo_parse.c
 	src/logo.c
 	src/ui_settings.c

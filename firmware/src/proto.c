@@ -12,6 +12,7 @@
 #include "ota.h"
 #include "version.h"
 #include "cfg_store.h"
+#include "whatsnew.h"
 #include "usage_view.h"
 #include "usage_state.h"
 #include "usage_freshness.h"
@@ -601,8 +602,18 @@ static void dispatch(const char *json)
 		char v[16];
 
 		if (msg_get_str(json, "version", v, sizeof(v))) {
+			char trail[CFG_OTA_VER_MAX];
+
 			printk("[proto] ota: writing %s\n", v);
-			cfg_set_ota_state(1, v);
+			/* Where we came FROM as well as where we are going.
+			 * The next boot's popup needs it to say what changed
+			 * across a jump of more than one release, and this is
+			 * the last moment anything knows: after the write
+			 * this image is gone. See whatsnew.h for why it is
+			 * packed into the existing field. */
+			whatsnew_trail(BLINK_FW_VERSION, v, trail,
+				       sizeof(trail));
+			cfg_set_ota_state(1, trail);
 		}
 	} else if (strcmp(type, "ota_resume") == 0) {
 		/*
