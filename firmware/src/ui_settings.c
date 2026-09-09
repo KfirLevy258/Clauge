@@ -494,6 +494,10 @@ static void upd_prompt_show(const struct ota_ui *snap)
 		return;
 	}
 	upd_prompt_done = true;
+	/* After the guard above, so this is the one moment the box is really
+	 * put up rather than every service tick that finds it already
+	 * there. Pairs with the withdrawal line. */
+	printk("[ota] offer shown: %s\n", snap->version);
 
 	upd_prompt = lv_obj_create(lv_layer_top());
 	lv_obj_set_size(upd_prompt, 300, 130);
@@ -854,6 +858,43 @@ static void upd_timer_cb(lv_timer_t *t)
 	 */
 	if (snap.st != OTA_UI_DOWNLOADING && snap.st != OTA_UI_REBOOTING) {
 		dl_overlay_hide();
+	}
+
+	/*
+	 * The offer is an assertion about the CURRENT state, so it goes away
+	 * when that state does.
+	 *
+	 * Nothing used to close this but the two buttons on it. It appeared
+	 * on OTA_UI_AVAILABLE and then stayed on the panel through every
+	 * state after it -- CHECKING, UP_TO_DATE, FAILED, and IDLE, which is
+	 * where it stops changing, so "still there" meant "there for good".
+	 *
+	 * That is what a customer tapped on 2026-09-09. proto.c answers every
+	 * `welcome` with a check, so the daemon restarting -- which is what
+	 * `blink update` does -- moved the board to CHECKING and cleared
+	 * ota_staged underneath a green "Update now" button that went on
+	 * sitting there. This was first written up as a race between two
+	 * request flags on one loop turn. It is not: the button outlives the
+	 * state that justified it by thirty seconds or by the rest of the
+	 * boot, and the customer is not tapping into a narrow window, they
+	 * are tapping something that has been wrong for a while.
+	 *
+	 * Re-arming upd_prompt_done is the point of doing it here rather than
+	 * in upd_prompt_close(). A prompt the USER answered must not come
+	 * back -- "Later" means later, not in five seconds -- but one the
+	 * board withdrew was never answered at all, so the next genuine
+	 * AVAILABLE has to be allowed to ask again. Without that, a daemon
+	 * restart at the wrong moment would eat the offer for the whole boot.
+	 */
+	if (snap.st != OTA_UI_AVAILABLE && upd_prompt) {
+		upd_prompt_close();
+		upd_prompt_done = false;
+		/* Logged because this is the moment the reported fault used
+		 * to NOT happen, and there was no way to tell from outside
+		 * whether the offer on the glass still meant anything. A
+		 * support reader looking at why a customer's tap did nothing
+		 * needs to see that the board had already withdrawn it. */
+		printk("[ota] offer withdrawn: state is no longer available\n");
 	}
 
 	switch (snap.st) {
