@@ -46,6 +46,11 @@ void proto_ota_check(void);			/* ask the daemon what it has */
  * both halves, so the confirmation screen says so. */
 const char *proto_ota_app_version(void);
 bool proto_ota_install(void);			/* approve; the daemon flashes */
+/* Is there an ota_avail to act on? The tethered loop asks BEFORE consenting,
+ * so a tap that cannot go anywhere is reported rather than dropped -- the
+ * install used to be attempted blind and its refusal thrown away. See
+ * upd_tap.h. */
+bool proto_ota_staged(void);
 
 /*
  * Tell the host which provider the user picked as primary.

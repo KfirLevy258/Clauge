@@ -204,6 +204,11 @@ const char *proto_ota_app_version(void)
 	return ota_app;
 }
 
+bool proto_ota_staged(void)
+{
+	return ota_staged;
+}
+
 void proto_ota_check(void)
 {
 	char buf[96];

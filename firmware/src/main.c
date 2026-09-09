@@ -30,6 +30,7 @@
 #include "ui_anim.h"
 #include "tz_fetch.h"
 #include "ota.h"
+#include "upd_tap.h"
 #include "ui_touchfx.h"
 #include "version.h"
 
@@ -1541,8 +1542,39 @@ static void run_usb(void)
 		/* The boot-time check moved into proto.c's welcome handler,
 		 * which fires on every host connection rather than the first;
 		 * see there. */
-		if (ota_take_check_request()) {
-			proto_ota_check();
+		/*
+		 * Both flags are taken unconditionally, before either is acted
+		 * on. They are consume-on-read, so reading one only when the
+		 * other is clear leaves a stale request armed for the next
+		 * turn -- and reading them inside the call would leave the
+		 * order to the compiler. upd_tap.h has the rule and the bug
+		 * that produced it: a customer's tap on "Update now" during a
+		 * daemon restart went nowhere at all.
+		 */
+		{
+			bool inst_req = ota_take_install_request();
+			bool chk_req = ota_take_check_request();
+
+			switch (upd_tap_act(inst_req, chk_req,
+					    proto_ota_staged())) {
+			case UPD_ACT_CHECK:
+				proto_ota_check();
+				break;
+			case UPD_ACT_INSTALL:
+				proto_ota_install();
+				break;
+			case UPD_ACT_REFUSED:
+				/* Consent with nothing to spend it on. Say so
+				 * here rather than let the 30 s watchdog below
+				 * describe it as a failed check: the customer
+				 * asked to install, and an answer about
+				 * checking sends them somewhere else. */
+				ota_ui_set(OTA_UI_FAILED, NULL, 0);
+				ota_ui_set_error("The app stopped answering");
+				break;
+			case UPD_ACT_NONE:
+				break;
+			}
 		}
 		/*
 		 * A check nobody answers must not hang the row. The query goes
@@ -1570,10 +1602,6 @@ static void run_usb(void)
 				checking_since = 0;
 			}
 		}
-		if (ota_take_install_request()) {
-			proto_ota_install();
-		}
-
 		/* No completion handling: the daemon writes slot0 with esptool
 		 * and resets the board itself, so the next thing that happens
 		 * here is a boot. See the OTA block in proto.c.

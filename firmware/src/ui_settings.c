@@ -855,9 +855,33 @@ static void upd_timer_cb(lv_timer_t *t)
 		break;
 	case OTA_UI_FAILED:
 		if (upd_seen != OTA_UI_FAILED) {
-			const char *base = upd_seen == OTA_UI_DOWNLOADING ?
+			/*
+			 * AVAILABLE counts as an update, not as a check.
+			 *
+			 * A consent the daemon never answered lands here
+			 * WITHOUT passing through DOWNLOADING -- main.c raises
+			 * FAILED straight from AVAILABLE (see upd_tap.h) --
+			 * and the customer who tapped "Update now" was then
+			 * told "Couldn't check for updates", an answer to a
+			 * question they had not asked. It reads as the board
+			 * being confused, which is worse than the fault.
+			 */
+			const char *base = (upd_seen == OTA_UI_DOWNLOADING ||
+					    upd_seen == OTA_UI_AVAILABLE) ?
 				"Update failed. The current version keeps running." :
 				"Couldn't check for updates.";
+
+			/*
+			 * Let the prompt come back. It is shown at most once
+			 * per boot so that a "Later" is respected, but a
+			 * failure is not a "Later": the customer said yes and
+			 * did not get an update, and latching the prompt shut
+			 * left them a board that would never offer again until
+			 * it was power-cycled. Re-arming costs nothing --
+			 * getting back to AVAILABLE still takes a fresh check
+			 * that succeeds.
+			 */
+			upd_prompt_done = false;
 
 			/* Say which failure it was when we know. "Update
 			 * failed" alone is true of a hash that did not match,

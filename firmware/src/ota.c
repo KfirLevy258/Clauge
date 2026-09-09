@@ -546,7 +546,20 @@ void ota_request_check(void)
 
 void ota_request_install(void)
 {
-	atomic_set(&badge, 0);
+	/*
+	 * The badge is NOT cleared here any more.
+	 *
+	 * Clearing it at consent meant the board forgot there was an update
+	 * the instant the user asked for one -- before anything had been
+	 * sent, let alone accepted. On every path where the install then did
+	 * not happen (a daemon that had gone away, an ota_staged cleared out
+	 * from under the tap -- see upd_tap.h) the row went blank and the one
+	 * affordance for trying again went with it.
+	 *
+	 * ota_ui_set() already clears it at REBOOTING, which is the point of
+	 * no return, and at UP_TO_DATE, which is a check saying there is
+	 * nothing to badge. Those are the two places it is actually true.
+	 */
 	atomic_set(&req_install, 1);
 }
 
