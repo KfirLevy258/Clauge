@@ -80,11 +80,52 @@ int main(void)
 			}
 		}
 	}
-	/* The worst case that can reach the screen: every release in the
-	 * table, plus the header the caller puts above it. */
-	CHECK(whatsnew_render("0.0.1", "1.3.2", buf, sizeof(buf)) ==
-	      whatsnew_entries());
-	CHECK(lines(buf) + 1 <= 8);
+	/* No single entry may eat the whole budget, or the cap below becomes
+	 * unreachable for everything behind it. A rule about the copy someone
+	 * writes at release time, so it is checked here. */
+	for (int i = 0; i < whatsnew_entries(); i++) {
+		CHECK(lines(whatsnew_lines_at(i)) <= WHATSNEW_ROWS_PER_ENTRY);
+	}
+
+	/*
+	 * THE ROW CAP. The box is 230 px with LV_OBJ_FLAG_SCROLLABLE cleared,
+	 * so a row that does not fit is not scrolled to and not clipped: it
+	 * pushes the OK button off the panel, and a popup that cannot be
+	 * dismissed is a board the customer cannot get past.
+	 *
+	 * A byte budget does not bound this. 224 bytes of short lines is
+	 * thirty rows -- which is why the earlier version of this test, which
+	 * only checked that today's three entries happened to fit, would have
+	 * passed a table that overflowed the screen.
+	 */
+	whatsnew_render("0.0.1", "1.3.2", buf, sizeof(buf));
+	CHECK(lines(buf) <= WHATSNEW_ROWS);
+
+	/*
+	 * And the cap holds no matter how many releases are in play, which is
+	 * the question that produced it: what happens after a hundred
+	 * updates. The row budget is asked for explicitly here so the cap can
+	 * be proved biting at a size this test can construct, rather than
+	 * asserted about a table that is currently three entries long.
+	 */
+	for (int r = 1; r <= 10; r++) {
+		int n = whatsnew_render_rows("0.0.1", "1.3.2", buf,
+					     sizeof(buf), r);
+
+		CHECK(lines(buf) <= r);
+		CHECK(n <= whatsnew_entries());
+		/* Whatever did not fit is counted, never silently dropped --
+		 * otherwise the popup claims the newest release is all that
+		 * changed. */
+		if (n < whatsnew_entries()) {
+			CHECK(has(buf, "earlier update"));
+		}
+	}
+	/* One row, three releases: the count line is the row that survives,
+	 * because it is the only one that is still true. */
+	CHECK(whatsnew_render_rows("0.0.1", "1.3.2", buf, sizeof(buf), 1) == 0);
+	CHECK(lines(buf) == 1);
+	CHECK(has(buf, "3 earlier updates."));
 
 	/* ---------------- one release at a time -------------------------- */
 	CHECK(whatsnew_render("1.3.1", "1.3.2", buf, sizeof(buf)) == 1);
@@ -93,13 +134,16 @@ int main(void)
 	CHECK(!has(buf, "Claude Desktop"));
 
 	/* ---------------- the reported jump: 1.2.5 -> 1.3.2 -------------- */
-	CHECK(whatsnew_render("1.2.5", "1.3.2", buf, sizeof(buf)) == 3);
+	/*
+	 * Three releases, four rows. The release the customer landed on keeps
+	 * its detail and the rest becomes a count -- that is the shape at any
+	 * distance, and the only thing a longer jump changes is the number.
+	 */
+	CHECK(whatsnew_render("1.2.5", "1.3.2", buf, sizeof(buf)) == 2);
 	CHECK(has(buf, "Updates report honestly"));       /* 1.3.2 */
 	CHECK(has(buf, "out-of-date app"));               /* 1.3.1 */
-	CHECK(has(buf, "Claude Desktop countdowns"));     /* 1.3.0 */
-	/* It has to FIT: eight lines is the whole box, and the caller puts a
-	 * header above this. */
-	CHECK(lines(buf) <= 7);
+	CHECK(has(buf, "and 1 earlier update."));         /* 1.3.0, counted */
+	CHECK(lines(buf) <= WHATSNEW_ROWS);
 	CHECK(strlen(buf) < WHATSNEW_MAX);
 
 	/* ---------------- an unknown origin is not an error -------------- */
@@ -117,10 +161,17 @@ int main(void)
 	CHECK(buf[0] == '\0');
 
 	/* ---------------- nothing is invented about older releases ------- */
-	/* There were no releases between 1.2.5 and 1.3.0, so a jump from
-	 * further back than the table still must not claim there were. */
-	CHECK(whatsnew_render("1.0.0", "1.3.2", buf, sizeof(buf)) == 3);
-	CHECK(!has(buf, "earlier"));
+	/*
+	 * The count may only ever name releases this table HAS and could not
+	 * fit. There were none between 1.2.5 and 1.3.0, so coming from far
+	 * below the table must not inflate the number: 1.3.0 is the one entry
+	 * left over, and one is what it has to say however far back the jump
+	 * started.
+	 */
+	CHECK(whatsnew_render("1.0.0", "1.3.2", buf, sizeof(buf)) == 2);
+	CHECK(has(buf, "and 1 earlier update."));
+	CHECK(whatsnew_render("0.0.1", "1.3.2", buf, sizeof(buf)) == 2);
+	CHECK(has(buf, "and 1 earlier update."));
 
 	/* ---------------- the budget stops the walk cleanly -------------- */
 	{

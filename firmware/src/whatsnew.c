@@ -65,7 +65,27 @@ int whatsnew_has(const char *version)
 	return index_of(version) >= 0;
 }
 
+/* Rows a table entry will occupy: one per line. The copy rules keep every
+ * line inside the label's width, so a line is a row and neither wraps. */
+static int rows_in(const char *s)
+{
+	int n = 1;
+
+	for (; *s; s++) {
+		if (*s == '\n') {
+			n++;
+		}
+	}
+	return n;
+}
+
 int whatsnew_render(const char *from, const char *to, char *buf, size_t len)
+{
+	return whatsnew_render_rows(from, to, buf, len, WHATSNEW_ROWS);
+}
+
+int whatsnew_render_rows(const char *from, const char *to, char *buf,
+			 size_t len, int rows)
 {
 	int start = index_of(to);
 	size_t used = 0;
@@ -109,33 +129,62 @@ int whatsnew_render(const char *from, const char *to, char *buf, size_t len)
 	 * and then had no room to say that two more releases existed.
 	 */
 	size_t room = len;
+	int row_room = rows;
+	int rows_used = 0;
 
 	if (last > start) {
-		const size_t tail_max = sizeof("\nand 99 earlier updates.");
+		/* Sized for a four-digit count, not a two-digit one. At 100
+		 * releases the reservation was one byte short of the line it
+		 * was reserving for, so the count would be silently dropped
+		 * -- the exact failure the reservation exists to prevent,
+		 * appearing only once there were enough releases to need it
+		 * most. Found by building a 103-release table and looking at
+		 * the panel; three bytes of a 224-byte budget. */
+		const size_t tail_max = sizeof("\nand 9999 earlier updates.");
 
 		room = len > tail_max ? len - tail_max : len;
+		/* The count line is a row too, and it is the one row that
+		 * must never be the one dropped. */
+		if (row_room > 1) {
+			row_room--;
+		}
 	}
 
 	for (int i = start; i <= last; i++) {
 		size_t need = strlen(NOTES[i].lines) + 1;   /* + '\n' */
+		int need_rows = rows_in(NOTES[i].lines);
 
+		/*
+		 * Rows first, and ABSOLUTELY -- no first-entry exception.
+		 *
+		 * Overflowing the byte budget costs a sentence nobody reads.
+		 * Overflowing the row budget costs the OK button, which is
+		 * clamped out of the box's 230 px with scrolling cleared, and
+		 * a popup that cannot be dismissed is a board the customer
+		 * cannot get past. The two budgets are not the same kind of
+		 * limit and they do not get the same kind of exception.
+		 */
+		if (rows_used + need_rows > row_room) {
+			dropped = last - i + 1;
+			break;
+		}
 		/*
 		 * Newest first, and the budget stops the walk rather than
 		 * truncating a line mid-sentence. Half a sentence about a
 		 * feature is worse than a count of the sentences that did not
 		 * fit -- the customer cannot tell the difference between a
 		 * clipped line and a badly written one.
-		 */
-		/*
-		 * The reservation never costs the FIRST entry. With a budget
-		 * too small for one release and a count line both, the words
-		 * win: "and 2 earlier updates." on its own tells a customer
-		 * nothing they can use, where one real improvement does.
+		 *
+		 * The BYTE reservation, unlike the row cap, never costs the
+		 * first entry: with room for one release or a count but not
+		 * both, the words win, because "and 2 earlier updates." on
+		 * its own tells a customer nothing they can use.
 		 */
 		if (used + need >= (shown ? room : len)) {
 			dropped = last - i + 1;
 			break;
 		}
+		rows_used += need_rows;
 		if (used) {
 			buf[used++] = '\n';
 		}

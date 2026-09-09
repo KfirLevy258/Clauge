@@ -377,6 +377,11 @@ void ui_settings_notice_dismiss(void)
 
 void ui_settings_notice(const char *txt)
 {
+	ui_settings_notice_titled(NULL, txt);
+}
+
+void ui_settings_notice_titled(const char *title, const char *body)
+{
 	if (notice) {
 		lv_obj_del(notice);
 	}
@@ -403,12 +408,38 @@ void ui_settings_notice(const char *txt)
 	lv_obj_set_flex_align(notice, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
 			      LV_FLEX_ALIGN_CENTER);
 
+	/*
+	 * A title, when the caller has one, in the settings screen's heading
+	 * face at full brightness -- and the body under it dim.
+	 *
+	 * Every notice in this family was one centred sentence in one weight,
+	 * which is right for one sentence and wrong the moment there are six.
+	 * The update popup grew a list of what changed and read as a block of
+	 * undifferentiated text: nothing said which line was the headline and
+	 * which were the details, so the eye had nowhere to land. Two weights
+	 * and the flex row gap do the whole job.
+	 *
+	 * Still CENTRED, unlike a list anywhere else. This box is 300 px on a
+	 * 320 px panel seen from across a desk, and every other popup on it is
+	 * centred; a left edge here would be the only one on the device.
+	 */
+	if (title && title[0]) {
+		lv_obj_t *h = lv_label_create(notice);
+
+		lv_label_set_text(h, title);
+		lv_obj_set_width(h, 270);
+		lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
+		lv_obj_set_style_text_font(h, &lv_font_montserrat_16, 0);
+		lv_obj_set_style_text_color(h, COL_TEXT, 0);
+		lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
+	}
+
 	lv_obj_t *l = lv_label_create(notice);
 
-	lv_label_set_text(l, txt);
+	lv_label_set_text(l, body);
 	lv_obj_set_width(l, 270);
 	lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-	lv_obj_set_style_text_color(l, COL_TEXT, 0);
+	lv_obj_set_style_text_color(l, title && title[0] ? COL_DIM : COL_TEXT, 0);
 	lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
 
 	lv_obj_t *ok = mk_btn(notice, "OK", COL_TRACK, notice_ok_cb, NULL);

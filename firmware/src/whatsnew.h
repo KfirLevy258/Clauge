@@ -41,8 +41,46 @@
  */
 
 /* Enough for the panel and no more -- see constraint 1. The caller adds its
- * own header line on top of this. */
+ * own title above this. */
 #define WHATSNEW_MAX 224
+
+/*
+ * And the limit that actually matters: ROWS, not bytes.
+ *
+ * A byte budget does not bound the height of anything. 224 bytes of short
+ * lines is thirty rows, and the notice box is clamped to 230 px with
+ * LV_OBJ_FLAG_SCROLLABLE cleared (ui_settings.c) -- so rows past the bottom
+ * do not scroll and are not clipped. They push the OK button off the panel,
+ * and a popup whose only dismiss button is off the panel is a board the
+ * customer cannot get past.
+ *
+ * The arithmetic: 230 px of box, less 24 of padding, less a 20 px
+ * montserrat_16 title, less two 12 px flex gaps, less the 36 px button,
+ * leaves 126 px. At the default montserrat_14's ~17 px line that is 7 rows.
+ *
+ * FOUR, not seven, and not the six that also fits. Every number in that sum
+ * is an estimate -- the 17 px line most of all -- and the cost of the
+ * estimate being wrong is not a clipped row, it is the dismiss button off
+ * the panel. Four spends about 68 px of the 126, so the line height can be a
+ * third larger than assumed and nothing is lost. Six spends 102 and leaves
+ * no room to be wrong.
+ *
+ * It is also the better read. This is a gauge glanced at from across a desk:
+ * four rows is a glance and six is a paragraph. The release the customer
+ * landed on keeps its detail, everything behind it becomes an honest count,
+ * and the full notes are on the website for anyone who wants them.
+ *
+ * A hard cap, not a target. Unlike the byte budget, where overflowing costs
+ * a truncated sentence, overflowing here costs the button -- so no entry is
+ * ever admitted past it, not even the first one.
+ */
+#define WHATSNEW_ROWS 4
+
+/* The most rows any single entry may occupy. Two, so that one release can
+ * never fill the budget on its own and leave no room for the count line
+ * behind it. Enforced by the host test rather than at runtime: it is a rule
+ * about the copy someone writes at release time. */
+#define WHATSNEW_ROWS_PER_ENTRY 2
 
 /*
  * Fill `buf` with what changed, landing on `to` from `from`.
@@ -57,6 +95,12 @@
  * should show its header alone rather than an empty box.
  */
 int whatsnew_render(const char *from, const char *to, char *buf, size_t len);
+
+/* The same, with the row cap given explicitly. Exists so the host test can
+ * prove the cap bites at a size it can construct, rather than only asserting
+ * that today's three-entry table happens to fit. */
+int whatsnew_render_rows(const char *from, const char *to, char *buf,
+			 size_t len, int rows);
 
 /* Is there an entry for this version? tools/release.sh asks, through the
  * host test, so that a release cannot ship without one. */

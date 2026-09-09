@@ -270,10 +270,11 @@ static void ota_report_outcome(void)
 {
 	char trail[CFG_OTA_VER_MAX];
 	char from[CFG_OTA_VER_MAX], to[CFG_OTA_VER_MAX];
+	char title[32];
 	/* Static rather than automatic: this is a quarter of a kilobyte and
 	 * it runs on the main thread during boot, beside the LVGL work. It
 	 * is called once, so the BSS is the cheaper of the two. */
-	static char msg[WHATSNEW_MAX + 48];
+	static char notes[WHATSNEW_MAX];
 
 	if (cfg_get_ota_state(trail, sizeof(trail)) != 1) {
 		return;
@@ -301,22 +302,20 @@ static void ota_report_outcome(void)
 	       strcmp(to, BLINK_FW_VERSION) == 0 ? "landed" : "REVERTED",
 	       to, BLINK_FW_VERSION, from[0] ? from : "?");
 	if (strcmp(to, BLINK_FW_VERSION) == 0) {
-		int n = snprintf(msg, sizeof(msg), "Updated to version %s.",
-				 BLINK_FW_VERSION);
-
+		snprintf(title, sizeof(title), "Updated to %s",
+			 BLINK_FW_VERSION);
 		/*
-		 * The notes go after the header's NUL, which is then
-		 * overwritten with the newline that joins them -- so a
-		 * release with nothing to say about itself leaves exactly
-		 * the sentence this popup showed before, rather than a
-		 * heading with a blank space under it.
+		 * A release with nothing to say about itself gets the plain
+		 * one-line notice, not a heading with an empty space under
+		 * it -- which is also exactly what this popup was before the
+		 * notes existed.
 		 */
-		if (n > 0 && (size_t)n + 1 < sizeof(msg) &&
-		    whatsnew_render(from, BLINK_FW_VERSION, msg + n + 1,
-				    sizeof(msg) - n - 1) > 0) {
-			msg[n] = '\n';
+		if (whatsnew_render(from, BLINK_FW_VERSION, notes,
+				    sizeof(notes)) > 0) {
+			ui_settings_notice_titled(title, notes);
+		} else {
+			ui_settings_notice(title);
 		}
-		ui_settings_notice(msg);
 	} else {
 		ui_settings_notice("Update failed, previous version restored.");
 	}

@@ -13,6 +13,11 @@ void ui_settings_attach(lv_obj_t *scr);
 /* One-line notice popup on the gauge screen (update outcome etc.). Safe to
  * call once the screen exists; replaces any previous notice. */
 void ui_settings_notice(const char *txt);
+/* The same box with a heading above the body: the heading in montserrat_16
+ * at full brightness, the body dim beneath the flex gap. For a notice that
+ * is a headline plus detail rather than one sentence -- see the comment on
+ * the implementation. A NULL or empty title is exactly ui_settings_notice. */
+void ui_settings_notice_titled(const char *title, const char *body);
 /* Take a notice down without the tap; the sleep peek does this on timeout. */
 void ui_settings_notice_dismiss(void);
 
