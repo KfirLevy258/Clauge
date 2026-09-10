@@ -78,6 +78,30 @@ static int span_of(const char *from, const char *to)
 	return n;
 }
 
+/*
+ * Where the span STARTS, which is the other half of the same lesson.
+ *
+ * span_of() was fixed when the count and the table stopped agreeing, but the
+ * pager's `first` index kept the assumption in its other form: that a span
+ * begins at entry 0. That holds only while the release being installed is the
+ * newest row in the table -- true of every release at the moment it ships, and
+ * false the instant the next one is added above it.
+ *
+ * So this test broke on the first release after it was written, exactly as the
+ * comment above predicted, and for a reason that looks nothing like the cause:
+ * twenty-four checks about page boundaries, all failing because the first page
+ * started at 1.
+ */
+static int first_of(const char *to)
+{
+	for (int i = 0; i < whatsnew_entries(); i++) {
+		if (strcmp(whatsnew_version_at(i), to) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
 /* What a page costs, by the same arithmetic whatsnew.c uses. */
 static int page_px(const struct whatsnew_page *p)
 {
@@ -172,7 +196,8 @@ int main(void)
 	 * prompted all of this never sees a pager at all. */
 	CHECK(span_of("1.2.5", "1.3.2") == 3);
 	CHECK(whatsnew_paginate("1.2.5", "1.3.2", pages, 16) >= 1);
-	CHECK(pages[0].first == 0);
+	/* Where 1.3.2 sits, not the head of the table -- see first_of(). */
+	CHECK(pages[0].first == first_of("1.3.2"));
 	CHECK(page_px(&pages[0]) <= WHATSNEW_PAGE_PX);
 
 	CHECK(whatsnew_paginate("1.3.1", "1.3.2", pages, 16) == 1);
@@ -199,7 +224,8 @@ int main(void)
 				CHECK(page_px(&pages[i]) <= px);
 			}
 			CHECK(pages[i].first == (i ? pages[i - 1].first
-						 + pages[i - 1].count : 0));
+						 + pages[i - 1].count
+					     : first_of("1.3.2")));
 			total += pages[i].count;
 		}
 		CHECK(total == span_of("1.2.5", "1.3.2"));

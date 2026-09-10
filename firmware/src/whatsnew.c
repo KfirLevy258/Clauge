@@ -30,6 +30,7 @@ static const struct {
 	const char *version;
 	const char *lines;
 } NOTES[] = {
+	{ "1.3.3", "A dropped update finishes itself\nThe board asks again if one fails" },
 	{ "1.3.2", "Updates report honestly\nFinished sessions clear away" },
 	{ "1.3.1", "It spots an out-of-date app" },
 	{ "1.3.0", "Claude Desktop countdowns\nA pip for every session" },
