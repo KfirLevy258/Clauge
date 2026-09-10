@@ -1025,7 +1025,14 @@ def main(argv=None):
             kind = m.get("t")
             if kind in _REPEATED:
                 if _REPEATED[kind].worth_logging(m):
-                    print(f"[bridge] -> {m}", file=sys.stderr)
+                    # Compact for the frame that repeats all day: 279 bytes
+                    # of dict repr against 60 of values, and once the
+                    # heartbeat was gone this was 48% of the file. Anything
+                    # logbook.brief does not recognise falls through to the
+                    # full repr, because an unexpected message is exactly
+                    # when every field is wanted.
+                    short = logbook.brief(m)
+                    print(f"[bridge] -> {short or m}", file=sys.stderr)
             elif kind not in ("ota_data", "pong"):
                 print(f"[bridge] -> {m}", file=sys.stderr)
             # encode_CHECKED. This is the only writer, and it used to call

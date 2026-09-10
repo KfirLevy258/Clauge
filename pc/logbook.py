@@ -36,13 +36,23 @@ Journal counts bytes.
 import os
 import time
 
-# Rotate the live file at 2 MB and keep three older generations, so the whole
-# log costs at most 8 MB on a customer's disk no matter how long the daemon
-# runs. At the volume left after the heartbeat suppression above, that is
-# months of history rather than the days a date-based rule would give on a
-# busy machine -- and unlike a date rule it cannot be exceeded.
-CAP_BYTES = 2 * 1024 * 1024
-KEEP = 3
+# Rotate at 4 MB and keep four older generations: 20 MB on a customer's disk,
+# ever, no matter how long the daemon runs.
+#
+# The numbers are measured rather than chosen. On a development machine under
+# continuous use -- the worst case there is, because the reading genuinely
+# changes almost every poll and almost nothing gets suppressed -- the log runs
+# at 24 KB/hour, or about 4 MB a week. 20 MB is therefore around five weeks
+# there and considerably longer on a machine that is merely in use.
+#
+# An earlier version of this said 2 MB and three generations, on an estimate
+# that the usage frame would rarely change. It changes most minutes on a
+# machine somebody is working at, which put the real retention at a fortnight.
+# Disk is the cheapest thing in this trade: the daemon's own download is 25 MB,
+# so a 20 MB ceiling on its log is not a number anyone will notice, and a
+# ceiling is the whole point -- a date rule cannot promise one.
+CAP_BYTES = 4 * 1024 * 1024
+KEEP = 4
 
 
 def _stamp(when=None) -> str:
@@ -52,46 +62,152 @@ def _stamp(when=None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
 
 
+# How far back the repeat detector looks for a repeating block, and how long
+# a run may go unreported. The window has to cover a Python traceback, which
+# is the shape that matters -- a crash-looping login service writes the same
+# five-to-ten lines every ThrottleInterval, forever.
+REPEAT_WINDOW = 16
+TALLY_EVERY_S = 300.0
+
+
 class Journal:
-    """A text stream that stamps every line with the time it was written.
+    """A text stream that timestamps every line and collapses repeats.
 
     Wraps sys.stderr rather than replacing the 31 print() calls that write to
     it, and rides on the supervisor's own redirect: launchd and the Windows
     task both point the daemon's stderr at bridge.log, so writing through
     here is writing to that file.
 
+    WHY IT COLLAPSES BLOCKS AND NOT LINES. The case worth handling is a
+    daemon that cannot start: launchd restarts it every ThrottleInterval and
+    it writes the same traceback each time, about 8,600 times a day. Adjacent
+    identical lines never occur in that -- consecutive lines of a traceback
+    differ; it is the BLOCK that repeats -- so a syslog-style "last message
+    repeated" would not fire once. Without this, such a loop fills all five
+    rotation generations in about four days and evicts the history from
+    before the fault, which is the only part anyone needs.
+
+    The block is written TWICE before anything is suppressed, so a reader
+    sees the shape before they see the count.
+
     print() reaches write() more than once for one line -- the text, then the
-    newline -- so the stamp is placed on a transition into a line rather than
-    per call. A traceback arrives the same way and comes out stamped too,
-    which is the case the timestamps were most missing for: an exception in
-    the log used to have nothing to say when it happened.
+    newline -- so lines are assembled here and judged whole. A partial line
+    is held rather than written, because a line cannot be un-written once it
+    has gone out, and flush() emits whatever is pending.
     """
 
-    def __init__(self, stream, clock=None):
+    def __init__(self, stream, clock=None, window=REPEAT_WINDOW,
+                 tally_every_s=TALLY_EVERY_S, now=None):
+        import time as _time
         self._stream = stream
         self._clock = clock or _stamp
-        self._fresh = True          # at the start of a line
+        self._now = now or _time.monotonic
+        self._window = window
+        self._tally_every = tally_every_s
+        self._partial = ""          # a line not yet terminated
+        self._recent = []           # lines emitted, most recent last
+        self._block = None          # the repeating block, once detected
+        self._pos = 0               # how far into it the current pass is
+        self._reps = 0              # complete passes suppressed so far
+        self._tally_at = 0.0
 
-    def write(self, s) -> int:
-        if not s:
-            return 0
-        out = []
-        for part in s.splitlines(keepends=True):
-            if self._fresh:
-                out.append(self._clock())
-                out.append(" ")
-            out.append(part)
-            self._fresh = part.endswith(("\n", "\r"))
-        self._stream.write("".join(out))
+    # -- the raw path: stamps and writes, never consulted by the detector --
+    def _emit(self, text):
+        self._stream.write(self._clock() + " " + text + "\n")
         # PYTHONUNBUFFERED is set in the plist and the unit, but the Windows
         # service opens its own file with buffering=1 and this wrapper sits
         # between print() and that -- so flush here rather than trust which
         # of the two is in play. The log lagging minutes behind the daemon
         # reads as a hang; the comment on the plist says so.
         self._stream.flush()
+
+    def _tally(self):
+        """Report and clear the suppressed run, if there is one."""
+        if not self._reps:
+            return
+        n, self._reps = self._reps, 0
+        if len(self._block) == 1:
+            self._emit(f"[log] last message repeated {n} times")
+        else:
+            self._emit(f"[log] last {len(self._block)} lines"
+                       f" repeated {n} times")
+        self._tally_at = self._now()
+
+    def _period(self):
+        """Shortest L for which the last 2L lines are the same block twice.
+
+        Shortest, not longest: "A A A A" has period 1, and reporting it as 2
+        would halve the count and read as though pairs were the unit.
+        """
+        r = self._recent
+        for L in range(1, self._window + 1):
+            if 2 * L > len(r):
+                break
+            if r[-L:] == r[-2 * L:-L]:
+                return L
+        return 0
+
+    def _offer(self, text):
+        """One complete line, from the caller."""
+        if self._block is not None:
+            if text == self._block[self._pos]:
+                self._pos += 1
+                if self._pos == len(self._block):
+                    self._pos = 0
+                    self._reps += 1
+                    # A run that never ends must not leave the log silent --
+                    # that reads as a daemon that died, which is the opposite
+                    # of what is happening. Report and keep counting.
+                    if self._now() - self._tally_at >= self._tally_every:
+                        self._tally()
+                return
+            # The pattern broke. Say what was skipped, then carry on.
+            self._tally()
+            self._block = None
+            self._pos = 0
+            self._recent = []
+
+        self._emit(text)
+        self._recent.append(text)
+        if len(self._recent) > 2 * self._window:
+            del self._recent[:-2 * self._window]
+        L = self._period()
+        if L:
+            self._block = list(self._recent[-L:])
+            self._pos = 0
+            self._reps = 0
+            self._tally_at = self._now()
+
+    def write(self, s) -> int:
+        if not s:
+            return 0
+        self._partial += s
+        while True:
+            i = self._partial.find("\n")
+            if i < 0:
+                break
+            line = self._partial[:i].rstrip("\r")
+            self._partial = self._partial[i + 1:]
+            self._offer(line)
+        # A writer that never sends a newline must not grow this without
+        # bound. Nothing does; the cap is here because a buffer fed from
+        # somebody else's print() is the wrong place to assume it.
+        if len(self._partial) > 8192:
+            self._offer(self._partial)
+            self._partial = ""
         return len(s)
 
     def flush(self):
+        """Anything held goes out now.
+
+        Called after every print() by the daemon's own flushing, and at
+        shutdown -- so a partial line, or a suppressed run at the moment the
+        process ends, is still reported rather than lost.
+        """
+        if self._partial:
+            self._offer(self._partial)
+            self._partial = ""
+        self._tally()
         self._stream.flush()
 
     def isatty(self) -> bool:
@@ -209,8 +325,8 @@ class Repeats:
 
     The usage frame goes out once a minute whether or not anything moved, and
     once the heartbeat stopped being logged it was most of what was left:
-    about 270 bytes a minute, 0.5 MB a day, which is 16 days of history in
-    the 8 MB the rotation allows. An idle desk was spending all of that
+    about 270 bytes a minute, 0.5 MB a day, which is forty days of history in
+    the 20 MB the rotation allows. An idle desk was spending all of that
     saying "still 8%".
 
     Comparison is on the fields that carry meaning, NOT on the whole message.
@@ -254,6 +370,32 @@ class Repeats:
             return None
         n, self._n = self._n, 0
         return f"[bridge] {n} unchanged {self._label} not logged"
+
+
+def brief(m):
+    """The usage frame, in the width it deserves.
+
+    A frame is 279 bytes as a dict repr and it goes out every poll. Once the
+    heartbeat stopped being logged it was 48% of the whole file, and almost
+    all of that is field names re-printed every minute -- the payload is
+    twelve short values.
+
+    Nothing parses this log (checked: no test, doc or tool greps the arrow
+    lines), and `blink status --wire` prints the full frame on demand for
+    anyone who wants every field. So the log gets the values.
+
+    Returns None for anything that is not a usage frame, so the caller falls
+    back to the full repr -- an unexpected message is exactly when you want
+    every field, and those are rare by definition.
+    """
+    if m.get("t") != "usage":
+        return None
+    return ("usage %s/%s %s%%/%ss %s%%/%ss %s n=%s/%s age=%ss%s" % (
+        m.get("provider", "?"), m.get("src", "?"),
+        m.get("session_pct"), m.get("session_resets_in_s"),
+        m.get("weekly_pct"), m.get("weekly_resets_in_s"),
+        m.get("state", "?"), m.get("n_sess"), m.get("n_run"),
+        m.get("age_s"), " STALE" if m.get("stale") else ""))
 
 
 def _is_the_same_file(path, stream) -> bool:

@@ -431,11 +431,11 @@ and the tail of `~/.blink/bridge.log` (neither contains a credential or any
 message text).
 
 Every line in that log carries the local date and time it was written. The
-file is capped at 2 MB and the three previous ones are kept beside it as
-`bridge.log.1` through `bridge.log.3`, so it holds about a month of history
-and cannot grow without limit -- one customer's reached 2 MB in a week before
-this existed. If the problem you are reporting is older than the log, send
-`bridge.log.1` too.
+file is capped at 4 MB and the four previous ones are kept beside it as
+`bridge.log.1` through `bridge.log.4`, so it uses at most 20 MB and holds
+something over a month on a busy machine -- one customer's reached 2 MB in a
+week, growing without any limit at all, before this existed. If the problem
+you are reporting is older than the log, send `bridge.log.1` too.
 
 The daemon does not write a line for every message it sends. The board's
 10-second keepalive is counted rather than printed, and a usage reading that
