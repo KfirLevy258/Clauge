@@ -55,6 +55,11 @@ int whatsnew_entries(void)
 	return N_NOTES;
 }
 
+const char *whatsnew_version_at(int i)
+{
+	return (i >= 0 && i < N_NOTES) ? NOTES[i].version : "";
+}
+
 const char *whatsnew_lines_at(int i)
 {
 	return (i >= 0 && i < N_NOTES) ? NOTES[i].lines : "";
@@ -65,9 +70,8 @@ int whatsnew_has(const char *version)
 	return index_of(version) >= 0;
 }
 
-/* Rows a table entry will occupy: one per line. The copy rules keep every
- * line inside the label's width, so a line is a row and neither wraps. */
-static int rows_in(const char *s)
+/* Lines in an entry: one per '\n', plus one. */
+static int lines_in(const char *s)
 {
 	int n = 1;
 
@@ -79,142 +83,120 @@ static int rows_in(const char *s)
 	return n;
 }
 
-int whatsnew_render(const char *from, const char *to, char *buf, size_t len)
+/* Pixels an entry occupies, not counting the gap above it. */
+static int height_of(int i)
 {
-	return whatsnew_render_rows(from, to, buf, len, WHATSNEW_ROWS);
+	return WHATSNEW_VER_PX + lines_in(NOTES[i].lines) * WHATSNEW_LINE_PX;
 }
 
-int whatsnew_render_rows(const char *from, const char *to, char *buf,
-			 size_t len, int rows)
+/*
+ * The span of releases to describe: newest first, from `to` back to but not
+ * including `from`. Returns the count, and sets *start.
+ *
+ * An unknown `from` is not an error -- it is what a breadcrumb written
+ * before whatsnew_trail existed reports -- and the honest answer is the one
+ * release we know the board is running.
+ */
+static int span(const char *from, const char *to, int *start)
 {
-	int start = index_of(to);
-	size_t used = 0;
-	int shown = 0, dropped = 0;
+	int s = index_of(to);
+	int last;
 
-	if (!buf || len == 0) {
+	*start = s;
+	if (s < 0) {
 		return 0;
 	}
-	buf[0] = '\0';
-	if (start < 0) {
-		/* A version with no entry. Say nothing rather than guess:
-		 * the caller's header still names the version. */
-		return 0;
-	}
-
-	/*
-	 * How far back to go. An empty or unparseable `from` means the board
-	 * cannot tell where it came from -- a breadcrumb written before
-	 * whatsnew_trail existed -- and the honest answer is the one release
-	 * we know it is running.
-	 */
-	int last = start;
-
+	last = s;
 	if (from && from[0]) {
-		for (int i = start; i < N_NOTES; i++) {
+		for (int i = s; i < N_NOTES; i++) {
 			if (!ota_version_newer(NOTES[i].version, from)) {
 				break;
 			}
 			last = i;
 		}
 	}
+	return last - s + 1;
+}
 
-	/*
-	 * Room held back for the count line, whenever there is more than one
-	 * release in play and therefore something that could be dropped.
-	 *
-	 * Without the reservation the count is the first thing squeezed out,
-	 * which is precisely backwards: it is the line that stops the popup
-	 * from silently claiming the newest release is all that changed. A
-	 * 64-byte render of the 1.2.5 -> 1.3.2 jump spent every byte on 1.3.2
-	 * and then had no room to say that two more releases existed.
-	 */
-	size_t room = len;
-	int row_room = rows;
-	int rows_used = 0;
+int whatsnew_paginate(const char *from, const char *to,
+		      struct whatsnew_page *out, int max)
+{
+	return whatsnew_paginate_px(from, to, out, max, WHATSNEW_PAGE_PX);
+}
 
-	if (last > start) {
-		/* Sized for a four-digit count, not a two-digit one. At 100
-		 * releases the reservation was one byte short of the line it
-		 * was reserving for, so the count would be silently dropped
-		 * -- the exact failure the reservation exists to prevent,
-		 * appearing only once there were enough releases to need it
-		 * most. Found by building a 103-release table and looking at
-		 * the panel; three bytes of a 224-byte budget. */
-		const size_t tail_max = sizeof("\nand 9999 earlier updates.");
+int whatsnew_paginate_px(const char *from, const char *to,
+			 struct whatsnew_page *out, int max, int page_px)
+{
+	int start, n = span(from, to, &start);
+	int pages = 0, used = 0, on_page = 0, first = start;
 
-		room = len > tail_max ? len - tail_max : len;
-		/* The count line is a row too, and it is the one row that
-		 * must never be the one dropped. */
-		if (row_room > 1) {
-			row_room--;
-		}
+	if (n <= 0) {
+		return 0;
 	}
-
-	for (int i = start; i <= last; i++) {
-		size_t need = strlen(NOTES[i].lines) + 1;   /* + '\n' */
-		int need_rows = rows_in(NOTES[i].lines);
+	for (int i = start; i < start + n; i++) {
+		int need = height_of(i) + (on_page ? WHATSNEW_GAP_PX : 0);
 
 		/*
-		 * Rows first, and ABSOLUTELY -- no first-entry exception.
-		 *
-		 * Overflowing the byte budget costs a sentence nobody reads.
-		 * Overflowing the row budget costs the OK button, which is
-		 * clamped out of the box's 230 px with scrolling cleared, and
-		 * a popup that cannot be dismissed is a board the customer
-		 * cannot get past. The two budgets are not the same kind of
-		 * limit and they do not get the same kind of exception.
+		 * A release never straddles a page turn, so a release that
+		 * does not fit starts the next page rather than being split.
+		 * The first release on a page is admitted unconditionally:
+		 * WHATSNEW_LINES_PER_ENTRY keeps any one of them well under a
+		 * page, and a release that could not fit alone would
+		 * otherwise loop forever here.
 		 */
-		if (rows_used + need_rows > row_room) {
-			dropped = last - i + 1;
-			break;
+		if (on_page && used + need > page_px) {
+			if (pages < max && out) {
+				out[pages].first = first;
+				out[pages].count = on_page;
+			}
+			pages++;
+			first = i;
+			on_page = 0;
+			used = 0;
+			need = height_of(i);
 		}
-		/*
-		 * Newest first, and the budget stops the walk rather than
-		 * truncating a line mid-sentence. Half a sentence about a
-		 * feature is worse than a count of the sentences that did not
-		 * fit -- the customer cannot tell the difference between a
-		 * clipped line and a badly written one.
-		 *
-		 * The BYTE reservation, unlike the row cap, never costs the
-		 * first entry: with room for one release or a count but not
-		 * both, the words win, because "and 2 earlier updates." on
-		 * its own tells a customer nothing they can use.
-		 */
-		if (used + need >= (shown ? room : len)) {
-			dropped = last - i + 1;
-			break;
-		}
-		rows_used += need_rows;
-		if (used) {
-			buf[used++] = '\n';
-		}
-		memcpy(buf + used, NOTES[i].lines, strlen(NOTES[i].lines));
-		used += strlen(NOTES[i].lines);
-		buf[used] = '\0';
-		shown++;
+		used += need;
+		on_page++;
 	}
+	if (on_page) {
+		if (pages < max && out) {
+			out[pages].first = first;
+			out[pages].count = on_page;
+		}
+		pages++;
+	}
+	return pages;
+}
 
+int whatsnew_summary(const char *from, const char *to, char *buf, size_t len)
+{
+	int start, n = span(from, to, &start);
+	int changes = 0;
+
+	if (!buf || len == 0) {
+		return 0;
+	}
+	buf[0] = '\0';
+	if (n <= 0) {
+		return 0;
+	}
+	for (int i = start; i < start + n; i++) {
+		changes += lines_in(NOTES[i].lines);
+	}
 	/*
-	 * Nothing is said about releases OLDER than the oldest entry here.
-	 *
-	 * The table cannot tell whether any exist: between 1.2.5 and 1.3.0
-	 * there were none, so a customer on that jump who was told "and
-	 * earlier updates" would be reading an invention. The only count this
-	 * is entitled to make is the one below, of entries it has and could
-	 * not fit.
+	 * "since 1.2.5" only when it says something. With one release it is a
+	 * comparison nobody asked for -- "2 changes since 1.3.1" on an update
+	 * from 1.3.1 -- and with an unknown origin it would be a version we
+	 * are not entitled to name.
 	 */
-	if (dropped > 0) {
-		char tail[40];
-		int n = snprintf(tail, sizeof(tail),
-				 "%sand %d earlier update%s.",
-				 used ? "\n" : "", dropped,
-				 dropped == 1 ? "" : "s");
-
-		if (n > 0 && used + (size_t)n < len) {
-			memcpy(buf + used, tail, (size_t)n + 1);
-		}
+	if (n > 1 && from && from[0]) {
+		snprintf(buf, len, "%d change%s since %s", changes,
+			 changes == 1 ? "" : "s", from);
+	} else {
+		snprintf(buf, len, "%d change%s", changes,
+			 changes == 1 ? "" : "s");
 	}
-	return shown;
+	return changes;
 }
 
 void whatsnew_trail(const char *from, const char *to, char *buf, size_t len)

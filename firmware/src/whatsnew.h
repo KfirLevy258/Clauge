@@ -40,83 +40,115 @@
  * not degrade to silence, it degrades to describing the wrong release.
  */
 
-/* Enough for the panel and no more -- see constraint 1. The caller adds its
- * own title above this. */
-#define WHATSNEW_MAX 224
+/*
+ * ---------------------------------------------------------------------
+ * THE NOTICE says how much changed. THE SCREEN says what.
+ * ---------------------------------------------------------------------
+ *
+ * An earlier version of this put the change list in the notice itself and
+ * spent a long time on how many rows would fit. That was the wrong argument
+ * to be having: the notice box is clamped to 230 px with
+ * LV_OBJ_FLAG_SCROLLABLE cleared, so a row too many is not clipped and not
+ * scrolled to -- it lands under the OK button, off the panel, on a popup
+ * that is the only way past it. Every number in that budget was an estimate,
+ * and being wrong cost the dismiss button.
+ *
+ * A screen has no such ceiling. It is 152 px of body against the notice's
+ * 126, it is left-aligned because there is no box around it, and it can page
+ * -- which is the answer this hardware wants, because NOTHING on this board
+ * scrolls. ui_swipe.h has the measurement: five deliberate swipes on this
+ * resistive panel produced thirty press-release cycles.
+ */
+
+/* Body height of the What's new screen: 240 less 12 top pad, a 20 px title,
+ * an 8 px gap, the 36 px Back button and 12 px bottom pad. */
+#define WHATSNEW_PAGE_PX 152
+
+/* What a release costs on that screen: a dim version label, then one line
+ * per change, plus a gap above every release but the first on its page. */
+#define WHATSNEW_VER_PX  15
+#define WHATSNEW_LINE_PX 17
+#define WHATSNEW_GAP_PX   4
+
+/* The most lines any single entry may carry. Enforced by the host test: it
+ * is a rule about the copy someone writes at release time, and it is what
+ * keeps a release from ever being too tall for a page of its own. */
+#define WHATSNEW_LINES_PER_ENTRY 2
+
+/* Longest summary this writes, plus room: "999 changes since 10.10.10". */
+#define WHATSNEW_SUMMARY_MAX 48
 
 /*
- * And the limit that actually matters: ROWS, not bytes.
+ * One page of the screen: which releases it holds.
  *
- * A byte budget does not bound the height of anything. 224 bytes of short
- * lines is thirty rows, and the notice box is clamped to 230 px with
- * LV_OBJ_FLAG_SCROLLABLE cleared (ui_settings.c) -- so rows past the bottom
- * do not scroll and are not clipped. They push the OK button off the panel,
- * and a popup whose only dismiss button is off the panel is a board the
- * customer cannot get past.
- *
- * The arithmetic: 230 px of box, less 24 of padding, less a 20 px
- * montserrat_16 title, less two 12 px flex gaps, less the 36 px button,
- * leaves 126 px. At the default montserrat_14's ~17 px line that is 7 rows.
- *
- * FOUR, not seven, and not the six that also fits. Every number in that sum
- * is an estimate -- the 17 px line most of all -- and the cost of the
- * estimate being wrong is not a clipped row, it is the dismiss button off
- * the panel. Four spends about 68 px of the 126, so the line height can be a
- * third larger than assumed and nothing is lost. Six spends 102 and leaves
- * no room to be wrong.
- *
- * It is also the better read. This is a gauge glanced at from across a desk:
- * four rows is a glance and six is a paragraph. The release the customer
- * landed on keeps its detail, everything behind it becomes an honest count,
- * and the full notes are on the website for anyone who wants them.
- *
- * A hard cap, not a target. Unlike the byte budget, where overflowing costs
- * a truncated sentence, overflowing here costs the button -- so no entry is
- * ever admitted past it, not even the first one.
+ * Pages break BETWEEN releases and never inside one, so a release and its
+ * version label are never split across a page turn. The cost is that pages
+ * are not equal length and the last is usually short, which is honest --
+ * padding them would misrepresent where the boundaries are.
  */
-#define WHATSNEW_ROWS 4
-
-/* The most rows any single entry may occupy. Two, so that one release can
- * never fill the budget on its own and leave no room for the count line
- * behind it. Enforced by the host test rather than at runtime: it is a rule
- * about the copy someone writes at release time. */
-#define WHATSNEW_ROWS_PER_ENTRY 2
+struct whatsnew_page {
+	int first;		/* index of the first release on this page */
+	int count;		/* how many releases it holds */
+};
 
 /*
- * Fill `buf` with what changed, landing on `to` from `from`.
+ * How many pages the screen has room to hold, and therefore the most this
+ * table may ever grow to.
  *
- * `from` may be "" or unparseable, which is what a board updated by a
- * release that did not record where it came from reports. That is not an
- * error: it renders `to`'s own entry alone, which is the honest answer to
- * "what do we know".
+ * The screen paginates into an array of this size on the stack. A page holds
+ * at least one release, so the page count can never exceed the number of
+ * entries in the table -- which means one number bounds both, and the host
+ * test asserts the table against it. That assertion is the point: without it
+ * the ceiling is a number in ui_settings.c that the table quietly grows past,
+ * and the failure is not a crash. whatsnew_paginate returns the TRUE total
+ * because the pager prints it, so the screen would say "9 / 12" and then draw
+ * a blank body for the pages it had no room to describe.
  *
- * Returns the number of releases described. Zero means there is nothing to
- * say -- an unknown `to`, or a table with no entry for it -- and the caller
- * should show its header alone rather than an empty box.
+ * Sixteen because a customer would have to be sixteen releases behind to
+ * reach it, and because the answer when the table does get there is to drop
+ * the oldest entries rather than to widen this -- nobody updating from that
+ * far back reads to the end, and the full notes are on the website.
  */
-int whatsnew_render(const char *from, const char *to, char *buf, size_t len);
+#define WHATSNEW_MAX_PAGES 16
 
-/* The same, with the row cap given explicitly. Exists so the host test can
- * prove the cap bites at a size it can construct, rather than only asserting
- * that today's three-entry table happens to fit. */
-int whatsnew_render_rows(const char *from, const char *to, char *buf,
-			 size_t len, int rows);
+/*
+ * Pack the releases between `from` and `to` into pages.
+ *
+ * Returns the TOTAL number of pages, which may exceed `max` -- the caller
+ * needs the true count for its "3 / 4", and truncating it silently would
+ * make the pager lie. Fills at most `max` entries of `out`.
+ *
+ * An empty or unparseable `from` is not an error: it yields the single
+ * release the board is running, which is all a breadcrumb from before this
+ * existed can tell us.
+ */
+int whatsnew_paginate(const char *from, const char *to,
+		      struct whatsnew_page *out, int max);
+
+/* The same with the page height given explicitly, so the host test can prove
+ * the packing at sizes it can construct rather than only asserting that
+ * today's three-entry table happens to land on one page. */
+int whatsnew_paginate_px(const char *from, const char *to,
+			 struct whatsnew_page *out, int max, int page_px);
+
+/*
+ * "5 changes since 1.2.5", for the notice, into a WHATSNEW_SUMMARY_MAX buf.
+ *
+ * Writes "" and returns 0 when there is nothing to say -- a version with no
+ * entry -- and the caller then shows its title alone. `since` is dropped
+ * when `from` is unknown or when only one release is involved, because
+ * "2 changes since 1.3.1" reads as a comparison nobody asked for.
+ */
+int whatsnew_summary(const char *from, const char *to, char *buf, size_t len);
+
+/* The table, for the screen to draw and for the host test to measure. */
+int whatsnew_entries(void);
+const char *whatsnew_version_at(int i);
+const char *whatsnew_lines_at(int i);
 
 /* Is there an entry for this version? tools/release.sh asks, through the
  * host test, so that a release cannot ship without one. */
 int whatsnew_has(const char *version);
-
-/*
- * The table itself, for tests/whatsnew.
- *
- * Exposed so the panel's width and height budget can be ASSERTED rather than
- * written down in a comment above the table and then quietly outgrown by the
- * next release's entry. The failure it guards is not a crash: it is a line
- * that wraps onto a ninth row and disappears under the OK button, which
- * nobody sees until a customer's board does it.
- */
-int whatsnew_entries(void);
-const char *whatsnew_lines_at(int i);
 
 /*
  * The breadcrumb written to cfg_store just before rebooting into a new

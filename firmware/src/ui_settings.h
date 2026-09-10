@@ -18,6 +18,13 @@ void ui_settings_notice(const char *txt);
  * is a headline plus detail rather than one sentence -- see the comment on
  * the implementation. A NULL or empty title is exactly ui_settings_notice. */
 void ui_settings_notice_titled(const char *title, const char *body);
+/* The post-update notice: a tick, the version, "5 changes since 1.2.5", and
+ * a "What's new" button that opens the paged list. `from`/`to` are the halves
+ * of the OTA breadcrumb, and they decide what that screen shows. */
+void ui_settings_notice_update(const char *version, const char *summary,
+			       const char *from, const char *to);
+/* Close the What's new screen, if it is open. */
+void ui_settings_whatsnew_dismiss(void);
 /* Take a notice down without the tap; the sleep peek does this on timeout. */
 void ui_settings_notice_dismiss(void);
 

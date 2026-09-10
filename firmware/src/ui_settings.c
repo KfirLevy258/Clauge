@@ -20,6 +20,7 @@
 
 #include "ui_settings.h"
 #include "cfg_store.h"
+#include "whatsnew.h"
 #include "ui_boot.h"
 #include "ui_anim.h"
 #include "ui_swipe.h"
@@ -32,6 +33,7 @@
 #include "backlight.h"
 #include "ota.h"
 #include "proto.h"
+#include "upd_prompt.h"
 #include "upd_row.h"
 #include "usage_view.h"
 
@@ -380,6 +382,354 @@ void ui_settings_notice(const char *txt)
 	ui_settings_notice_titled(NULL, txt);
 }
 
+/* ---------------- What's new: a screen, because a box has a ceiling ------
+ *
+ * Lives on lv_layer_top ABOVE the notice, so Back deletes it and reveals the
+ * notice underneath rather than having to rebuild it.
+ *
+ * Nothing here scrolls, and that is not an omission. ui_swipe.h has the
+ * measurement: five deliberate swipes on this resistive panel produced
+ * thirty press-release cycles, twelve of them holding fewer than two
+ * samples. Paging is what this hardware can actually do.
+ */
+static lv_obj_t *wn;			/* NULL when closed */
+static char wn_from[CFG_OTA_VER_MAX];
+static char wn_to[CFG_OTA_VER_MAX];
+static int wn_page, wn_pages;
+
+#define WN_BODY_TOP 48
+#define WN_BTN_Y   192
+
+static void wn_draw(void);
+
+static void wn_close_cb(lv_event_t *e)
+{
+	ARG_UNUSED(e);
+	if (wn) {
+		lv_obj_del(wn);
+		wn = NULL;
+	}
+}
+
+static void wn_prev_cb(lv_event_t *e)
+{
+	ARG_UNUSED(e);
+	if (wn_page > 0) {
+		wn_page--;
+		wn_draw();
+	}
+}
+
+static void wn_next_cb(lv_event_t *e)
+{
+	ARG_UNUSED(e);
+	if (wn_page + 1 < wn_pages) {
+		wn_page++;
+		wn_draw();
+	}
+}
+
+/* A pager chevron. Deliberately 44 px wide against the 120 px of Back: big
+ * enough for a panel that reports a swipe as thirty separate touches. */
+static lv_obj_t *wn_chev(const char *glyph, int x, bool live, lv_event_cb_t cb)
+{
+	/* The callback is attached either way -- mk_btn hands it straight to
+	 * lv_obj_add_event_cb, which does not take NULL -- and the handlers
+	 * bounds-check wn_page themselves, so a dimmed chevron is inert
+	 * without a second mechanism for making it so. */
+	lv_obj_t *b = mk_btn(wn, glyph, COL_TRACK, cb, NULL);
+
+	lv_obj_set_size(b, 44, 36);
+	lv_obj_align(b, LV_ALIGN_TOP_LEFT, x, WN_BTN_Y);
+	if (!live) {
+		/* Dimmed rather than removed: a control that vanishes at the
+		 * ends of a list leaves the remaining one somewhere new every
+		 * page, and on this panel that costs a mis-tap. */
+		lv_obj_set_style_text_color(lv_obj_get_child(b, 0),
+					    COL_LINE, 0);
+	}
+	return b;
+}
+
+/* Redraw the body for wn_page. The frame (title, rule, Back) is rebuilt with
+ * it -- this screen is cheap and rebuilding is fewer moving parts than
+ * tracking which labels belong to the last page. */
+static void wn_draw(void)
+{
+	struct whatsnew_page pg[WHATSNEW_MAX_PAGES];
+	int y = WN_BODY_TOP;
+
+	if (!wn) {
+		return;
+	}
+	lv_obj_clean(wn);
+
+	lv_obj_t *title = lv_label_create(wn);
+
+	lv_label_set_text(title, "What's new");
+	lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+	lv_obj_set_style_text_color(title, COL_TEXT, 0);
+	lv_obj_align(title, LV_ALIGN_TOP_LEFT, 12, 12);
+
+	lv_obj_t *rule = lv_obj_create(wn);
+
+	lv_obj_set_size(rule, 296, 1);
+	lv_obj_align(rule, LV_ALIGN_TOP_LEFT, 12, 40);
+	lv_obj_set_style_bg_color(rule, COL_LINE, 0);
+	lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_width(rule, 0, 0);
+	lv_obj_clear_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
+
+	wn_pages = whatsnew_paginate(wn_from, wn_to, pg,
+				     (int)(sizeof(pg) / sizeof(pg[0])));
+	/*
+	 * Never offer a page that was not written into pg[].
+	 *
+	 * whatsnew_paginate returns the TRUE total on purpose, because the
+	 * pager prints it -- but it only FILLS `max` of them, so a total past
+	 * the end of this array would put "9 / 12" under a blank body. The
+	 * host test asserts the table stays inside WHATSNEW_MAX_PAGES, so this
+	 * cannot happen on a release that shipped; it is here because the cost
+	 * of being wrong is a screen that describes nothing, and the clamp is
+	 * one line. Under-reporting the count is the better of the two lies.
+	 */
+	if (wn_pages > (int)(sizeof(pg) / sizeof(pg[0]))) {
+		wn_pages = (int)(sizeof(pg) / sizeof(pg[0]));
+	}
+	if (wn_page >= wn_pages) {
+		wn_page = wn_pages ? wn_pages - 1 : 0;
+	}
+	/* Zero pages means no entry for this version, and pg[0] then holds
+	 * nothing to read. The notice does not offer the button in that case,
+	 * so this is a guard rather than a path. */
+	if (wn_pages > 0) {
+		const struct whatsnew_page *p = &pg[wn_page];
+
+		for (int i = 0; i < p->count; i++) {
+			int idx = p->first + i;
+
+			if (i) {
+				y += WHATSNEW_GAP_PX;
+			}
+
+			lv_obj_t *v = lv_label_create(wn);
+
+			lv_label_set_text(v, whatsnew_version_at(idx));
+			lv_obj_set_style_text_color(v, COL_DIM, 0);
+			lv_obj_align(v, LV_ALIGN_TOP_LEFT, 12, y);
+			y += WHATSNEW_VER_PX;
+
+			lv_obj_t *l = lv_label_create(wn);
+
+			lv_label_set_text(l, whatsnew_lines_at(idx));
+			lv_obj_set_width(l, 296);
+			lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+			lv_obj_set_style_text_color(l, COL_TEXT, 0);
+			lv_obj_align(l, LV_ALIGN_TOP_LEFT, 12, y);
+			/* One row per line. The copy rule in whatsnew.h keeps
+			 * every line inside the 296 px width and the host test
+			 * enforces it, so a line is a row and never wraps. */
+			y += WHATSNEW_LINE_PX;
+			for (const char *c = whatsnew_lines_at(idx); *c; c++) {
+				if (*c == '\n') {
+					y += WHATSNEW_LINE_PX;
+				}
+			}
+		}
+	}
+
+	lv_obj_t *back = mk_btn(wn, "Back", COL_TRACK, wn_close_cb, NULL);
+
+	lv_obj_set_size(back, 120, 36);
+	lv_obj_align(back, LV_ALIGN_TOP_LEFT, 12, WN_BTN_Y);
+
+	if (wn_pages > 1) {
+		/* Two ints and " / ": 24 covers any page count that could
+		 * exist, and -Wformat-truncation says so at 12. */
+		char n[24];
+
+		wn_chev(LV_SYMBOL_LEFT, 170, wn_page > 0, wn_prev_cb);
+		wn_chev(LV_SYMBOL_RIGHT, 264, wn_page + 1 < wn_pages,
+			wn_next_cb);
+
+		lv_obj_t *num = lv_label_create(wn);
+
+		snprintf(n, sizeof(n), "%d / %d", wn_page + 1, wn_pages);
+		lv_label_set_text(num, n);
+		lv_obj_set_style_text_color(num, COL_DIM, 0);
+		lv_obj_align(num, LV_ALIGN_TOP_LEFT, 222, WN_BTN_Y + 10);
+	}
+}
+
+/* Swipe right to leave, the same gesture that closes the settings panel.
+ * Reached only because GESTURE_BUBBLE is cleared below -- the flag is what
+ * decides whether this handler ever runs or the screen underneath gets the
+ * swipe instead. */
+static void wn_gesture_cb(lv_event_t *e)
+{
+	ARG_UNUSED(e);
+	if (lv_indev_get_gesture_dir(lv_indev_active()) == LV_DIR_RIGHT) {
+		wn_close_cb(NULL);
+	}
+}
+
+static void wn_open_cb(lv_event_t *e)
+{
+	ARG_UNUSED(e);
+	if (wn) {
+		return;
+	}
+	wn = lv_obj_create(lv_layer_top());
+	lv_obj_set_size(wn, 320, 240);
+	lv_obj_set_style_bg_color(wn, COL_BG, 0);
+	lv_obj_set_style_bg_opa(wn, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_width(wn, 0, 0);
+	lv_obj_set_style_pad_all(wn, 0, 0);
+	lv_obj_set_style_radius(wn, 0, 0);
+	lv_obj_clear_flag(wn, LV_OBJ_FLAG_SCROLLABLE);
+	/*
+	 * Do NOT bubble, for the reason build_panel gives and one more.
+	 *
+	 * In LVGL 9 every child is born GESTURE_BUBBLE, so a swipe anywhere on
+	 * this full-screen overlay travelled up to the gauge screen -- whose
+	 * handler happily started a slide to settings while this was still
+	 * sitting on lv_layer_top. Reported from the panel on 2026-09-09: the
+	 * slide begins and comes apart halfway. Every other full-screen thing
+	 * in this file clears this flag; this one did not, and it is the only
+	 * one that also covers the whole screen from the top layer.
+	 */
+	lv_obj_clear_flag(wn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+	lv_obj_add_event_cb(wn, wn_gesture_cb, LV_EVENT_GESTURE, NULL);
+	lv_obj_center(wn);
+	wn_page = 0;
+	wn_draw();
+}
+
+void ui_settings_whatsnew_dismiss(void)
+{
+	wn_close_cb(NULL);
+}
+
+/*
+ * The post-update notice: a tick, the version, how much changed, and a way
+ * into the detail.
+ *
+ * The list itself is NOT here. It was, and the argument that produced this
+ * shape was about how many rows would fit in a box clamped to 230 px with
+ * scrolling cleared -- where a row too many lands under the OK button, off
+ * the panel, on the only control that dismisses it. The screen behind
+ * "What's new" has no such ceiling and can page, so the notice gets to be
+ * two lines and an answer to the only question a customer actually has
+ * after an update, which is whether it worked.
+ */
+void ui_settings_notice_update(const char *version, const char *summary,
+			       const char *from, const char *to)
+{
+	if (notice) {
+		lv_obj_del(notice);
+	}
+	snprintf(wn_from, sizeof(wn_from), "%s", from ? from : "");
+	snprintf(wn_to, sizeof(wn_to), "%s", to ? to : "");
+
+	notice = lv_obj_create(lv_layer_top());
+	lv_obj_set_width(notice, 300);
+	lv_obj_set_height(notice, LV_SIZE_CONTENT);
+	lv_obj_set_style_min_height(notice, 110, 0);
+	lv_obj_set_style_max_height(notice, 230, 0);
+	lv_obj_set_style_pad_all(notice, 12, 0);
+	lv_obj_set_style_pad_row(notice, 12, 0);
+	lv_obj_set_style_bg_color(notice, COL_BG, 0);
+	lv_obj_set_style_bg_opa(notice, LV_OPA_COVER, 0);
+	lv_obj_set_style_border_color(notice, COL_TRACK, 0);
+	lv_obj_set_style_border_width(notice, 1, 0);
+	lv_obj_clear_flag(notice, LV_OBJ_FLAG_SCROLLABLE);
+	/* Same reason as the What's new screen: a swipe that lands on a modal
+	 * must not reach the screen behind it and start a slide the modal is
+	 * still covering. This one predates that screen and was never swiped
+	 * hard enough to show it. */
+	lv_obj_clear_flag(notice, LV_OBJ_FLAG_GESTURE_BUBBLE);
+	lv_obj_set_flex_flow(notice, LV_FLEX_FLOW_COLUMN);
+	lv_obj_set_flex_align(notice, LV_FLEX_ALIGN_CENTER,
+			      LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+	/* Tick and version on ONE row. Stacked, they cost a row and a gap --
+	 * 46 px of a 230 px box -- for no more information. */
+	lv_obj_t *head = lv_obj_create(notice);
+
+	lv_obj_set_size(head, 270, 24);
+	lv_obj_set_style_bg_opa(head, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(head, 0, 0);
+	lv_obj_set_style_pad_all(head, 0, 0);
+	lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+
+	lv_obj_t *tick = lv_label_create(head);
+
+	lv_label_set_text(tick, LV_SYMBOL_OK);
+	lv_obj_set_style_text_color(tick, COL_GREEN, 0);
+
+	lv_obj_t *ver = lv_label_create(head);
+
+	lv_label_set_text_fmt(ver, "Updated to %s", version);
+	lv_obj_set_style_text_font(ver, &lv_font_montserrat_16, 0);
+	lv_obj_set_style_text_color(ver, COL_TEXT, 0);
+
+	/* Measured, then centred as a pair: aligning each to the row
+	 * separately would leave the gap between them at whatever the
+	 * version string happened to make it. */
+	lv_obj_update_layout(head);
+	{
+		int tw = lv_obj_get_width(tick);
+		int vw = lv_obj_get_width(ver);
+		int x = (270 - (tw + 8 + vw)) / 2;
+
+		lv_obj_align(tick, LV_ALIGN_LEFT_MID, x, 0);
+		lv_obj_align(ver, LV_ALIGN_LEFT_MID, x + tw + 8, 0);
+	}
+
+	if (summary && summary[0]) {
+		lv_obj_t *sum = lv_label_create(notice);
+
+		lv_label_set_text(sum, summary);
+		lv_obj_set_width(sum, 270);
+		lv_label_set_long_mode(sum, LV_LABEL_LONG_WRAP);
+		lv_obj_set_style_text_color(sum, COL_DIM, 0);
+		lv_obj_set_style_text_align(sum, LV_TEXT_ALIGN_CENTER, 0);
+	}
+
+	lv_obj_t *row = lv_obj_create(notice);
+
+	lv_obj_set_size(row, 270, 36);
+	lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+	lv_obj_set_style_border_width(row, 0, 0);
+	lv_obj_set_style_pad_all(row, 0, 0);
+	lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+	/* Only when there is something behind it. A release with no entry in
+	 * the table would open an empty screen. */
+	if (summary && summary[0]) {
+		lv_obj_t *more = mk_btn(row, "What's new", COL_BG,
+					wn_open_cb, NULL);
+
+		lv_obj_set_size(more, 128, 36);
+		lv_obj_set_style_border_color(more, COL_TRACK, 0);
+		lv_obj_set_style_border_width(more, 1, 0);
+		lv_obj_align(more, LV_ALIGN_LEFT_MID, 0, 0);
+
+		lv_obj_t *ok = mk_btn(row, "OK", COL_TRACK, notice_ok_cb, NULL);
+
+		lv_obj_set_size(ok, 128, 36);
+		lv_obj_align(ok, LV_ALIGN_RIGHT_MID, 0, 0);
+	} else {
+		lv_obj_t *ok = mk_btn(row, "OK", COL_TRACK, notice_ok_cb, NULL);
+
+		lv_obj_set_size(ok, 120, 36);
+		lv_obj_align(ok, LV_ALIGN_CENTER, 0, 0);
+	}
+
+	lv_obj_update_layout(notice);
+	lv_obj_center(notice);
+}
+
 void ui_settings_notice_titled(const char *title, const char *body)
 {
 	if (notice) {
@@ -404,6 +754,12 @@ void ui_settings_notice_titled(const char *title, const char *body)
 	lv_obj_set_style_border_color(notice, COL_TRACK, 0);
 	lv_obj_set_style_border_width(notice, 1, 0);
 	lv_obj_clear_flag(notice, LV_OBJ_FLAG_SCROLLABLE);
+	/* And gestures stop here. See the note on the What's new screen: in
+	 * LVGL 9 these are born GESTURE_BUBBLE, so a swipe that lands on a
+	 * modal travels past it and slides the screen it is covering. This is
+	 * the builder every OTHER notice goes through -- the update failures,
+	 * "Couldn't check for updates" -- and it had the same hole. */
+	lv_obj_clear_flag(notice, LV_OBJ_FLAG_GESTURE_BUBBLE);
 	lv_obj_set_flex_flow(notice, LV_FLEX_FLOW_COLUMN);
 	lv_obj_set_flex_align(notice, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
 			      LV_FLEX_ALIGN_CENTER);
@@ -486,17 +842,18 @@ static void upd_prompt_now_cb(lv_event_t *e)
 	ota_request_install();
 }
 
+/*
+ * Draws the box, and nothing else. WHETHER to draw it -- the once-per-boot
+ * latch, the withdrawal, and the two different reasons the latch lifts again
+ * -- is upd_prompt_step() in upd_prompt.h, so that all of it can be reached
+ * from a host test instead of only from a finger on the panel.
+ */
 static void upd_prompt_show(const struct ota_ui *snap)
 {
-	/* Never stack on top of something the user is already answering. */
-	if (upd_prompt_done || upd_prompt || panel || confirm || notice ||
-	    dl_overlay) {
-		return;
-	}
-	upd_prompt_done = true;
-	/* After the guard above, so this is the one moment the box is really
-	 * put up rather than every service tick that finds it already
-	 * there. Pairs with the withdrawal line. */
+	/* Called only for UPD_PROMPT_SHOW, which already answered every
+	 * question the guard that used to sit here was asking. This is the one
+	 * moment the box is really put up rather than every service tick that
+	 * finds it already there. Pairs with the withdrawal line. */
 	printk("[ota] offer shown: %s\n", snap->version);
 
 	upd_prompt = lv_obj_create(lv_layer_top());
@@ -511,6 +868,10 @@ static void upd_prompt_show(const struct ota_ui *snap)
 	 * it and overlapped (user-reported 2026-08-20). */
 	lv_obj_set_style_pad_all(upd_prompt, 0, 0);
 	lv_obj_clear_flag(upd_prompt, LV_OBJ_FLAG_SCROLLABLE);
+	/* Same hole, and this is the prompt the 2026-09-09 report was about --
+	 * a customer already trying to act on it. A swipe that drifts off the
+	 * buttons must not slide the screen out from under the offer. */
+	lv_obj_clear_flag(upd_prompt, LV_OBJ_FLAG_GESTURE_BUBBLE);
 	lv_obj_center(upd_prompt);
 
 	lv_obj_t *l = lv_label_create(upd_prompt);
@@ -631,6 +992,16 @@ static void dl_overlay_show(const struct ota_ui *snap, bool rebooting)
 		lv_obj_set_style_border_width(dl_overlay, 0, 0);
 		lv_obj_set_style_radius(dl_overlay, 0, 0);
 		lv_obj_clear_flag(dl_overlay, LV_OBJ_FLAG_SCROLLABLE);
+		/*
+		 * And gestures, most of all here.
+		 *
+		 * This is the screen that says "keep the cable connected" while
+		 * the daemon writes slot 0 with esptool. A stray swipe bubbling
+		 * past it started a slide animation on top of a flash in
+		 * progress -- the one moment on this device where the panel
+		 * should do nothing at all but sit still and be read.
+		 */
+		lv_obj_clear_flag(dl_overlay, LV_OBJ_FLAG_GESTURE_BUBBLE);
 		lv_obj_center(dl_overlay);
 
 		dl_lbl = lv_label_create(dl_overlay);
@@ -886,15 +1257,28 @@ static void upd_timer_cb(lv_timer_t *t)
 	 * AVAILABLE has to be allowed to ask again. Without that, a daemon
 	 * restart at the wrong moment would eat the offer for the whole boot.
 	 */
-	if (snap.st != OTA_UI_AVAILABLE && upd_prompt) {
-		upd_prompt_close();
-		upd_prompt_done = false;
-		/* Logged because this is the moment the reported fault used
-		 * to NOT happen, and there was no way to tell from outside
-		 * whether the offer on the glass still meant anything. A
-		 * support reader looking at why a customer's tap did nothing
-		 * needs to see that the board had already withdrawn it. */
-		printk("[ota] offer withdrawn: state is no longer available\n");
+	{
+		struct upd_prompt_turn pt = upd_prompt_step(
+			snap.st, upd_prompt != NULL, upd_prompt_done,
+			panel || confirm || notice || dl_overlay);
+
+		if (pt.act == UPD_PROMPT_WITHDRAW) {
+			upd_prompt_close();
+			/* Logged because this is the moment the reported
+			 * fault used to NOT happen, and there was no way to
+			 * tell from outside whether the offer on the glass
+			 * still meant anything. A support reader looking at
+			 * why a customer's tap did nothing needs to see that
+			 * the board had already withdrawn it. */
+			printk("[ota] offer withdrawn: state is no longer available\n");
+		}
+		/* Applied verbatim, including the FAILED case that lifts it
+		 * with no box open -- the one a tap leaves behind, and the one
+		 * that made a half-finished pair update permanent. */
+		upd_prompt_done = pt.latched;
+		if (pt.act == UPD_PROMPT_SHOW) {
+			upd_prompt_show(&snap);
+		}
 	}
 
 	switch (snap.st) {
@@ -914,8 +1298,7 @@ static void upd_timer_cb(lv_timer_t *t)
 		dl_overlay_show(&snap, true);
 		break;
 	case OTA_UI_AVAILABLE:
-		upd_prompt_show(&snap);
-		break;
+		break;		/* the offer is raised above, by upd_prompt_step */
 	case OTA_UI_UP_TO_DATE:
 		/* Bounce back to IDLE even with the panel shut, so a stale
 		 * "Up to date" cannot greet the next open. */
@@ -944,16 +1327,15 @@ static void upd_timer_cb(lv_timer_t *t)
 				"Couldn't check for updates.";
 
 			/*
-			 * Let the prompt come back. It is shown at most once
-			 * per boot so that a "Later" is respected, but a
-			 * failure is not a "Later": the customer said yes and
-			 * did not get an update, and latching the prompt shut
-			 * left them a board that would never offer again until
-			 * it was power-cycled. Re-arming costs nothing --
-			 * getting back to AVAILABLE still takes a fresh check
-			 * that succeeds.
+			 * The prompt is let back in by upd_prompt_step()
+			 * above, which lifts the latch on FAILED whether or
+			 * not a box is open. It used to be done here, where
+			 * no test could reach it -- and it is the rule that a
+			 * tap disables, since answering the prompt closes it
+			 * and leaves the withdrawal rule nothing to act on.
+			 * Re-arming costs nothing: getting back to AVAILABLE
+			 * still takes a fresh check that succeeds.
 			 */
-			upd_prompt_done = false;
 
 			/* Say which failure it was when we know. "Update
 			 * failed" alone is true of a hash that did not match,
@@ -1993,11 +2375,37 @@ BUILD_ASSERT(FOOT_Y2 + 16 <= 240,
  * which are not page changes, and growing a rail mark for one would promise
  * something that is not about to happen.
  */
+/*
+ * Is something modal on lv_layer_top waiting to be answered?
+ *
+ * The screen must not move out from under it. Clearing GESTURE_BUBBLE on
+ * those objects does NOT achieve this and it is worth writing down why: that
+ * flag governs LVGL's own gesture dispatch, and screen navigation on this
+ * board does not use it. ui_swipe reads the touch device directly, because
+ * LVGL's detector cannot survive a panel that reports one physical swipe as
+ * five or six short presses -- ui_swipe.h has the measurements. So a swipe
+ * bound for settings never passes through the LVGL bubbling at all, and a
+ * modal that stops gestures there is still swiped straight off the screen.
+ *
+ * Reported from the panel on 2026-09-10, after a first fix that sealed every
+ * modal against the wrong mechanism.
+ *
+ * `panel` is checked separately by both callers: it is a screen rather than
+ * an overlay, and it has its own swipe-to-close.
+ */
+static bool modal_up(void)
+{
+	return notice != NULL || wn != NULL || upd_prompt != NULL ||
+	       dl_overlay != NULL;
+}
+
 static void swipe_progress_cb(enum ui_swipe_dir dir, int pct)
 {
 	int delta = 0;
 
-	if (panel == NULL && !ui_anim_gesture_muted()) {
+	/* No page preview under a modal either: the rail would grow a mark
+	 * promising a page change that modal_up() is about to refuse. */
+	if (panel == NULL && !modal_up() && !ui_anim_gesture_muted()) {
 		if (dir == UI_SWIPE_UP) {
 			delta = 1;
 		} else if (dir == UI_SWIPE_DOWN) {
@@ -2021,6 +2429,22 @@ static void swipe_progress_cb(enum ui_swipe_dir dir, int pct)
  */
 static void swipe_cb(enum ui_swipe_dir dir)
 {
+	/*
+	 * A modal owns the screen until it is answered -- with one exception,
+	 * which is the full-screen one: What's new leaves on a right swipe,
+	 * the same stroke that closes settings. Routed through here rather
+	 * than through an LV_EVENT_GESTURE handler because this is the
+	 * detector that actually works on this hardware.
+	 */
+	if (wn != NULL) {
+		if (dir == UI_SWIPE_RIGHT) {
+			wn_close_cb(NULL);
+		}
+		return;
+	}
+	if (modal_up()) {
+		return;
+	}
 	if (panel != NULL) {
 		return;
 	}
@@ -2144,7 +2568,27 @@ static void swipe_cb(enum ui_swipe_dir dir)
  */
 static bool zone_was_a_tap(void)
 {
-	return panel == NULL && !ui_anim_gesture_muted() &&
+	/*
+	 * modal_up() is the term this was missing, and the geometry is why it
+	 * took two wrong fixes to find.
+	 *
+	 * These zones live on the gauge screen, 44 px wide at each edge. The
+	 * What's new screen is a full 320x240 and physically covers them, so
+	 * it looked fixed. The notice is 300 px wide and centred, which
+	 * leaves a 10 px strip of live edge zone down each side -- and on a
+	 * resistive panel a stroke that breaks contact arrives as a press,
+	 * which is exactly what ui_swipe_dragging() is unable to call a drag.
+	 * So a swipe across the notice opened settings underneath it, while
+	 * the same swipe across What's new did nothing, and the difference
+	 * was 20 px of width rather than anything either fix had touched.
+	 *
+	 * Reported twice from the panel on 2026-09-10. The first fix sealed
+	 * LVGL's gesture bubbling, which screen navigation does not use; the
+	 * second taught swipe_cb about modals, which is right and is not the
+	 * route a tap takes. This is the third and it is the one under the
+	 * finger.
+	 */
+	return panel == NULL && !modal_up() && !ui_anim_gesture_muted() &&
 	       !ui_swipe_dragging();
 }
 

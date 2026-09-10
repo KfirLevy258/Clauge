@@ -126,6 +126,24 @@ void ui_sleep_run(bool (*awake)(void), const char *peek_note)
 	 * from hours ago as though it were news.
 	 */
 	usage_view_set_sleeping(true);
+	/*
+	 * And take What's new down, because it would eat the tap below.
+	 *
+	 * That screen is a full 320x240 on lv_layer_top, which sits above
+	 * every screen -- so lv_scr_load() does not hide it and the closing
+	 * clip, drawn straight to the panel, only paints over it. The tap is
+	 * the part that matters: lv_obj_create hands out LV_OBJ_FLAG_CLICKABLE
+	 * by default (lv_obj.c:495), so the hit test finds this overlay before
+	 * it finds `scr`, tap_cb never runs, and a board dozing with the screen
+	 * open cannot be woken by touching it at all. Every OTHER modal here is
+	 * narrower than the panel and leaves a live strip down each side, which
+	 * is why this is the first one to reach the tap.
+	 *
+	 * The notice underneath is left alone: the peek replaces it with its
+	 * own note a moment later, and that path has worked since it was
+	 * written.
+	 */
+	ui_settings_whatsnew_dismiss();
 	lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 	lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
 	lv_obj_set_style_bg_color(scr, lv_color_hex(close->bg_rgb), 0);

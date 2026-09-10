@@ -270,11 +270,7 @@ static void ota_report_outcome(void)
 {
 	char trail[CFG_OTA_VER_MAX];
 	char from[CFG_OTA_VER_MAX], to[CFG_OTA_VER_MAX];
-	char title[32];
-	/* Static rather than automatic: this is a quarter of a kilobyte and
-	 * it runs on the main thread during boot, beside the LVGL work. It
-	 * is called once, so the BSS is the cheaper of the two. */
-	static char notes[WHATSNEW_MAX];
+	char summary[WHATSNEW_SUMMARY_MAX];
 
 	if (cfg_get_ota_state(trail, sizeof(trail)) != 1) {
 		return;
@@ -302,20 +298,17 @@ static void ota_report_outcome(void)
 	       strcmp(to, BLINK_FW_VERSION) == 0 ? "landed" : "REVERTED",
 	       to, BLINK_FW_VERSION, from[0] ? from : "?");
 	if (strcmp(to, BLINK_FW_VERSION) == 0) {
-		snprintf(title, sizeof(title), "Updated to %s",
-			 BLINK_FW_VERSION);
 		/*
-		 * A release with nothing to say about itself gets the plain
-		 * one-line notice, not a heading with an empty space under
-		 * it -- which is also exactly what this popup was before the
-		 * notes existed.
+		 * The notice says how much changed; the screen behind it says
+		 * what. An empty summary means this release has no entry in
+		 * the table, and then the notice shows the tick and the
+		 * version alone rather than offering a screen with nothing
+		 * on it.
 		 */
-		if (whatsnew_render(from, BLINK_FW_VERSION, notes,
-				    sizeof(notes)) > 0) {
-			ui_settings_notice_titled(title, notes);
-		} else {
-			ui_settings_notice(title);
-		}
+		whatsnew_summary(from, BLINK_FW_VERSION, summary,
+				 sizeof(summary));
+		ui_settings_notice_update(BLINK_FW_VERSION, summary, from,
+					  BLINK_FW_VERSION);
 	} else {
 		ui_settings_notice("Update failed, previous version restored.");
 	}

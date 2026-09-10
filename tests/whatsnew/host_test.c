@@ -1,16 +1,18 @@
-/* What the popup after an update says, pinned.
+/* What the panel says after an update, pinned.
  *
  *   cc -Wall -Werror -I firmware/src tests/whatsnew/host_test.c \
  *      firmware/src/whatsnew.c firmware/src/ota_parse.c -o /tmp/whatsnew
  *
  * The popup used to say "Updated to version 1.3.2." and nothing else. The
  * customer who prompted this went 1.2.5 -> 1.3.2 in one tap -- three
- * releases -- so the interesting cases here are the multi-release walk and
- * the screen budget that stops it. See whatsnew.h.
+ * releases -- so the interesting cases are the multi-release span, how it
+ * packs into pages, and the breadcrumb that makes any of it knowable at all.
+ * See whatsnew.h.
  */
 #include <stdio.h>
 #include <string.h>
 #include "whatsnew.h"
+#include "ota_parse.h"
 
 static int fails;
 
@@ -23,13 +25,11 @@ static int fails;
 	} \
 } while (0)
 
-/* Does `hay` contain `needle`? */
 static int has(const char *hay, const char *needle)
 {
 	return strstr(hay, needle) != NULL;
 }
 
-/* How many lines the text would occupy before wrapping. */
 static int lines(const char *s)
 {
 	int n = s[0] ? 1 : 0;
@@ -42,177 +42,189 @@ static int lines(const char *s)
 	return n;
 }
 
+/*
+ * How many releases lie between `from` and `to`.
+ *
+ * Computed here rather than assumed to be the whole table. It was assumed,
+ * and that only held because the real table happens to contain exactly the
+ * three releases of the reported jump -- so "the span" and "the table" were
+ * the same number by coincidence. Loading a ten-release table to exercise
+ * the pager separated them and 24 checks failed, all of them measuring the
+ * wrong quantity. The assertion would have gone on passing until the fourth
+ * release was added, and then failed for a reason nobody would have believed.
+ */
+static int span_of(const char *from, const char *to)
+{
+	int n = 0;
+	int seen_to = 0;
+
+	for (int i = 0; i < whatsnew_entries(); i++) {
+		const char *v = whatsnew_version_at(i);
+
+		if (!seen_to) {
+			if (strcmp(v, to) != 0) {
+				continue;
+			}
+			seen_to = 1;
+		}
+		if (n && from && from[0] && !ota_version_newer(v, from)) {
+			break;
+		}
+		n++;
+		if (!from || !from[0]) {
+			break;      /* unknown origin: the landed release only */
+		}
+	}
+	return n;
+}
+
+/* What a page costs, by the same arithmetic whatsnew.c uses. */
+static int page_px(const struct whatsnew_page *p)
+{
+	int px = 0;
+
+	for (int i = 0; i < p->count; i++) {
+		px += WHATSNEW_VER_PX
+		    + lines(whatsnew_lines_at(p->first + i)) * WHATSNEW_LINE_PX
+		    + (i ? WHATSNEW_GAP_PX : 0);
+	}
+	return px;
+}
+
 int main(void)
 {
-	char buf[WHATSNEW_MAX];
+	char buf[WHATSNEW_SUMMARY_MAX];
 	char from[16], to[16], trail[16];
+	struct whatsnew_page pages[16];
 
 	/* ---------------- the table is present and reachable ------------- */
 	CHECK(whatsnew_has("1.3.2"));
 	CHECK(whatsnew_has("1.3.0"));
-	/* A release with no entry must be answerable, because release.sh
-	 * asks exactly this before it will publish. */
+	/* release.sh asks exactly this before it will publish. */
 	CHECK(!whatsnew_has("9.9.9"));
 	CHECK(!whatsnew_has(""));
-
-	/* ---------------- the panel's budget, asserted ------------------- */
+	CHECK(whatsnew_entries() >= 1);
 	/*
-	 * The box is 230 px tall with a 270 px label and an OK button under
-	 * it: about eight lines of the default montserrat_14, at roughly 33
-	 * characters before it wraps. Neither number is enforced anywhere in
-	 * the firmware -- LVGL will happily lay a ninth line out underneath
-	 * the button, where nobody sees it until a customer's board does it.
-	 * So the budget is checked here, where adding a release that breaks
-	 * it fails in CI instead of on a desk.
+	 * And the table has a ceiling, asserted here because nothing else
+	 * would notice it being passed.
+	 *
+	 * The screen paginates into an array of WHATSNEW_MAX_PAGES on the
+	 * stack. A page holds at least one release, so the page count can
+	 * never exceed the entry count -- one number bounds both, and this is
+	 * the check that makes the number real. The release that pushes the
+	 * table past it fails here, at `tools/release.sh` time, rather than
+	 * drawing a blank page on the desk of the one customer far enough
+	 * behind to page that deep. Trim the oldest entries when it fires.
 	 */
+	CHECK(whatsnew_entries() <= WHATSNEW_MAX_PAGES);
+	for (int i = 0; i < whatsnew_entries(); i++) {
+		CHECK(whatsnew_version_at(i)[0] != '\0');
+		CHECK(whatsnew_lines_at(i)[0] != '\0');
+	}
+	/* Out of range must answer rather than walk off the table: the screen
+	 * asks for entries by index while paging. */
+	CHECK(whatsnew_version_at(-1)[0] == '\0');
+	CHECK(whatsnew_lines_at(whatsnew_entries())[0] == '\0');
+
+	/* ---------------- the copy rules, checked not described ---------- */
 	for (int i = 0; i < whatsnew_entries(); i++) {
 		const char *p = whatsnew_lines_at(i);
 
-		CHECK(p[0] != '\0');
+		/* No entry may need a page to itself. whatsnew_paginate
+		 * admits the first release on a page unconditionally -- that
+		 * is what stops it looping -- so a release taller than a page
+		 * would overrun one. */
+		CHECK(lines(p) <= WHATSNEW_LINES_PER_ENTRY);
+		CHECK(WHATSNEW_VER_PX + lines(p) * WHATSNEW_LINE_PX
+		      <= WHATSNEW_PAGE_PX);
 		CHECK(p[strlen(p) - 1] != '\n');   /* no trailing blank line */
+		/* ~33 characters before the screen's 296 px wraps, and a
+		 * wrapped line is a row this arithmetic did not count. */
 		for (const char *e; ; p = e + 1) {
 			e = strchr(p, '\n');
-			/* One wrapped row per line, so the row count below is
-			 * the line count and not a guess. */
 			CHECK((size_t)(e ? e - p : (long)strlen(p)) <= 33);
 			if (!e) {
 				break;
 			}
 		}
 	}
-	/* No single entry may eat the whole budget, or the cap below becomes
-	 * unreachable for everything behind it. A rule about the copy someone
-	 * writes at release time, so it is checked here. */
-	for (int i = 0; i < whatsnew_entries(); i++) {
-		CHECK(lines(whatsnew_lines_at(i)) <= WHATSNEW_ROWS_PER_ENTRY);
-	}
 
-	/*
-	 * THE ROW CAP. The box is 230 px with LV_OBJ_FLAG_SCROLLABLE cleared,
-	 * so a row that does not fit is not scrolled to and not clipped: it
-	 * pushes the OK button off the panel, and a popup that cannot be
-	 * dismissed is a board the customer cannot get past.
-	 *
-	 * A byte budget does not bound this. 224 bytes of short lines is
-	 * thirty rows -- which is why the earlier version of this test, which
-	 * only checked that today's three entries happened to fit, would have
-	 * passed a table that overflowed the screen.
-	 */
-	whatsnew_render("0.0.1", "1.3.2", buf, sizeof(buf));
-	CHECK(lines(buf) <= WHATSNEW_ROWS);
-
-	/*
-	 * And the cap holds no matter how many releases are in play, which is
-	 * the question that produced it: what happens after a hundred
-	 * updates. The row budget is asked for explicitly here so the cap can
-	 * be proved biting at a size this test can construct, rather than
-	 * asserted about a table that is currently three entries long.
-	 */
-	for (int r = 1; r <= 10; r++) {
-		int n = whatsnew_render_rows("0.0.1", "1.3.2", buf,
-					     sizeof(buf), r);
-
-		CHECK(lines(buf) <= r);
-		CHECK(n <= whatsnew_entries());
-		/* Whatever did not fit is counted, never silently dropped --
-		 * otherwise the popup claims the newest release is all that
-		 * changed. */
-		if (n < whatsnew_entries()) {
-			CHECK(has(buf, "earlier update"));
-		}
-	}
-	/* One row, three releases: the count line is the row that survives,
-	 * because it is the only one that is still true. */
-	CHECK(whatsnew_render_rows("0.0.1", "1.3.2", buf, sizeof(buf), 1) == 0);
-	CHECK(lines(buf) == 1);
-	CHECK(has(buf, "3 earlier updates."));
-
-	/* ---------------- one release at a time -------------------------- */
-	CHECK(whatsnew_render("1.3.1", "1.3.2", buf, sizeof(buf)) == 1);
-	CHECK(has(buf, "Updates report honestly"));
-	/* Nothing from a release the board already had. */
-	CHECK(!has(buf, "Claude Desktop"));
-
-	/* ---------------- the reported jump: 1.2.5 -> 1.3.2 -------------- */
-	/*
-	 * Three releases, four rows. The release the customer landed on keeps
-	 * its detail and the rest becomes a count -- that is the shape at any
-	 * distance, and the only thing a longer jump changes is the number.
-	 */
-	CHECK(whatsnew_render("1.2.5", "1.3.2", buf, sizeof(buf)) == 2);
-	CHECK(has(buf, "Updates report honestly"));       /* 1.3.2 */
-	CHECK(has(buf, "out-of-date app"));               /* 1.3.1 */
-	CHECK(has(buf, "and 1 earlier update."));         /* 1.3.0, counted */
-	CHECK(lines(buf) <= WHATSNEW_ROWS);
-	CHECK(strlen(buf) < WHATSNEW_MAX);
-
-	/* ---------------- an unknown origin is not an error -------------- */
-	/* A board updated by a release that recorded only its target reports
-	 * "" here. Showing the one release we know it is running is the
-	 * honest answer; showing nothing would be a regression on today. */
-	CHECK(whatsnew_render("", "1.3.2", buf, sizeof(buf)) == 1);
-	CHECK(has(buf, "Updates report honestly"));
-	CHECK(!has(buf, "Claude Desktop"));
-	CHECK(whatsnew_render("not-a-version", "1.3.2", buf, sizeof(buf)) == 1);
-
-	/* ---------------- a version we have no entry for ----------------- */
-	/* Say nothing rather than guess: the caller's header still names it. */
-	CHECK(whatsnew_render("1.3.0", "9.9.9", buf, sizeof(buf)) == 0);
+	/* ---------------- the summary the notice shows ------------------- */
+	CHECK(whatsnew_summary("1.2.5", "1.3.2", buf, sizeof(buf)) == 5);
+	CHECK(has(buf, "5 changes since 1.2.5"));
+	/* One release: "since" is dropped, because "2 changes since 1.3.1"
+	 * on an update FROM 1.3.1 is a comparison nobody asked for. */
+	CHECK(whatsnew_summary("1.3.1", "1.3.2", buf, sizeof(buf)) == 2);
+	CHECK(strcmp(buf, "2 changes") == 0);
+	/* An unknown origin names no version it is not entitled to name. */
+	CHECK(whatsnew_summary("", "1.3.2", buf, sizeof(buf)) == 2);
+	CHECK(!has(buf, "since"));
+	/* A version with no entry says nothing at all, and the caller shows
+	 * its title alone rather than an empty line under it. */
+	CHECK(whatsnew_summary("1.3.0", "9.9.9", buf, sizeof(buf)) == 0);
 	CHECK(buf[0] == '\0');
+	/* Singular, because "1 changes" is the tell of a count nobody read. */
+	CHECK(whatsnew_summary("1.3.0", "1.3.1", buf, sizeof(buf)) == 1);
+	CHECK(strcmp(buf, "1 change") == 0);
 
-	/* ---------------- nothing is invented about older releases ------- */
-	/*
-	 * The count may only ever name releases this table HAS and could not
-	 * fit. There were none between 1.2.5 and 1.3.0, so coming from far
-	 * below the table must not inflate the number: 1.3.0 is the one entry
-	 * left over, and one is what it has to say however far back the jump
-	 * started.
-	 */
-	CHECK(whatsnew_render("1.0.0", "1.3.2", buf, sizeof(buf)) == 2);
-	CHECK(has(buf, "and 1 earlier update."));
-	CHECK(whatsnew_render("0.0.1", "1.3.2", buf, sizeof(buf)) == 2);
-	CHECK(has(buf, "and 1 earlier update."));
+	/* ---------------- pagination: the reported jump ------------------ */
+	/* Three releases and five changes fit one page, so the customer who
+	 * prompted all of this never sees a pager at all. */
+	CHECK(span_of("1.2.5", "1.3.2") == 3);
+	CHECK(whatsnew_paginate("1.2.5", "1.3.2", pages, 16) >= 1);
+	CHECK(pages[0].first == 0);
+	CHECK(page_px(&pages[0]) <= WHATSNEW_PAGE_PX);
 
-	/* ---------------- the budget stops the walk cleanly -------------- */
-	{
-		char mid[96];
+	CHECK(whatsnew_paginate("1.3.1", "1.3.2", pages, 16) == 1);
+	CHECK(pages[0].count == 1);
+	/* An unknown origin yields the one release we know is running. */
+	CHECK(whatsnew_paginate("", "1.3.2", pages, 16) == 1);
+	CHECK(pages[0].count == 1);
+	CHECK(whatsnew_paginate("1.3.0", "9.9.9", pages, 16) == 0);
 
-		/* Room for one release and the count, which is what the
-		 * reservation exists to guarantee: without it the count was
-		 * the first thing squeezed out, leaving a popup that silently
-		 * claimed the newest release was all that changed. */
-		CHECK(whatsnew_render("1.2.5", "1.3.2", mid, sizeof(mid)) == 1);
-		CHECK(has(mid, "Updates report honestly"));
-		CHECK(has(mid, "and 2 earlier updates."));
-		CHECK(strlen(mid) < sizeof(mid));
+	/* ---------------- pagination: the rules, at sizes we can build --- */
+	/* Every page inside its budget, and no release ever split across a
+	 * page turn -- so the counts have to add back up to the whole span. */
+	for (int px = 40; px <= 200; px += 7) {
+		int n = whatsnew_paginate_px("1.2.5", "1.3.2", pages, 16, px);
+		int total = 0;
+
+		CHECK(n >= 1);
+		for (int i = 0; i < n && i < 16; i++) {
+			CHECK(pages[i].count >= 1);
+			/* A page holding more than one release must fit. One
+			 * holding a single release is admitted whatever the
+			 * budget, which is what stops this looping. */
+			if (pages[i].count > 1) {
+				CHECK(page_px(&pages[i]) <= px);
+			}
+			CHECK(pages[i].first == (i ? pages[i - 1].first
+						 + pages[i - 1].count : 0));
+			total += pages[i].count;
+		}
+		CHECK(total == span_of("1.2.5", "1.3.2"));
 	}
-	{
-		char small[64];
 
-		/* Too small for both. The WORDS win: "and 2 earlier updates."
-		 * on its own tells a customer nothing they can use, where one
-		 * real improvement does. */
-		CHECK(whatsnew_render("1.2.5", "1.3.2", small,
-				      sizeof(small)) == 1);
-		CHECK(has(small, "Updates report honestly"));
-		/* Whole sentences or none -- never a clipped one. */
-		CHECK(strlen(small) < sizeof(small));
+	/* A budget too small for two releases gives one page each. */
+	CHECK(whatsnew_paginate_px("1.2.5", "1.3.2", pages, 16, 50)
+	      == span_of("1.2.5", "1.3.2"));
+	for (int i = 0; i < span_of("1.2.5", "1.3.2") && i < 16; i++) {
+		CHECK(pages[i].count == 1);
 	}
-	{
-		/* Absurdly small: no line fits at all. Must not write past
-		 * the end, and must not leave a stray leading newline. */
-		char tiny[24];
 
-		whatsnew_render("1.2.5", "1.3.2", tiny, sizeof(tiny));
-		CHECK(strlen(tiny) < sizeof(tiny));
-		CHECK(tiny[0] != '\n');
-	}
+	/* The TOTAL comes back even when it exceeds `max`, because the pager
+	 * prints it -- truncating it silently would put "1 / 1" on a screen
+	 * that has three pages. */
 	{
-		char one[2];
+		struct whatsnew_page one[1];
 
-		CHECK(whatsnew_render("1.2.5", "1.3.2", one, sizeof(one)) == 0);
-		CHECK(one[0] == '\0');
+		CHECK(whatsnew_paginate_px("1.2.5", "1.3.2", one, 1, 50)
+		      == span_of("1.2.5", "1.3.2"));
+		CHECK(one[0].count == 1);
 	}
+	/* A NULL out is legal, for a caller that only wants the count. */
+	CHECK(whatsnew_paginate_px("1.2.5", "1.3.2", NULL, 0, 50)
+	      == span_of("1.2.5", "1.3.2"));
 
 	/* ---------------- the breadcrumb ---------------------------------- */
 	/* 16 is CFG_OTA_VER_MAX, the real field this has to live in. */
@@ -222,24 +234,22 @@ int main(void)
 	CHECK(strcmp(from, "1.2.5") == 0);
 	CHECK(strcmp(to, "1.3.2") == 0);
 
-	/* Two-digit parts still fit, which is the case the 16 bytes were
-	 * checked against rather than assumed. */
+	/* Two-digit parts still fit -- checked, not assumed. */
 	whatsnew_trail("10.10.0", "10.11.0", trail, 16);
 	CHECK(strcmp(trail, "10.10.0>10.11.0") == 0);
 	whatsnew_split(trail, from, sizeof(from), to, sizeof(to));
 	CHECK(strcmp(to, "10.11.0") == 0);
 
 	/* When the pair does not fit, the TARGET survives whole. A truncated
-	 * version string would name a release nobody shipped, and main.c
-	 * compares this against BLINK_FW_VERSION to decide whether the update
-	 * landed -- so a clipped target reports a good update as a failure. */
+	 * version names a release nobody shipped, and main.c compares this
+	 * against BLINK_FW_VERSION to decide whether the update landed -- so
+	 * a clipped target reports a good update as a failure. */
 	whatsnew_trail("10.10.10", "10.10.11", trail, 16);
 	CHECK(strcmp(trail, "10.10.11") == 0);
 	whatsnew_split(trail, from, sizeof(from), to, sizeof(to));
 	CHECK(from[0] == '\0');
 	CHECK(strcmp(to, "10.10.11") == 0);
 
-	/* An unknown origin packs as the target alone. */
 	whatsnew_trail("", "1.3.2", trail, 16);
 	CHECK(strcmp(trail, "1.3.2") == 0);
 
@@ -252,23 +262,19 @@ int main(void)
 	CHECK(from[0] == '\0');
 	CHECK(strcmp(to, "1.3.2") == 0);
 
-	/* And an empty one, which is what a cleared breadcrumb reads as. */
 	whatsnew_split("", from, sizeof(from), to, sizeof(to));
 	CHECK(from[0] == '\0');
 	CHECK(to[0] == '\0');
 
 	/* Round trip, for every pair the table knows about. */
-	{
-		static const char *const vs[] = {"1.3.0", "1.3.1", "1.3.2"};
-
-		for (int i = 0; i < 3; i++) {
-			for (int j = 0; j < 3; j++) {
-				whatsnew_trail(vs[i], vs[j], trail, 16);
-				whatsnew_split(trail, from, sizeof(from),
-					       to, sizeof(to));
-				CHECK(strcmp(to, vs[j]) == 0);
-				CHECK(strcmp(from, vs[i]) == 0);
-			}
+	for (int i = 0; i < whatsnew_entries(); i++) {
+		for (int j = 0; j < whatsnew_entries(); j++) {
+			whatsnew_trail(whatsnew_version_at(i),
+				       whatsnew_version_at(j), trail, 16);
+			whatsnew_split(trail, from, sizeof(from),
+				       to, sizeof(to));
+			CHECK(strcmp(to, whatsnew_version_at(j)) == 0);
+			CHECK(strcmp(from, whatsnew_version_at(i)) == 0);
 		}
 	}
 
