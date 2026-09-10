@@ -258,10 +258,17 @@ class Bridge:
             return
         if not m or not ota_mod.is_newer(m.get("version", ""), cur):
             have = m.get("version", "?") if m else "unreachable"
+            # Costs one signed fetch, and buys the board the answer to a
+            # question it was otherwise left to guess at. This is the state a
+            # working desk sits in, so it is the one that decides whether the
+            # update row tells the truth.
+            self._app_update = self._app_available(m)
+            app = self._app_update[0] if self._app_update else None
             print(f"[bridge] ota: board has {cur}, release has {have}"
-                  " -- nothing to do", file=sys.stderr)
-            self._ota_reset()
-            self._write(protocol.ota_none())
+                  " -- nothing to do" + (f", app {app}" if app else ""),
+                  file=sys.stderr)
+            self._manifest = None
+            self._write(protocol.ota_none(app=app))
             return
         self._manifest = m
         # Does this release also carry a newer version of THIS program? If so
@@ -275,8 +282,9 @@ class Bridge:
             # the one moment where declining costs only a retry.
             print(f"[bridge] ota: not offering {m.get('version')} -- {why}",
                   file=sys.stderr)
+            app = self._app_update[0] if self._app_update else None
             self._ota_reset()
-            self._write(protocol.ota_none())
+            self._write(protocol.ota_none(app=app))
             return
         app = self._app_update[0] if self._app_update else None
         print(f"[bridge] ota: offering {m['version']} ({m['size']} bytes)"

@@ -497,6 +497,63 @@ class TestPairUpdate(unittest.TestCase):
         self.assertNotIn("ota_resume", types(sent))
 
 
+class TestAppOldIsToldNotGuessed(unittest.TestCase):
+    """The board must be TOLD its app is behind, not left to work it out.
+
+    proto_host_outdated() used to compare the board's own firmware against the
+    daemon's version. That answers "older than ME", while the row it feeds says
+    "App is old", which is a claim about the RELEASE. They agree only while both
+    halves ship from one tag, so any board running ahead of the published feed
+    made the panel lie -- every developer's desk from the first local build
+    onwards.
+
+    ota_none is the message that has to carry it: a board whose firmware is
+    already current never sees an ota_avail, and that is exactly the state the
+    row exists to talk about.
+    """
+
+    M = {"version": "0.4.8", "size": 5, "sha256": HELLO_SHA,
+         "daemon": {"version": "99.0.0", "proto": 2, "artifacts": {
+             "macos-arm64": {"size": 9, "sha256": "ab" * 32}}}}
+
+    def setUp(self):
+        from pc import update
+        self._key = update.platform_key
+        update.platform_key = lambda: "macos-arm64"
+        self.addCleanup(lambda: setattr(update, "platform_key", self._key))
+
+    def test_a_current_board_with_a_stale_app_is_told(self):
+        b, sent, _ = bridge(manifest=self.M, self_update=lambda v, a: True)
+        b.on_message({"t": "ota_query", "cur": "0.4.8"})
+        self.assertEqual(types(sent), ["ota_none"])
+        self.assertEqual(sent[0].get("app"), "99.0.0")
+
+    def test_nothing_newer_says_nothing(self):
+        """Absent means "no newer app", and the board's row goes blank. It must
+        not be sent as an empty string, which reads as an answer."""
+        m = {"version": "0.4.8", "size": 5, "sha256": HELLO_SHA}
+        b, sent, _ = bridge(manifest=m, self_update=lambda v, a: True)
+        b.on_message({"t": "ota_query", "cur": "0.4.8"})
+        self.assertEqual(types(sent), ["ota_none"])
+        self.assertNotIn("app", sent[0])
+
+    def test_an_unverifiable_manifest_claims_nothing(self):
+        """Same rule the offer path follows: a daemon binary is decided by the
+        SIGNED manifest or not at all."""
+        b, sent, _ = bridge(manifest=self.M, signed=None,
+                            self_update=lambda v, a: True)
+        b.on_message({"t": "ota_query", "cur": "0.4.8"})
+        self.assertNotIn("app", sent[0])
+
+    def test_the_field_is_optional_on_the_wire(self):
+        from pc import protocol
+        self.assertNotIn("app", protocol.ota_none())
+        self.assertEqual(protocol.ota_none(app="1.3.4")["app"], "1.3.4")
+        # Additive: firmware that predates it ignores an unknown key, which is
+        # why PROTO_VERSION does not move for this.
+        self.assertEqual(protocol.ota_none()["v"], PROTO_VERSION)
+
+
 class TestResumeSurvivesATransient(unittest.TestCase):
     """A resume that never got as far as installing must not spend consent.
 

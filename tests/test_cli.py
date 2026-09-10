@@ -728,3 +728,36 @@ def test_status_does_not_sweep_the_codex_slots(tmp_path):
     assert cli.main(["status"]) == 0
 
     assert slot.exists(), "`blink status` swept the slots it was reporting on"
+
+
+# --- the board running ahead of this app -------------------------------------
+#
+# The line fires on a comparison against THIS APP, so it also fires when the app
+# is already the newest thing published -- every developer's desk from the first
+# local build onwards. `blink status` does not touch the network on purpose (it
+# has to work on a plane, and it is the first thing anyone runs when nothing
+# works), so it cannot tell those apart and must not pretend to.
+
+def _board_lines_for(fw):
+    from pc.cli import board_lines
+    return "\n".join(board_lines({"port": "/dev/x", "board_id": "abc",
+                                  "fw": fw},
+                                 [("/dev/x", "CH340")], (), "blink"))
+
+
+def test_a_board_ahead_names_both_possibilities():
+    from pc.version import RELEASE_VERSION
+    a, b, c = RELEASE_VERSION.split(".")
+    out = _board_lines_for(f"{a}.{b}.{int(c) + 1}")
+    assert "they ship together" in out
+    assert "blink update" in out
+    # The half that was missing: the command can find nothing, and then the
+    # board is simply ahead of the feed rather than the app being behind it.
+    assert "ahead of the published release" in out
+
+
+def test_a_matched_pair_says_none_of_it():
+    from pc.version import RELEASE_VERSION
+    out = _board_lines_for(RELEASE_VERSION)
+    assert "they ship together" not in out
+    assert "ahead of the published release" not in out

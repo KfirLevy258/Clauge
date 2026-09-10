@@ -664,8 +664,24 @@ def ota_resume(version):
     return {"t": "ota_resume", "v": VERSION, "version": version}
 
 
-def ota_none():
-    return {"t": "ota_none", "v": VERSION}
+def ota_none(app=None):
+    """Nothing to install on the BOARD -- which says nothing about the app.
+
+    `app` carries the same fact ota_avail does, for the case that message
+    cannot reach: firmware current, daemon behind. The board had no way to
+    learn it there, so it inferred one, by comparing its own firmware version
+    against the daemon's and calling anything lower "old". That is a different
+    question -- "older than me" rather than "older than the release" -- and it
+    is false on every board running ahead of the feed, which is every
+    developer's desk from the first local build onwards.
+
+    Additive and optional, like ota_avail's: firmware that predates it ignores
+    the field, so the protocol version does not move.
+    """
+    msg = {"t": "ota_none", "v": VERSION}
+    if app:
+        msg["app"] = app
+    return msg
 
 
 

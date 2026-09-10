@@ -631,6 +631,20 @@ static void dispatch(const char *json)
 		}
 	} else if (strcmp(type, "ota_none") == 0) {
 		ota_staged = false;
+		/*
+		 * Nothing for the BOARD, which says nothing about the app --
+		 * and this is the only message that can carry that answer to a
+		 * board whose firmware is already current, which is the state
+		 * a working desk sits in.
+		 *
+		 * Absent means the daemon predates the field, and absent has
+		 * to read as "nobody told me" rather than "there is none":
+		 * proto_host_outdated() then says no, the row goes blank, and
+		 * blank is the honest answer to a question nothing answered.
+		 */
+		if (!msg_get_str(json, "app", ota_app, sizeof(ota_app))) {
+			ota_app[0] = '\0';
+		}
 		ota_ui_set(OTA_UI_UP_TO_DATE, NULL, 0);
 	} else if (strcmp(type, "ota_error") == 0) {
 		char why[48] = "";
@@ -731,12 +745,31 @@ const char *proto_host_version(void)
 
 bool proto_host_outdated(void)
 {
-	/* Only ever an advisory. The pair ships from one tag, so a daemon
-	 * older than this firmware means somebody's install is half-updated --
-	 * usually because the app on the computer has no way to update itself
-	 * that the customer has noticed. Usage keeps flowing either way. */
-	return host_seen && host_ver[0] &&
-	       ota_version_newer(BLINK_FW_VERSION, host_ver);
+	/*
+	 * What the DAEMON said, not what this board worked out.
+	 *
+	 * This used to be `ota_version_newer(BLINK_FW_VERSION, host_ver)` -- a
+	 * comparison between our own firmware and the app's version. That
+	 * answers "is the app older than ME", and the row it feeds says "App
+	 * is old", which is a claim about the RELEASE. The two agree only
+	 * while both halves ship from one tag, and any board running ahead of
+	 * the published feed breaks it: every developer's desk from the first
+	 * local build onwards, and any unit hand-flashed from an unreleased
+	 * tree. Seen 2026-09-11 on a board calling the newest published app
+	 * old, while the daemon logged "release has 1.3.2 -- nothing to do"
+	 * on every query.
+	 *
+	 * The daemon is the only party that can answer it, because it is the
+	 * one that fetches and verifies the signed manifest, and it now says
+	 * so on ota_avail and ota_none alike. ota_app holds that answer and
+	 * proto_ota_check() clears it, so a stale yes cannot outlive the
+	 * question.
+	 *
+	 * Still only ever an advisory: usage keeps flowing either way, and a
+	 * daemon too old to send the field leaves this false, which is the
+	 * right way to be wrong.
+	 */
+	return ota_app[0] != '\0';
 }
 
 bool proto_host_seen(void)

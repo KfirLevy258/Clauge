@@ -2455,6 +2455,22 @@ def board_lines(known, ports, undriven=(), blink_cmd="blink"):
         out.append(f"            the board is on {known['fw']} and this app is"
                    f" {RELEASE_VERSION} -- they ship together")
         out.append(f"            run: {blink_cmd} update")
+        # ...which can find nothing, and used not to admit it.
+        #
+        # This compares the board against THIS APP, so it fires whenever the
+        # board is ahead -- including when the app is already the newest thing
+        # published, which is every developer's desk from the first local build
+        # onwards and any unit hand-flashed from an unreleased tree. There the
+        # command above is a no-op and the reader is left rerunning it.
+        #
+        # Answering it properly means asking the feed, and `blink status` does
+        # not touch the network on purpose: it has to work on a plane, and it
+        # is the first thing anyone runs when nothing works. So it names the
+        # other possibility instead of guessing between them. The panel has
+        # the same question and no room for this sentence --
+        # docs/open-bugs/app-is-old-is-a-guess.md.
+        out.append("            (if that finds nothing, this board is ahead"
+                   " of the published release)")
     return out
 
 
