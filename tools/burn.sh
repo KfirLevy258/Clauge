@@ -68,7 +68,18 @@ die()  { printf '\nFAILED: %s\n' "$*" >&2; exit 1; }
 #    esptool.py that is already on PATH -- one chosen on purpose, or the
 #    stubs in tests/ci/check_factory.sh, must win.
 PY="${BLINK_PYTHON:-$ROOT/.venv/bin/python}"
-[ -x "$PY" ] || PY="$(blink_zephyr_ws 2>/dev/null)/.venv/bin/python"
+# `|| true` inside the substitution, and it is load-bearing.
+#
+# blink_zephyr_ws returns non-zero when there is no workspace, which makes the
+# ASSIGNMENT non-zero, which makes this whole `||` list non-zero -- and `set -e`
+# then killed the script here, silently, with no message and status 1. On a
+# machine with a Zephyr workspace it never fired; on one without, `burn.sh`
+# exited before printing a single line. Two of the three fleet desks and every
+# CI runner are machines without one, which is why the factory check failed
+# there and passed on the author's desk for days.
+#
+# The next line already handles "no usable interpreter" properly, and says so.
+[ -x "$PY" ] || PY="$(blink_zephyr_ws 2>/dev/null || true)/.venv/bin/python"
 [ -x "$PY" ] || PY=$(command -v python3) || die "no python3"
 for mod in serial numpy PIL; do
 	"$PY" -c "import $mod" 2>/dev/null ||
