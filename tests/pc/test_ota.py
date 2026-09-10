@@ -352,13 +352,27 @@ if __name__ == "__main__":
 class FakePending:
     """update.PendingFirmware without a filesystem."""
 
-    def __init__(self, version=None):
+    def __init__(self, version=None, tries=0):
         self.version = version
+        self.tries = tries
         self.writes = []
 
     def set(self, version):
         self.version = version
+        self.tries = 0
         self.writes.append(version)
+
+    def read(self):
+        if not self.version:
+            return None, 0
+        return self.version, self.tries
+
+    def bump(self):
+        if self.version:
+            self.tries += 1
+
+    def clear(self):
+        self.version = None
 
     def take(self):
         v, self.version = self.version, None
@@ -481,6 +495,63 @@ class TestPairUpdate(unittest.TestCase):
         b.on_message({"t": "hello", "v": PROTO_VERSION, "fw": "0.4.8"})
         self.assertEqual(flashed, [])
         self.assertNotIn("ota_resume", types(sent))
+
+
+class TestResumeSurvivesATransient(unittest.TestCase):
+    """A resume that never got as far as installing must not spend consent.
+
+    From a customer desk, 2026-09-10: the app half of a pair update landed and
+    the firmware half did not. The board stayed on 1.2.5 with the app on
+    1.3.2, the daemon answered `ota_none`, and the panel said nothing at all.
+
+    The resume had taken the approval, failed to produce a manifest, and
+    returned -- so the consent was gone. The board does not re-offer inside one
+    boot either (ui_settings.c latches upd_prompt_done on "Update now"), so the
+    two faults compound: the update is never offered again and never explained.
+    """
+
+    M = {"version": "0.4.9", "size": 5, "sha256": HELLO_SHA}
+
+    def test_a_manifest_that_cannot_be_read_keeps_the_approval(self):
+        pending = FakePending(version="0.4.9")
+        b, sent, flashed = bridge(manifest=None, firmware=b"hello",
+                                  pending=pending)
+        b.on_message({"t": "hello", "v": PROTO_VERSION, "fw": "0.4.8"})
+        self.assertEqual(flashed, [])
+        self.assertEqual(pending.version, "0.4.9")   # still approved
+        self.assertEqual(pending.tries, 1)
+
+    def test_it_installs_when_the_feed_comes_back(self):
+        """The whole point of keeping it: the next connect finishes the job."""
+        pending = FakePending(version="0.4.9", tries=1)
+        b, sent, flashed = bridge(manifest=self.M, firmware=b"hello",
+                                  pending=pending)
+        b.on_message({"t": "hello", "v": PROTO_VERSION, "fw": "0.4.8"})
+        self.assertEqual(flashed, [(b"hello", "0.4.9")])
+        self.assertIsNone(pending.version)
+
+    def test_the_approval_is_dropped_once_the_tries_are_gone(self):
+        """Bounded, so a permanently broken feed ends in an answer rather
+        than a silent retry on every reconnect for the rest of the install."""
+        from pc import update
+        pending = FakePending(version="0.4.9", tries=update.RESUME_TRIES - 1)
+        b, sent, flashed = bridge(manifest=None, firmware=b"hello",
+                                  pending=pending)
+        b.on_message({"t": "hello", "v": PROTO_VERSION, "fw": "0.4.8"})
+        self.assertEqual(flashed, [])
+        self.assertIsNone(pending.version)
+        self.assertIn("ota_error", types(sent))
+
+    def test_a_release_that_moved_on_is_not_retried(self):
+        """Not a transient. The feed answered; what it serves is not what the
+        user agreed to, and no number of retries will change that."""
+        pending = FakePending(version="0.4.7")
+        b, sent, flashed = bridge(manifest=self.M, firmware=b"hello",
+                                  pending=pending)
+        b.on_message({"t": "hello", "v": PROTO_VERSION, "fw": "0.4.8"})
+        self.assertEqual(flashed, [])
+        self.assertIsNone(pending.version)
+        self.assertNotIn("ota_error", types(sent))
 
 
 class TestManifestCompatibility(unittest.TestCase):

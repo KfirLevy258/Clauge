@@ -457,5 +457,67 @@ class TestSwapWaitsForTheHandle(unittest.TestCase):
         self.assertNotIn("could not replace", msg)
 
 
+class TestPendingFirmware(unittest.TestCase):
+    """The note that carries one tap across the daemon replacing itself."""
+
+    def note(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(d,
+                                                            ignore_errors=True))
+        return update.PendingFirmware(os.path.join(d, "pending_fw.json"))
+
+    def test_absent_reads_as_nothing(self):
+        self.assertEqual(self.note().read(), (None, 0))
+
+    def test_set_then_read_does_not_spend_it(self):
+        p = self.note()
+        p.set("1.3.2")
+        self.assertEqual(p.read(), ("1.3.2", 0))
+        self.assertEqual(p.read(), ("1.3.2", 0))   # still there
+
+    def test_bump_counts_attempts_without_losing_the_version(self):
+        p = self.note()
+        p.set("1.3.2")
+        p.bump()
+        p.bump()
+        self.assertEqual(p.read(), ("1.3.2", 2))
+
+    def test_clear_removes_it(self):
+        p = self.note()
+        p.set("1.3.2")
+        p.clear()
+        self.assertEqual(p.read(), (None, 0))
+        p.clear()                       # and clearing twice is not an error
+
+    def test_a_note_from_an_older_daemon_has_no_counter(self):
+        """THE pair-update case, and the reason `tries` may not be there.
+
+        The OLD app writes this file and the NEW one reads it -- that is what
+        a pair update is -- so the first read after an update to a daemon that
+        counts attempts is always of a note written by one that did not. A
+        missing counter is zero attempts, never a reason to discard consent
+        the user gave.
+        """
+        p = self.note()
+        with open(p.path, "w", encoding="utf-8") as f:
+            json.dump({"version": "1.3.2"}, f)      # pre-counter format
+        self.assertEqual(p.read(), ("1.3.2", 0))
+
+    def test_a_corrupt_note_is_not_consent(self):
+        p = self.note()
+        with open(p.path, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual(p.read(), (None, 0))
+
+    def test_take_still_reads_and_clears(self):
+        """_on_ota_flash uses it when an app update failed and the old app is
+        installing the firmware itself -- there the consent IS being spent."""
+        p = self.note()
+        p.set("1.3.2")
+        self.assertEqual(p.take(), "1.3.2")
+        self.assertEqual(p.read(), (None, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

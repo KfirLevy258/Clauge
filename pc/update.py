@@ -456,6 +456,18 @@ def cleanup(target):
     _rmtree(_dirs(target)[1])
 
 
+# How many reconnects an approved install may fail to START on before the
+# consent is dropped and the user is told.
+#
+# Three, because the thing being ridden out is a transient: the new daemon
+# comes up seconds after replacing itself and immediately asks the feed for a
+# manifest it has to verify, which is the one moment in an update where a
+# network that has not settled is likeliest to answer badly. A second chance
+# covers a blip; a third covers a slow reconnect behind it. Past that the fault
+# is not transient and retrying silently is just a board that never says why.
+RESUME_TRIES = 3
+
+
 class PendingFirmware:
     """The firmware version the user already approved, across our own restart.
 
@@ -463,10 +475,27 @@ class PendingFirmware:
     daemon replaces itself in the middle of them -- so the consent has to
     outlive the process that received it. One line in a file does that.
 
-    take() clears before the caller acts on it, deliberately. If flashing goes
-    wrong the right outcome is a board still running its old firmware and a
-    user who can tap again, not a daemon that retries the same failing install
-    on every reconnect for the rest of its life.
+    WHAT THE COUNTER IS FOR, and why take() is no longer the whole story.
+
+    take() clears before the caller acts on it, and the reason is still good:
+    if FLASHING goes wrong the right outcome is a board on its old firmware and
+    a user who can tap again, not a daemon that retries the same failing
+    install on every reconnect for the rest of its life.
+
+    But "the flash failed" and "the flash was never reached" were the same
+    thing to this class, and they are not the same thing at all. The resume
+    re-runs the ordinary query first, and that query can fail for reasons that
+    have nothing to do with the image -- a manifest that did not verify because
+    the network was not up yet, a feed that answered late. The consent was
+    spent on those too: one unlucky second, and a board that the user had
+    already told to update sat on its old firmware with the daemon reporting
+    `ota_none` and the panel showing nothing at all. Reported from a customer
+    desk 2026-09-10, where the app half landed and the firmware half did not.
+
+    So read() and clear() are separate now. The caller spends the consent when
+    it genuinely attempts an install; when it could not even try, it leaves the
+    note where it is and bumps the counter, and RESUME_TRIES bounds that so a
+    permanently broken feed still ends in an answer rather than a silent loop.
     """
 
     def __init__(self, path):
@@ -476,18 +505,48 @@ class PendingFirmware:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, "w", encoding="utf-8") as f:
-                json.dump({"version": version}, f)
+                json.dump({"version": version, "tries": 0}, f)
         except OSError as e:
             print(f"[update] could not record the pending update: {e}",
                   file=sys.stderr)
 
-    def take(self):
+    def read(self):
+        """(version, tries) without spending anything. (None, 0) if absent.
+
+        `tries` is absent from a note written by a daemon older than this one,
+        which is exactly the case a pair update produces -- the OLD app writes
+        the breadcrumb and the NEW one reads it. Missing reads as zero rather
+        than as a reason to discard it.
+        """
         try:
             with open(self.path, encoding="utf-8") as f:
-                version = json.load(f).get("version")
+                data = json.load(f)
+            version = data.get("version")
+            tries = data.get("tries")
         except (OSError, ValueError):
-            return None
+            return None, 0
+        if not version:
+            return None, 0
+        return version, tries if isinstance(tries, int) and tries >= 0 else 0
+
+    def bump(self):
+        """Record one more attempt that did not get as far as installing."""
+        version, tries = self.read()
+        if not version:
+            return
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"version": version, "tries": tries + 1}, f)
+        except OSError as e:
+            print(f"[update] could not record the pending update: {e}",
+                  file=sys.stderr)
+
+    def clear(self):
         _rm(self.path)
+
+    def take(self):
+        version, _ = self.read()
+        self.clear()
         return version or None
 
 

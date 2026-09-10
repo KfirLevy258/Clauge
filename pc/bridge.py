@@ -361,17 +361,61 @@ class Bridge:
         """
         if not self._pending:
             return
-        version = self._pending.take()
+        from pc import update
+        version, tries = self._pending.read()
         if not version:
             return
         print(f"[bridge] ota: resuming the approved install of {version}",
               file=sys.stderr)
         self._on_ota_query(self._board_fw or "0.0.0")
-        if not self._manifest or self._manifest.get("version") != version:
+        if not self._manifest:
+            #
+            # NOTHING WAS ATTEMPTED, so the consent is not spent.
+            #
+            # This branch is reached when the query could not produce a
+            # manifest at all -- the feed did not answer, or the signature did
+            # not verify. It says nothing about the image the user approved,
+            # and it is the likeliest moment in the whole update for a
+            # transient to land: the daemon has just replaced itself and is
+            # asking the network a question within seconds of starting.
+            #
+            # Spending the approval here is what left a customer's board on
+            # 1.2.5 with the app on 1.3.2 (2026-09-10), the daemon answering
+            # `ota_none`, and nothing on the panel to say an update had been
+            # agreed to and dropped. The board will not re-offer inside the
+            # same boot either, so the two faults compound into a board that
+            # simply never updates again.
+            #
+            # RESUME_TRIES bounds it: retry on the next connect, and when the
+            # tries are gone say so out loud rather than looping in silence.
+            attempt = tries + 1
+            if attempt >= update.RESUME_TRIES:
+                self._pending.clear()
+                print(f"[bridge] ota: could not resume {version} after"
+                      f" {attempt} attempts; giving up", file=sys.stderr)
+                self._write(protocol.ota_error(
+                    "could not read the release feed"))
+            else:
+                self._pending.bump()
+                print(f"[bridge] ota: no manifest yet; {version} stays"
+                      f" approved (attempt {attempt} of"
+                      f" {update.RESUME_TRIES})", file=sys.stderr)
+            self._ota_reset()
+            return
+        if self._manifest.get("version") != version:
+            # A different fault: the feed answered, and what it is serving is
+            # not what the user agreed to. Retrying cannot change that, so the
+            # approval goes rather than riding along onto an image nobody
+            # consented to.
+            self._pending.clear()
             print("[bridge] ota: the release moved on; not resuming",
                   file=sys.stderr)
             self._ota_reset()
             return
+        # From here an install is genuinely attempted, which is what the
+        # approval was for. Spend it BEFORE the flash, so a failure that gets
+        # as far as writing does not come back on every reconnect.
+        self._pending.clear()
         # Put the board back on its progress screen. It has been sitting on an
         # "Install?" prompt for something it already agreed to.
         self._write(protocol.ota_resume(version))
