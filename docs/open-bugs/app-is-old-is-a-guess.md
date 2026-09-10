@@ -76,6 +76,21 @@ field older firmware ignores, so `PROTO_VERSION` does not move.
    "unknown". The daemon side wants a test that `ota_none` carries the app
    version when one is newer, and does not when none is.
 
+## `blink status` has it too, and its advice is worse
+
+The same comparison drives the CLI, which does name a remedy the panel has no
+room for:
+
+    Board       ... firmware 1.3.3
+                the board is on 1.3.3 and this app is 1.3.2 -- they ship together
+                run: /Users/kfir/.blink/bin/blink update
+
+Observed 2026-09-11 on a desk whose app was already the newest published
+release. Running that command finds nothing to do, so the one place with room
+to give an instruction spends it on an instruction that cannot help. Whatever
+fixes `proto_host_outdated()` should fix this line with it -- they are the same
+question asked twice.
+
 ## The second half, which the fix above does not address
 
 Even when it is true, the row is a dead end. It states a problem, offers no
