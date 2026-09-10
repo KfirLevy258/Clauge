@@ -331,7 +331,18 @@ ok "the two state directories never cross"
 printf '{"session_id":"weird"}' | $SH "$SHIM" Stop '../../../etc' >/dev/null 2>&1
 [ -f "$DIR/weird.state" ] ||
 	fail "an unknown tool argument did not fall back to state/"
-extra=$(ls -1 "$HOME/.blink" | grep -vxE 'state|state-codex|precious' || true)
+# A glob rather than `ls | grep`: shellcheck refuses the latter (SC2010), and
+# it is right to -- a filename with a newline in it would be counted twice.
+# This is a directory whose contents an attacker-shaped session id helps
+# choose, which is the whole point of the assertion below.
+extra=
+for p in "$HOME"/.blink/*; do
+	[ -e "$p" ] || continue		# no matches: the glob stays literal
+	case "${p##*/}" in
+	state|state-codex|precious) ;;
+	*) extra="${extra:+$extra }${p##*/}" ;;
+	esac
+done
 [ -z "$extra" ] ||
 	fail "an unknown tool argument created something in ~/.blink: $extra"
 ok "an unknown tool argument cannot choose a directory"

@@ -36,6 +36,17 @@ import threading
 
 import pytest
 
+# run.py reads the desk inventory with tomllib, which arrived in 3.11, and
+# docs/fleet-testing.md says so: "Needs Python 3.11 or newer". This module
+# imports it by path, so on an older interpreter the failure is a COLLECTION
+# error -- the whole file, before any test runs -- rather than a skip.
+#
+# CI still has 3.9 jobs on purpose: /usr/bin/python3 on macOS is 3.9, which is
+# the interpreter a customer's machine hands the installer, and pc/fleet_gate.py
+# already documents that. So this has to say "not here" rather than fall over.
+pytest.importorskip("tomllib",
+                    reason="tools/fleet/run.py needs Python 3.11 or newer")
+
 _RUN_PY = (pathlib.Path(__file__).resolve().parents[2]
            / "tools" / "fleet" / "run.py")
 

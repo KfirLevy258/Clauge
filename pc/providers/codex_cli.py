@@ -167,7 +167,16 @@ def _head_line(path: str) -> str:
     nl = blob.find(b"\n")
     if nl < 0:
         return ""
-    return blob[:nl].decode("utf-8", "replace")
+    # rstrip the CR, because a line does not include its terminator.
+    #
+    # The read is binary -- it has to be, to find the newline in a 51 MB file
+    # without decoding it -- so Python's universal-newline translation never
+    # runs and a file written with CRLF hands back a trailing "\r". Any writer
+    # that opened the rollout in text mode on Windows produces exactly that.
+    #
+    # json.loads happens to tolerate it (a CR is whitespace), which is why this
+    # went unnoticed; the substring checks in session_meta_cwd would not have.
+    return blob[:nl].decode("utf-8", "replace").rstrip("\r")
 
 
 def session_meta_cwd(head_line: str):

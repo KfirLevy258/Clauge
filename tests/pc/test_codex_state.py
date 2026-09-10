@@ -74,7 +74,15 @@ def test_the_arguments_are_what_is_honoured_not_a_default(monkeypatch, d):
     # Expanded, not passed through as a literal tilde -- open() would make a
     # directory called "~" in the working directory rather than fail loudly.
     assert seen[1] == (os.path.expanduser(codex_state.STATE_DIR), True)
-    assert seen[1][0].startswith(os.path.expanduser("~") + os.sep)
+    # Normalised, because STATE_DIR is a "/"-separated constant and os.sep is
+    # "\" on Windows: expanduser fills in the home and leaves the rest alone,
+    # so the real value is "C:\Users\me/.blink/state-codex". Windows opens that
+    # perfectly well -- the mixed separator is cosmetic -- but a raw startswith
+    # against os.sep called it an escape from the home directory, which is the
+    # one thing this line is here to rule out.
+    home = os.path.normcase(os.path.normpath(os.path.expanduser("~")))
+    got = os.path.normcase(os.path.normpath(seen[1][0]))
+    assert got.startswith(home + os.sep)
 
 
 def test_scan_reads_the_slots_the_shim_writes(d):
