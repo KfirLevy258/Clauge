@@ -2,7 +2,13 @@
 #define VERSION_H
 
 /* One source of truth: the serial hello and the settings panel must never
- * disagree about what is flashed. Bump on any user-visible change. */
+ * disagree about what is flashed. Bump on any user-visible change.
+ *
+ * Bump it LAST, immediately before cutting the release. check_versions.sh
+ * --release compares this file's last commit against every later change under
+ * firmware/src, so a bump made early and then followed by more firmware work
+ * fails the gate at the worst moment -- and the only honest way out is another
+ * edit here. Bumping early feels tidy and buys nothing. */
 #define BLINK_FW_VERSION "1.3.3"
 
 /* The wire protocol spoken over USB, and the daemon's own PROTO_VERSION in
@@ -17,7 +23,7 @@
  * (2026-07-17T00:00:00Z). SNTP is unauthenticated UDP; without a floor, an
  * on-path attacker can shift the clock into the past and make once-valid
  * leaked certificates verify again. Nudge forward on version bumps.
- * 1787961600 = 2026-08-29T00:00:00Z. */
-#define BLINK_TIME_FLOOR 1787961600LL
+ * 1789084800 = 2026-09-11T00:00:00Z. */
+#define BLINK_TIME_FLOOR 1789084800LL
 
 #endif /* VERSION_H */
