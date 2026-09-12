@@ -289,7 +289,7 @@ def test_a_long_run_of_continuation_bytes_is_refused_promptly():
 
 
 def test_the_module_logs_nothing_at_any_level(caplog):
-    """README.md:90 promises bridge.log holds nothing secret, and this parser
+    """README.md's "Something's wrong?" section promises bridge.log holds nothing secret, and this parser
     is pointed at the customer's conversations."""
     caplog.set_level(logging.NOTSET)
     v8_clone.parse(vfx.dumps({"secret": "conversation text"}))

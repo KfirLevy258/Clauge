@@ -1,6 +1,6 @@
 """Nothing from a conversation store may reach a log, a message, or a fixture.
 
-README.md:90 tells customers to email support the tail of ~/.blink/bridge.log
+README.md's "Something's wrong?" section tells customers to email support the tail of ~/.blink/bridge.log
 and promises that "nothing in either is a secret". Every source this project
 reads has to keep that promise true, and one of them now reads a store made
 largely of chat text.
@@ -51,7 +51,7 @@ SENSITIVE_MODULES = [
 ]
 
 _PRIVACY_PROMISE = (
-    "README.md:90 promises customers that the tail of ~/.blink/bridge.log "
+    "README.md's troubleshooting section promises customers that the tail of ~/.blink/bridge.log "
     "holds nothing secret. This module reads a store built largely of the "
     "owner's own conversations (or, for pc/leveldb.py and pc/v8_clone.py, "
     "is the substrate every such module reads through), so this is a real "
