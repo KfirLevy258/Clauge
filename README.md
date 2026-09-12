@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/img/brand/logo-wide.png" alt="BLINK" width="420">
+<a href="https://blink-buddy.com"><img src="docs/img/brand/logo-wide.png" alt="BLINK" width="420"></a>
 
 **Your Claude Code and Codex usage, as two live dials on your desk.**
 
@@ -13,6 +13,7 @@
   <img alt="Board: ESP32 CYD" src="https://img.shields.io/badge/board-ESP32%20%C2%B7%20CYD-3D444D?style=for-the-badge&labelColor=171B22&logo=espressif&logoColor=white">
   <img alt="Runs on macOS, Linux and Windows" src="https://img.shields.io/badge/runs%20on-macOS%20%C2%B7%20Linux%20%C2%B7%20Windows-3D444D?style=for-the-badge&labelColor=171B22">
   <img alt="Updates over the air" src="https://img.shields.io/badge/updates-over%20the%20air-3D444D?style=for-the-badge&labelColor=171B22">
+  <a href="LICENSE"><img alt="Licence: PolyForm Noncommercial 1.0.0" src="https://img.shields.io/badge/licence-noncommercial-3D444D?style=for-the-badge&labelColor=171B22"></a>
 </p>
 
 <table>
@@ -21,10 +22,14 @@
     <td align="center"><img src="docs/img/photos/codex-case-gauges.webp" alt="The Codex case, dials live" width="300"></td>
   </tr>
   <tr>
-    <td align="center"><sub><b>Claude edition</b></sub></td>
-    <td align="center"><sub><b>Codex edition</b></sub></td>
+    <td align="center"><sub><b>Claude edition</b></sub>&nbsp;</td>
+    <td align="center"><sub><b>Codex edition</b></sub>&nbsp;</td>
   </tr>
 </table>
+
+### Don't want to build one? &nbsp;[**blink-buddy.com**](https://blink-buddy.com)
+
+I build them, test them and post them.
 
 </div>
 
@@ -32,29 +37,62 @@
 
 BLINK is a small touchscreen that shows the same numbers as Claude Code's `/usage` command, always in view: your **5-hour session** and your **7-day week**, each as a dial that turns from green to amber to red, with a countdown to its reset. It plugs into your computer over USB, sets itself up in one command, and keeps itself updated.
 
+## Open source
+
+**BLINK is open source, and it is free.** Everything the device is made of is
+here: the firmware that draws the dials, the app that reads your usage, the
+build scripts, the tests. Nothing is held back, nothing is a trial, nothing
+expires. The board is an ESP32 "Cheap Yellow Display", about $12 anywhere, and
+the case is a 3D print - the files are on
+[MakerWorld](https://makerworld.com/en/models/3294736-blink-claude-code-codex-usage-monitor).
+
+**You can do anything you like with it, for yourself.** Build one. Build ten.
+Change it, rewrite it, put your own name on it. Give them to your friends. Use
+it at home, at school, in a club. You will never owe me anything for it.
+
+**The one thing you cannot do is sell it.** Not the device, not the software,
+not a product with this inside it. Making money out of BLINK is the only thing
+the licence forbids. If that is what you want to do, write to me and ask -
+the answer is often yes.
+
+And if you would rather not build one at all, I sell finished units, put
+together and tested by hand. That is what pays for the work that goes into
+this.
+
 ## Features
 
 - **Two dials, two countdowns.** Session and weekly limits, and the time until each one resets.
-- **An activity light.** Amber the moment any session -- Claude or Codex -- is waiting on you; a green pulse while everything is still working; red when a turn dies on an error -- a rate limit, most often.
-- **A page per provider.** Claude and Codex each get their own screen. Tap the name or swipe to switch; the needles move from one reading to the other.
+- **An activity light.** Amber the moment any session - Claude or Codex - is waiting on you; a green pulse while everything is still working; red when a turn dies on an error - a rate limit, most often.
+- **A page per provider.** Claude and Codex each get their own screen. Swipe to switch; the needles move from one reading to the other.
 - **It sleeps when your computer does.** About thirty seconds after the computer stops answering, the screen closes its eyes and dozes; it opens them the moment the computer is back. A tap while it sleeps shows the last figures.
-- **Claude Desktop too.** With Desktop alone the dials show percentages, a five-hour countdown whenever Desktop is holding a reset time, and a weekly countdown once one has been learned. Desktop keeps that reset time only while a window is running and clears it in between, so the countdown comes and goes; the fill rate covers the gaps. The dials follow Desktop's own refresh -- about every 5 minutes while you are using it, up to 15 when it sits idle -- where Claude Code updates them live.
+- **Claude Desktop too.** With Desktop alone the dials show percentages, a five-hour countdown whenever Desktop is holding a reset time, and a weekly countdown once one has been learned. Desktop keeps that reset time only while a window is running and clears it in between, so the countdown comes and goes; the fill rate covers the gaps. The dials follow Desktop's own refresh - about every 5 minutes while you are using it, up to 15 when it sits idle - where Claude Code updates them live.
 - **Nothing to sign in to.** It reads figures Claude Code and Codex have already written to disk. No credential, no network, nothing sent anywhere.
 - **Updates over the cable.** A new release asks on screen; one tap installs both the firmware and the app. Both halves are signed.
 - **Cheap, open hardware.** An ESP32 "Cheap Yellow Display" (~$12) and a 3D-printed case.
-- **Company units.** A unit built for a company shows its logo -- a still or a short clip -- after the boot animation, written once at the factory.
+- **Company units.** A unit built for a company shows its logo - a still or a short clip - after the boot animation, written once at the factory.
 
 ## The screens
 
 <table>
   <tr>
-    <td width="33%"><img src="docs/img/screen-claude.png" alt="The Claude page"><br><sub><b>Claude</b> - session and weekly, with the countdown to each reset</sub></td>
-    <td width="33%"><img src="docs/img/screen-codex.png" alt="The Codex page"><br><sub><b>Codex</b> - its own page, swipe or tap the name to switch</sub></td>
-    <td width="33%"><img src="docs/img/screen-desktop.png" alt="Claude Desktop only"><br><sub><b>Claude Desktop alone</b> - a countdown when Desktop has a reset time, a rate when it does not</sub></td>
+    <td width="33%"><img src="docs/img/screen-claude.png" alt="The Claude page: six coloured marks in the top-left corner, one per live session, the clock under the BLINK wordmark, and the session and weekly dials."></td>
+    <td width="33%"><img src="docs/img/screen-codex.png" alt="The Codex page, with its own session and weekly dials."></td>
+    <td width="33%"><img src="docs/img/screen-desktop.png" alt="Claude Desktop alone: the session dial shows a fill rate where a countdown would otherwise be."></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Claude</b></sub>&nbsp;</td>
+    <td align="center"><sub><b>Codex</b></sub>&nbsp;</td>
+    <td align="center"><sub><b>Desktop alone</b></sub>&nbsp;</td>
   </tr>
 </table>
 
-<sub>Rendered by the shipping firmware's own drawing code, not mocked up.</sub>
+Session and weekly, the countdown to each reset, and the time under the wordmark.
+The marks in the top-left corner are your live sessions - one per session,
+coloured by what each is doing. Claude and Codex each get a page of their own,
+and a swipe moves between them. With Claude Desktop alone there is often no reset
+time to count down to, so the session dial shows how fast it is filling instead.
+
+*Rendered by the shipping firmware's own drawing code, not mocked up.*
 
 ## Setup
 
@@ -87,9 +125,9 @@ Needs Claude Code 2.1.100 or newer. The installer changes one file, `~/.claude/s
 ~/.blink/bin/blink status
 ```
 
-That one command says whether the service is running, whether Claude Code and Codex are being read, and how old the numbers are. If the panel is dark or wrong, unplug the board and plug it back in first -- the app finds it again on its own. If that does not fix it, email **support@blink-buddy.com** with the output of `blink status` and the last lines of `~/.blink/bridge.log`; nothing in either is a secret.
+That one command says whether the service is running, whether Claude Code and Codex are being read, and how old the numbers are. If the panel is dark or wrong, unplug the board and plug it back in first - the app finds it again on its own. If that does not fix it, email **support@blink-buddy.com** with the output of `blink status` and the last lines of `~/.blink/bridge.log`; nothing in either is a secret.
 
-**If the board says the app is old.** The board and the app ship together, so normally they match. If they have come apart -- the board on a later version than the computer -- the board's own update screen cannot fix it, because the half that is behind is the half it cannot reach. `blink status` says so and names the cure:
+**If the board says the app is old.** The board and the app ship together, so normally they match. If they have come apart - the board on a later version than the computer - the board's own update screen cannot fix it, because the half that is behind is the half it cannot reach. `blink status` says so and names the cure:
 
 ```
 Board       COM25 (CH340) -- id 20500d33ff1c, firmware 1.3.2
@@ -97,7 +135,7 @@ Board       COM25 (CH340) -- id 20500d33ff1c, firmware 1.3.2
             run: blink update
 ```
 
-**On Windows, if the board never appears:** the board's USB chip needs a driver Windows does not ship, and the installer puts it in for you -- it is the one step that asks for the Windows permission prompt, and it only asks when there is something to install. If you skipped that prompt, or installed an older version, run:
+**On Windows, if the board never appears:** the board's USB chip needs a driver Windows does not ship, and the installer puts it in for you - it is the one step that asks for the Windows permission prompt, and it only asks when there is something to install. If you skipped that prompt, or installed an older version, run:
 
 ```
 %USERPROFILE%\.blink\bin\blink.exe driver
@@ -107,7 +145,7 @@ Board       COM25 (CH340) -- id 20500d33ff1c, firmware 1.3.2
 
 ## What it works with
 
-For Claude Desktop, the app learns usage by reading Claude Desktop's own local files on your machine, never anything else -- it only ever reads them, and nothing about your usage or your conversations ever leaves the machine.
+For Claude Desktop, the app learns usage by reading Claude Desktop's own local files on your machine, never anything else - it only ever reads them, and nothing about your usage or your conversations ever leaves the machine.
 
 | You use | You get |
 |---|---|
@@ -132,4 +170,10 @@ BLINK never sees a credential and never sends anything anywhere. It keeps the la
 - **[docs/windows-check.md](docs/windows-check.md)** - the ten-minute check a Windows release needs a person for
 - **[docs/fleet-testing.md](docs/fleet-testing.md)** - the one command that proves a release on three real desks and three real boards, and what a green run does and does not prove
 
-<div align="center"><sub>Firmware: Zephyr, C. App: Python, shipped as one binary. Board: ESP32-2432S028. <a href="LICENSE">MIT licensed</a>.</sub></div>
+<div align="center">
+<sub>Firmware: Zephyr, C. App: Python, one binary.</sub>&nbsp;<br>
+<sub>Board: ESP32-2432S028.</sub>&nbsp;<br>
+<sub>Source under <a href="LICENSE">PolyForm Noncommercial 1.0.0</a>.</sub>&nbsp;<br>
+<sub>Free to build for yourself. Never to sell.</sub>&nbsp;<br>
+<sub>Built units at <a href="https://blink-buddy.com">blink-buddy.com</a>.</sub>&nbsp;
+</div>

@@ -18,19 +18,28 @@ Your 5-hour session and 7-day week, as two live dials you can glance at all day.
 
 <table>
   <tr>
-    <td width="33%"><img src="img/screen-claude.png" alt="The Claude page"><br><sub><b>Claude</b> - session &amp; weekly, with the countdown to each reset</sub></td>
-    <td width="33%"><img src="img/screen-codex.png" alt="The Codex page"><br><sub><b>Codex</b> - its own page, swipe or tap the name to switch</sub></td>
-    <td width="33%"><img src="img/screen-desktop.png" alt="Claude Desktop only"><br><sub><b>Claude Desktop alone</b> - a countdown when Desktop has a reset time, a rate when it does not</sub></td>
+    <td width="33%"><img src="img/screen-claude.png" alt="The Claude page: six coloured marks in the top-left corner, one per live session, the clock under the BLINK wordmark, and the session and weekly dials."></td>
+    <td width="33%"><img src="img/screen-codex.png" alt="The Codex page, with its own session and weekly dials."></td>
+    <td width="33%"><img src="img/screen-desktop.png" alt="Claude Desktop alone: the session dial shows a fill rate where a countdown would otherwise be."></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Claude</b></sub>&nbsp;</td>
+    <td align="center"><sub><b>Codex</b></sub>&nbsp;</td>
+    <td align="center"><sub><b>Desktop alone</b></sub>&nbsp;</td>
   </tr>
 </table>
 
-<sub>The three screens above are rendered from the shipping firmware's own drawing code (`tools/panel_render`), not mocked up.</sub>
+Session and weekly, the countdown to each reset, and the time under the wordmark.
+The marks in the top-left corner are the live sessions, one per session, coloured
+by what each is doing.
+
+*The three screens above are rendered from the shipping firmware's own drawing code (`tools/panel_render`), not mocked up.*
 
 ## What is Blink?
 
 Blink is a small desk display that shows how much of your Claude Code usage you've spent - the same numbers as the `/usage` command, but always in view. It reads your **5-hour session** limit and your **7-day weekly** limit and draws each as a dial, green while you have room, amber as you get close, red when it's nearly gone. Glance over, know where you stand, keep working.
 
-Beside the dials is a small pip telling you whether anything is waiting on you -- across every Claude Code and Codex session you have open, one light: amber the moment a session has finished or is asking permission, a green pulse while everything is still working, red when something is stuck or rate-limited. Under them, a countdown to each window's reset.
+Beside the dials is a small pip telling you whether anything is waiting on you - across every Claude Code and Codex session you have open, one light: amber the moment a session has finished or is asking permission, a green pulse while everything is still working, red when something is stuck or rate-limited. Under them, a countdown to each window's reset.
 
 It runs on a cheap (~$12) ESP32 touchscreen. Plug it into your computer, run the setup once, and it sits on your desk and keeps itself up to date.
 
@@ -48,11 +57,11 @@ Blink never sees a credential and never sends anything anywhere. It reads figure
 | **Codex CLI** | Both limits and both countdowns, on its own page | **Full** |
 | **claude.ai in a browser** | Nothing | **Not supported** |
 
-**How current the Desktop figure is.** BLINK never asks the server; it reads the sample Desktop last wrote. Measured over 1,672 samples on one Mac (July-August 2026): Desktop writes one every 5 minutes while it is being used, every 15 minutes in the background (occasionally 30), and immediately when its usage panel is opened. The daemon reads the file every minute, so the board is at most a minute behind Desktop, and Desktop is at most 5-15 minutes behind the server. A person watching the board while the app sits idle sees the figure move in 15-minute steps -- reported 2026-08-30 as "stuck on 16 %, then 21 %" -- which is the app's clock, not a fault.
+**How current the Desktop figure is.** BLINK never asks the server; it reads the sample Desktop last wrote. Measured over 1,672 samples on one Mac (July-August 2026): Desktop writes one every 5 minutes while it is being used, every 15 minutes in the background (occasionally 30), and immediately when its usage panel is opened. The daemon reads the file every minute, so the board is at most a minute behind Desktop, and Desktop is at most 5-15 minutes behind the server. A person watching the board while the app sits idle sees the figure move in 15-minute steps - reported 2026-08-30 as "stuck on 16 %, then 21 %" - which is the app's clock, not a fault.
 
 **Sleep.** The board pings the app every 10 s. Thirty seconds without an answer, on a board that has shown figures this boot and is not mid-update, means the computer is asleep: the screen plays a closing clip, loops a sleeping one, and plays an opening clip when the app answers again. Uninstall sends a `bye` first so a removed app shows "connecting" instead. Clips: `tools/make_sleepanim.py`; design: `docs/sleep-mode-design.md`.
 
-**Why Claude Desktop is only half.** The five-hour window has a real countdown: Claude Desktop's own Local Storage carries a reset time next to its percentage, refreshed within seconds of a turn. The seven-day window does not -- an exhaustive search in August 2026 (every JSON file the app writes, its LevelDB, Session Storage and IndexedDB stores, its caches and its preferences plist) found no seven-day reset time anywhere a chat-only customer's machine writes one. So BLINK remembers one, the first time any source reports it, and counts it forward a week at a time; that countdown is published only while nothing has contradicted it, and withdrawn the moment something does. Wherever a window has no countdown to show, the panel shows a **rate** instead (`+14%/h`) -- measured from readings actually taken, not a guessed reset time. The activity light needs Claude Code's hooks, which a machine without Claude Code does not have. `blink install` says all of this on a machine in that state rather than reporting four successful steps.
+**Why Claude Desktop is only half.** The five-hour window has a real countdown: Claude Desktop's own Local Storage carries a reset time next to its percentage, refreshed within seconds of a turn. The seven-day window does not - an exhaustive search in August 2026 (every JSON file the app writes, its LevelDB, Session Storage and IndexedDB stores, its caches and its preferences plist) found no seven-day reset time anywhere a chat-only customer's machine writes one. So BLINK remembers one, the first time any source reports it, and counts it forward a week at a time; that countdown is published only while nothing has contradicted it, and withdrawn the moment something does. Wherever a window has no countdown to show, the panel shows a **rate** instead (`+14%/h`) - measured from readings actually taken, not a guessed reset time. The activity light needs Claude Code's hooks, which a machine without Claude Code does not have. `blink install` says all of this on a machine in that state rather than reporting four successful steps.
 
 **Why claude.ai is not supported.** A browser extension was built to read usage from response headers and measured against the real site: 178 responses, none carrying a rate-limit header of any kind. There is nothing to read. It was removed rather than shipped as a feature that does nothing. [`docs/next-steps.md`](next-steps.md) §A has the measurement.
 
@@ -67,7 +76,7 @@ Blink never sees a credential and never sends anything anywhere. It reads figure
 | A remembered weekly boundary | a weekly reset time, once one has been learned from any of the sources above; published only while nothing contradicts it | nothing - learned automatically, never configured |
 | Codex CLI's own session log | both limits and reset times, for Codex | nothing - read if Codex is installed |
 
-**How each source is tested.** Claude Code: CI installs real releases (oldest supported, stable, latest, next) and checks the status-line contract is still there. Codex: CI reads the struct that defines `rate_limits` in Codex's own source at the latest release, and fails the day a field is renamed -- Codex will not write a log without an account, so the parser is pinned to a real captured log instead. Claude Desktop: a closed app no runner can launch; the parser is pinned to a real captured cache file, and `blink status` reports on the customer's machine whether today's file still parses.
+**How each source is tested.** Claude Code: CI installs real releases (oldest supported, stable, latest, next) and checks the status-line contract is still there. Codex: CI reads the struct that defines `rate_limits` in Codex's own source at the latest release, and fails the day a field is renamed - Codex will not write a log without an account, so the parser is pinned to a real captured log instead. Claude Desktop: a closed app no runner can launch; the parser is pinned to a real captured cache file, and `blink status` reports on the customer's machine whether today's file still parses.
 
 When two of them disagree, the most recently observed number wins - field by field, so a source that knows your reset time still supplies it even when a fresher one takes over the percentage. [`docs/multi-provider.md`](multi-provider.md) has the details.
 
@@ -76,7 +85,7 @@ When two of them disagree, the most recently observed number wins - field by fie
 ## What's in here
 
 | Path | What's there |
-|------|--------------|
+|---|---|
 | `firmware/` | The device firmware (Zephyr, C) - this is the product |
 | `firmware/src/ota.c` | The update engine: signed install + automatic rollback |
 | `pc/`, `claude_usage_bridge.py` | The USB bridge and its setup, shipped as one binary - this is how a board gets its numbers |
@@ -255,7 +264,7 @@ means both "Claude" and "never stamped", so an unstamped Claude board can be
 turned into a Codex one by anyone with a cable. A re-burn of the same edition
 passes and says so; a burn of the *other* edition fails and tells you what the
 unit already is. A unit programmed before the latch existed arrives **latched
-as Claude** the first time it boots this firmware -- every unit built before
+as Claude** the first time it boots this firmware - every unit built before
 it was a Claude unit, and the alternative was delivering all of them
 re-stampable by their owners. A bench board meant to become Codex needs its
 config partition erased first (`esptool.py erase_region 0x3b0000 0x30000`).
@@ -266,7 +275,7 @@ to reuse the last build.
 **What it flashes is not the release artifact.** `zephyr.signed.bin` is signed
 but not *confirmed*: its MCUboot trailer says "boot this once". That is right
 for OTA, where the image lands in slot 1 and the firmware confirms it after it
-proves itself, and wrong for a direct flash -- a board on the bench has no
+proves itself, and wrong for a direct flash - a board on the bench has no
 daemon and no network, never becomes healthy, and reverts at 90 seconds. On a
 blank unit that is invisible, because there is nothing to revert to; on a
 re-burn it silently undoes the flash minutes after the script printed PASS.
@@ -274,7 +283,7 @@ re-burn it silently undoes the flash minutes after the script printed PASS.
 So `tools/sign_confirmed.py` re-signs the same image with `--pad --confirm` and
 that is what goes to the board. It reads the signing parameters out of the
 build's own `build.ninja` rather than repeating them, and it checks the trailer
-it produced -- an image that comes back with `image_ok` unset fails the burn
+it produced - an image that comes back with `image_ok` unset fails the burn
 before esptool is called. Measured on hardware 2026-09-07: a confirmed image's
 uptime runs straight through the 90-second deadline, where the unconfirmed one
 rebooted.
@@ -299,18 +308,18 @@ the partition holds 512 KB.
 There is no flag to set: the partition **is** the flag. A unit that never had
 one written boots as an individual unit, and a burn *without* `--logo` erases
 the partition, so a re-burned board is an individual unit again. Nothing over
-USB can change it -- like the edition, it takes esptool with the board in
-bootloader mode -- but unlike the edition it is not write-once, because a logo
+USB can change it - like the edition, it takes esptool with the board in
+bootloader mode - but unlike the edition it is not write-once, because a logo
 is a fact about the customer, not the enclosure. OTA never touches it: the
 firmware slots and the settings partition are exactly where they were.
-Edition and logo are independent -- a company unit is still a Claude or a
+Edition and logo are independent - a company unit is still a Claude or a
 Codex one.
 
 ### Tested without a board
 
 `tests/ci/check_factory.sh` runs both scripts, unmodified, on every push: it
 puts stub `esptool.py` / `espefuse.py` / `espsecure.py` on the PATH that
-record their calls, and a fake `serial` module that plays a board -- it
+record their calls, and a fake `serial` module that plays a board - it
 replays a boot transcript on every reset and answers the edition message.
 Eleven scenarios cover what matters on a production line: the images and
 addresses of an individual burn and a company burn, that the logo partition
@@ -380,13 +389,13 @@ The things that were open before the first release, and how each was settled.
 | | Decision |
 |---|---|
 | **Name** | **BLINK.** The panel, the app (`blink`), its directory (`~/.blink`), the login service and this repository all say it. Earlier names (Clauge, "Claude usage") are gone. |
-| **Editions** | Two -- Claude and Codex -- from **one firmware image**, chosen by a write-once stamp at the factory (`tools/burn-claude.sh` / `tools/burn-codex.sh`). Never user-changeable; a unit from before the stamp existed arrives latched as Claude. |
+| **Editions** | Two - Claude and Codex - from **one firmware image**, chosen by a write-once stamp at the factory (`tools/burn-claude.sh` / `tools/burn-codex.sh`). Never user-changeable; a unit from before the stamp existed arrives latched as Claude. |
 | **Company units** | The same image plays a company logo (a still or a short clip) after the boot animation when the factory wrote one to the `logo` partition (`tools/burn.sh --logo`). No logo partition, no logo: individuals are the default, and a re-burn without `--logo` erases it. |
 | **One board per computer** | The app drives one BLINK. A second one attached is ignored; `--port` picks one deterministically. |
-| **What is supported** | Claude Code in a terminal or IDE extension: everything. Codex CLI: everything, on its own page. Claude Desktop alone: a five-hour countdown whenever Desktop is holding a reset time -- it keeps one only while a window is running and clears it in between, so the countdown comes and goes and the fill rate covers the gaps -- a weekly countdown once one has been learned, and no activity light. claude.ai in a browser: nothing. |
-| **Automatic app updates** | **Off** for the first release. The signed manifest carries the switch (`daemon.auto`), so it can be turned on for a later release -- and off again within minutes -- without touching any installed machine. |
+| **What is supported** | Claude Code in a terminal or IDE extension: everything. Codex CLI: everything, on its own page. Claude Desktop alone: a five-hour countdown whenever Desktop is holding a reset time - it keeps one only while a window is running and clears it in between, so the countdown comes and goes and the fill rate covers the gaps - a weekly countdown once one has been learned, and no activity light. claude.ai in a browser: nothing. |
+| **Automatic app updates** | **Off** for the first release. The signed manifest carries the switch (`daemon.auto`), so it can be turned on for a later release - and off again within minutes - without touching any installed machine. |
 | **What the app keeps on disk** | Exactly what the table under "What the installer changes" says, readable by the user alone, sent nowhere. |
-| **Not yet** | macOS notarisation (the binary is unsigned; Gatekeeper asks once). Apple Silicon runs the full suite and the real installer in CI, but has not yet been watched by a person. (Windows has: a real Windows 10 PC with a Hebrew user name, 2026-08-29 -- which found four things that CI's ASCII English runners could not, fixed in 1.0.3 and 1.0.4.) **Claude Desktop's cache location has only been seen on macOS**; on Windows (`%APPDATA%\Claude\`) and Linux (`~/.config/Claude/`) it is the Electron convention, and `blink status` prints the path it looked at so the first person beside a signed-in Desktop there can confirm it in one glance. |
+| **Not yet** | macOS notarisation (the binary is unsigned; Gatekeeper asks once). Apple Silicon runs the full suite and the real installer in CI, but has not yet been watched by a person. (Windows has: a real Windows 10 PC with a Hebrew user name, 2026-08-29 - which found four things that CI's ASCII English runners could not, fixed in 1.0.3 and 1.0.4.) **Claude Desktop's cache location has only been seen on macOS**; on Windows (`%APPDATA%\Claude\`) and Linux (`~/.config/Claude/`) it is the Electron convention, and `blink status` prints the path it looked at so the first person beside a signed-in Desktop there can confirm it in one glance. |
 
 ## Security &amp; privacy
 
@@ -402,7 +411,7 @@ your sessions need from you, across Claude Code and Codex together, worst one
 wins.
 
 | Dot | Meaning |
-|-----|---------|
+|---|---|
 | 🟢 green, pulsing | Everything is working; nothing needs you |
 | 🟠 amber | **Your turn** - a session has finished its answer (Claude or Codex), even if others are still working |
 | 🟠 amber, pulsing | A session is asking permission right now |
@@ -433,7 +442,7 @@ message text).
 Every line in that log carries the local date and time it was written. The
 file is capped at 4 MB and the four previous ones are kept beside it as
 `bridge.log.1` through `bridge.log.4`, so it uses at most 20 MB and holds
-something over a month on a busy machine -- one customer's reached 2 MB in a
+something over a month on a busy machine - one customer's reached 2 MB in a
 week, growing without any limit at all, before this existed. If the problem
 you are reporting is older than the log, send `bridge.log.1` too.
 
